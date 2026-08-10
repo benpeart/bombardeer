@@ -4,16 +4,17 @@ include <BOSL2/gears.scad>
 $fn = 64; // High rendering resolution for round holes
 
 // --- System Parameters ---
-mod        = 2;     // Tooth size (Module)
-starts     = 1;     // 1 thread = 30:1 reduction, self-locking
-teeth      = 30;    // Number of teeth on the gear wheel
-worm_d     = 25;    // Pitch diameter of the worm screw (mm)
-worm_l     = 40;    // Length of the worm screw (mm)
+mod         = 2;     // Tooth size (Module)
+starts      = 1;     // 1 thread = 30:1 reduction, self-locking
+worm_d      = 50;    // Pitch diameter of the worm screw (48mm)
+worm_l      = 50;    // Length of the worm screw (40mm)
+gear_radius = 50;    // Target pitch radius (330mm)
+teeth       = (gear_radius * 2) / mod; // 350 teeth for 700mm pitch diameter
 
 // --- Shaft Fit Dimensions ---
-nema_d     = 5.2;   // NEMA 17 5mm shaft diameter (+0.2mm clearance for 3D printing)
-nema_flat  = 4.6;   // D-shaft flat dimension (+0.1mm clearance)
-tslot_size = 20.0;    // 2020 extrusion width (+0.0mm clearance)
+nema_d      = 5.2;   // NEMA 17 5mm shaft diameter (+0.2mm clearance for 3D printing)
+nema_flat   = 4.6;   // D-shaft flat dimension (+0.1mm clearance)
+tslot_size  = 20.0;  // 2020 extrusion width (+0.0mm clearance)
 
 // =================================================================
 // 1. THE WORM SCREW (WITH NEMA 17 D-SHAFT HOLE)
@@ -50,7 +51,7 @@ dist = worm_dist(mod=mod, d=worm_d, starts=starts, teeth=teeth);
 // 3. THE WORM GEAR (WITH 2020 T-SLOT SQUARE HOLE)
 // =================================================================
 translate([dist+10, 0, 0])
-//    rotate([90, 9, 0]) // Orient 90 degrees to mesh with worm thread
+    rotate([90, 9, 0]) // Orient 90 degrees to mesh with worm thread
         difference() {
             // Generate base gear wheel without internal shaft hole
             worm_gear(

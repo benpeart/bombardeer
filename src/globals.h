@@ -5,22 +5,29 @@
 
 // ESP32 Pin Assignments
 
-// Stepper motor pin assignments
-#define motEnablePin 27
+// Driver 1: Pan Axis
+#define PAN_USTEP_PIN1 19
+#define PAN_USTEP_PIN2 18
+#define PAN_STEP_PIN     26
+#define PAN_DIR_PIN      25
+#define PAN_ENABLE_PIN   27
 
-#define motLeftUStepPin1 19
-#define motLeftUStepPin2 18
-#define motLeftStepPin 26
-#define motLeftDirPin 25
+// Driver 2: Tilt Axis
+#define TILT_USTEP_PIN1 05
+#define TILT_USTEP_PIN2 04
+#define TILT_STEP_PIN    33
+#define TILT_DIR_PIN     32
+#define TILT_ENABLE_PIN  27
 
-#define motRightUStepPin1 05
-#define motRightUStepPin2 04
-#define motRightStepPin 33
-#define motRightDirPin 32
+// TMC2209 Single-Wire UART Pins (Shared UART2)
+#define TMC_RX_PIN       16  // ESP32 RX2 connected to TMC2209 TX/RX pins
+#define TMC_TX_PIN       17  // ESP32 TX2 connected through 1k ohm resistor
+#define SERIAL_PORT      Serial2
+#define R_SENSE          0.11f // Standard sense resistor value for stepsticks
 
-// TMC2209 Stepper driver
-#define SERIAL2_RX_PIN 16    // Specify Serial2 RX pin as the default has changed
-#define SERIAL2_TX_PIN 17    // Specify Serial2 TX pin as the default has changed
+// Driver Addresses on the shared UART bus
+#define PAN_DRIVER_ADDR  0b00  // MS1=GND, MS2=GND
+#define TILT_DRIVER_ADDR 0b01  // MS1=VCC, MS2=GND
 
 // -- Others
 #define PIN_LED_DATA 02        // pin to the data line of WS2812 LEDs

@@ -9,6 +9,8 @@
 #include <Arduino.h>
 #include <Preferences.h>
 #include <XboxSeriesXControllerESP32_asukiaaa.hpp>
+#include <TMCStepper.h>
+#include <FastAccelStepper.h>
 #include "globals.h"
 #include "debug.h"
 
@@ -24,21 +26,9 @@ Preferences preferences;
 #define BATTERY_VOLTAGE_FULL 22.3   // the voltage of a full battery
 
 // bind to any xbox controller
-#define DEADZONE_RADIUS 0.08
+#define DEADZONE_RADIUS 0.15
 #define TRIGGER_THRESHOLD 0.15
 XboxSeriesXControllerESP32_asukiaaa::Core xboxController;
-
-void onXboxConnect()
-{
-    DB_PRINTLN("Bluetooth MAC address: " + xboxController.buildDeviceAddressStr());
-    DB_PRINT(xboxController.xboxNotif.toString());
-    DB_PRINTLN("Xbox controller connected");
-}
-
-void onXboxDisconnect()
-{
-    DB_PRINTLN("Xbox controller disconnected");
-}
 
 #ifdef BATTERY_VOLTAGE
 float BatteryVoltage()
@@ -68,13 +58,88 @@ float BatteryVoltage()
 }
 #endif // BATTERY_VOLTAGE
 
-// ----- Main code
+// ============================================================================
+// Stepper LIBRARY INSTANTIATIONS
+// ============================================================================
+
+// TMCStepper Driver Configuration Objects
+TMC2209Stepper panTMC(&SERIAL_PORT, R_SENSE, PAN_DRIVER_ADDR);
+TMC2209Stepper tiltTMC(&SERIAL_PORT, R_SENSE, TILT_DRIVER_ADDR);
+
+// FastAccelStepper Engine & Motor Handles
+FastAccelStepperEngine engine = FastAccelStepperEngine();
+FastAccelStepper *panStepper = NULL;
+FastAccelStepper *tiltStepper = NULL;
+
+// ============================================================================
+// HELPER FUNCTIONS
+// ============================================================================
+
+/*
+ * Configure TMC2209 Driver Parameters over UART using teemuatlut/TMCStepper
+ */
+void initTMC2209(TMC2209Stepper &driver, const char *axisName, uint16_t current_mA)
+{
+    driver.begin();
+
+    // Verify UART Communication
+    uint8_t result = driver.test_connection();
+    if (result != 0)
+    {
+        DB_PRINTF("[TMC2209] ERROR: %s axis connection failed! Code: %d (Check wiring/addressing)", axisName, result);
+        return;
+    }
+
+    driver.toff(5);                 // Enable driver (Disable = 0)
+    driver.rms_current(current_mA); // Set run current in mA RMS
+    driver.iholddelay(10);          // Holding current delay
+    driver.microsteps(16);          // Set microstepping to 1/16
+    driver.en_spreadCycle(false);   // Enable StealthChop2 (Whisper quiet)
+    driver.pwm_autoscale(true);     // Auto-tune motor current scale
+
+    DB_PRINTF("[TMC2209] %s Driver Configured OK: %d mA RMS, 1/16 Microstepping, StealthChop ON", axisName, current_mA);
+}
+
+/*
+ * Parse Incoming Serial ASCII Targeting Commands from Raspberry Pi 5
+ * Example Frame: "P:1200,T:-450"
+ */
+void processSerialCommands()
+{
+    static String inputBuffer = "";
+
+    while (Serial.available() > 0)
+    {
+        char c = Serial.read();
+        if (c == '\n')
+        {
+            long panTarget = 0, tiltTarget = 0;
+            if (sscanf(inputBuffer.c_str(), "P:%ld,T:%ld", &panTarget, &tiltTarget) == 2)
+            {
+                if (panStepper)
+                    panStepper->moveTo(panTarget);
+                if (tiltStepper)
+                    tiltStepper->moveTo(tiltTarget);
+            }
+            inputBuffer = "";
+        }
+        else if (c != '\r')
+        {
+            inputBuffer += c;
+        }
+    }
+}
+
+// ============================================================================
+// Main code
+// ============================================================================
+
 void setup()
 {
     Serial.begin(115200);
     while (!Serial)
         ; // wait for serial port to connect. Needed for native USB port only
-    DB_PRINTLN("\nStarting Bombardeer on " + String(ARDUINO_BOARD));
+    DB_PRINTLN("\nStarting Bombardeer Turret Controller on " + String(ARDUINO_BOARD));
 
     // debug info about the ESP32 we are running on
     DB_PRINTLN("ESP32 Chip Model: " + String(ESP.getChipModel()));
@@ -95,26 +160,75 @@ void setup()
         DB_PRINTF("EEPROM init complete, all preferences deleted, new pref_version: %d\n", PREF_VERSION);
     }
 
-    // Disable steppers during startup
-    pinMode(motEnablePin, OUTPUT);
-    digitalWrite(motEnablePin, HIGH); // disable driver in hardware
-
-    // setup micro stepping/serial address pins for output
-    pinMode(motLeftUStepPin1, OUTPUT);
-    pinMode(motLeftUStepPin2, OUTPUT);
-    pinMode(motRightUStepPin1, OUTPUT);
-    pinMode(motRightUStepPin2, OUTPUT);
-
     // Setup Xbox controller
     xboxController.begin();
 
-    DB_PRINTLN("Booted, ready for action!");
+    // Disable steppers during startup
+    pinMode(PAN_ENABLE_PIN, OUTPUT);
+    digitalWrite(PAN_ENABLE_PIN, HIGH); // disable driver in hardware
+
+    // setup micro stepping/serial address pins for output
+    pinMode(PAN_USTEP_PIN1, OUTPUT);
+    pinMode(PAN_USTEP_PIN2, OUTPUT);
+    pinMode(PAN_STEP_PIN, OUTPUT);
+    pinMode(PAN_DIR_PIN, OUTPUT);
+    pinMode(TILT_USTEP_PIN1, OUTPUT);
+    pinMode(TILT_USTEP_PIN2, OUTPUT);
+    pinMode(TILT_STEP_PIN, OUTPUT);
+    pinMode(TILT_DIR_PIN, OUTPUT);
+
+    // 1. Initialize Hardware UART2 for TMC2209 Drivers
+    SERIAL_PORT.begin(115200, SERIAL_8N1, TMC_RX_PIN, TMC_TX_PIN);
+
+    // 2. Configure TMC2209 Registers over UART
+    DB_PRINTLN("[TMC2209] Configuring Drivers...");
+    initTMC2209(panTMC, "PAN", 1200);   // 1200 mA RMS run current
+    initTMC2209(tiltTMC, "TILT", 1000); // 1000 mA RMS run current
+
+    // 3. Initialize FastAccelStepper Engine
+    engine.init();
+
+    // 4. Connect Pan Stepper to Hardware Timers
+    panStepper = engine.stepperConnectToPin(PAN_STEP_PIN);
+    if (panStepper)
+    {
+        panStepper->setDirectionPin(PAN_DIR_PIN);
+        panStepper->setEnablePin(PAN_ENABLE_PIN);
+        panStepper->setAutoEnable(true); // Automatically disables driver on idle to save power
+
+        // Set Kinematics (Steps / sec)
+        panStepper->setSpeedInHz(15000);    // 15000 steps/sec max
+        panStepper->setAcceleration(20000); // 20000 steps/sec^2
+        DB_PRINTLN("[STEPPER] Pan axis hardware timer initialized successfully.");
+    }
+    else
+    {
+        DB_PRINTLN("[ERROR] Failed to attach Pan stepper to hardware timer!");
+    }
+
+    // 5. Connect Tilt Stepper to Hardware Timers
+    tiltStepper = engine.stepperConnectToPin(TILT_STEP_PIN);
+    if (tiltStepper)
+    {
+        tiltStepper->setDirectionPin(TILT_DIR_PIN);
+        tiltStepper->setEnablePin(TILT_ENABLE_PIN);
+        tiltStepper->setAutoEnable(true);
+
+        // Set Kinematics
+        tiltStepper->setSpeedInHz(15000);    // 15000 steps/sec max
+        tiltStepper->setAcceleration(20000); // 20000 steps/sec^2
+        DB_PRINTLN("[STEPPER] Tilt axis hardware timer initialized successfully.");
+    }
+    else
+    {
+        DB_PRINTLN("[ERROR] Failed to attach Tilt stepper to hardware timer!");
+    }
+
+    DB_PRINTLN("[SYSTEM] Bombadeer Controller Online. Ready for tracking commands.");
 }
 
 void loop()
 {
-    static boolean firstNotification = true;
-
     // check the battery voltage and if necessary, inform the user
 #ifdef BATTERY_VOLTAGE
     EVERY_N_MILLISECONDS(5000)
@@ -144,14 +258,14 @@ void loop()
     }
 #endif // BATTERY_VOLTAGE
 
+    processSerialCommands();
+
     // Handle Xbox controller
     xboxController.onLoop();
     if (xboxController.isConnected())
     {
-        //DB_PRINTLN("Xbox controller connected");
         if (xboxController.isWaitingForFirstNotification())
         {
-            DB_PRINTLN("waiting for first xbox controller notification");
 #ifdef DEBUG
             static const char *spinner = "|/-\\";
             static int spinner_index = 0;
@@ -162,12 +276,6 @@ void loop()
         }
         else
         {
-            if (firstNotification)
-            {
-                firstNotification = false;
-                onXboxConnect();
-            }
-
             //
             // Pan
             //
@@ -183,7 +291,10 @@ void loop()
                 pan = -(pan * pan);
             else
                 pan = pan * pan;
-            DB_PRINTF("pan = %f\n", pan);
+
+            // move in response to the pan input, scaled by a factor of 1000 steps per loop iteration
+            if (panStepper && pan)
+                panStepper->moveTo(panStepper->getCurrentPosition() + pan * 10000);
 
             //
             // Tilt
@@ -196,11 +307,14 @@ void loop()
                 tilt = 0;
 
             // use a power of 2 (squared) response curve to dampen the response around center and ramp it up the further you go
-            if (tilt)
+            if (tilt < 0)
                 tilt = -(tilt * tilt);
             else
                 tilt = tilt * tilt;
-            DB_PRINTF("tilt = %f\n", tilt);
+
+            // move in response to the tilt input, scaled by a factor of 1000 steps per loop iteration
+            if (tiltStepper && tilt)
+                tiltStepper->moveTo(tiltStepper->getCurrentPosition() + tilt * 10000);
 
             //
             // Trigger
@@ -250,12 +364,5 @@ void loop()
                 ;
 #endif
         }
-    }
-    else
-    {
-        DB_PRINTLN("Xbox controller disconnected");
-        if (!firstNotification)
-            onXboxDisconnect();
-        firstNotification = true;
     }
 }
