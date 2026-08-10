@@ -6,18 +6,18 @@
 // ESP32 Pin Assignments
 
 // Driver 1: Pan Axis
-#define PAN_USTEP_PIN1 19
-#define PAN_USTEP_PIN2 18
-#define PAN_STEP_PIN     26
-#define PAN_DIR_PIN      25
-#define PAN_ENABLE_PIN   27
+#define PAN_USTEP_PIN1 04
+#define PAN_USTEP_PIN2 27
+#define PAN_STEP_PIN   26
+#define PAN_DIR_PIN    25
 
 // Driver 2: Tilt Axis
-#define TILT_USTEP_PIN1 05
-#define TILT_USTEP_PIN2 04
-#define TILT_STEP_PIN    33
-#define TILT_DIR_PIN     32
-#define TILT_ENABLE_PIN  27
+#define TILT_USTEP_PIN1 18
+#define TILT_USTEP_PIN2 05
+#define TILT_STEP_PIN   33
+#define TILT_DIR_PIN    32
+
+#define SHARED_ENABLE_PIN 19
 
 // TMC2209 Single-Wire UART Pins (Shared UART2)
 #define TMC_RX_PIN       16  // ESP32 RX2 connected to TMC2209 TX/RX pins

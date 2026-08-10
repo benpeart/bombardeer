@@ -26,8 +26,8 @@ Preferences preferences;
 #define BATTERY_VOLTAGE_FULL 22.3   // the voltage of a full battery
 
 // bind to any xbox controller
-#define DEADZONE_RADIUS 0.15
-#define TRIGGER_THRESHOLD 0.15
+#define DEADZONE_RADIUS 0.25f
+#define TRIGGER_THRESHOLD 0.15f
 XboxSeriesXControllerESP32_asukiaaa::Core xboxController;
 
 #ifdef BATTERY_VOLTAGE
@@ -78,7 +78,7 @@ FastAccelStepper *tiltStepper = NULL;
 /*
  * Configure TMC2209 Driver Parameters over UART using teemuatlut/TMCStepper
  */
-void initTMC2209(TMC2209Stepper &driver, const char *axisName, uint16_t current_mA)
+void initTMC2209(TMC2209Stepper &driver, const char *axisName, uint16_t current_mA, bool useSpreadCycle)
 {
     driver.begin();
 
@@ -86,18 +86,137 @@ void initTMC2209(TMC2209Stepper &driver, const char *axisName, uint16_t current_
     uint8_t result = driver.test_connection();
     if (result != 0)
     {
-        DB_PRINTF("[TMC2209] ERROR: %s axis connection failed! Code: %d (Check wiring/addressing)", axisName, result);
+        DB_PRINTF("[TMC2209] ERROR: %s axis connection failed! Code: %d (Check wiring/addressing)\n", axisName, result);
         return;
     }
 
-    driver.toff(5);                 // Enable driver (Disable = 0)
-    driver.rms_current(current_mA); // Set run current in mA RMS
-    driver.iholddelay(10);          // Holding current delay
-    driver.microsteps(16);          // Set microstepping to 1/16
-    driver.en_spreadCycle(false);   // Enable StealthChop2 (Whisper quiet)
-    driver.pwm_autoscale(true);     // Auto-tune motor current scale
+    driver.toff(4);        // Enable driver chopper (TOFF = 4 is recommended for 24V/12V systems)
+    driver.blank_time(24); // Set comparator blank time
 
-    DB_PRINTF("[TMC2209] %s Driver Configured OK: %d mA RMS, 1/16 Microstepping, StealthChop ON", axisName, current_mA);
+    // Set RMS current and holding current ratio (0.5 = 50% hold current)
+    // 17HS19-2004S1 is rated 2.0A Peak (~1414mA RMS).
+    // Setting 1200mA RMS is ~85% max capacity to keep drivers cool without active fans.
+    driver.rms_current(current_mA, 0.5);
+
+    driver.microsteps(16); // 1/16 Microstepping from controller
+    driver.intpol(true);   // Interpolate to 1/256 microsteps internally (Ultra smooth)
+
+    driver.iholddelay(10); // Delays ~0.3 seconds after last step before entering hold current
+    driver.TPOWERDOWN(20); // Delay between standstill and powerdown
+
+    if (useSpreadCycle)
+    {
+        // High-torque mode: Recommended for high speed/accel (15000 steps/sec)
+        driver.en_spreadCycle(true);
+        driver.pwm_autoscale(false);
+        DB_PRINTF("[TMC2209] %s Configured: %d mA RMS, SpreadCycle (High Torque)\n", axisName, current_mA);
+    }
+    else
+    {
+        // Quiet mode with automatic StealthChop -> SpreadCycle velocity threshold
+        driver.en_spreadCycle(false);
+        driver.pwm_autoscale(true);
+        // Automatically switch from StealthChop to SpreadCycle at higher RPM to prevent lost steps
+        driver.TPWMTHRS(100);
+        DB_PRINTF("[TMC2209] %s Configured: %d mA RMS, StealthChop + Hybrid Switch\n", axisName, current_mA);
+    }
+}
+
+// Persistent state tracker per axis to manage hysteresis and single-shot stops
+struct AxisControlState
+{
+    int lastDir = 0;          // -1 = Reverse, 0 = Stopped, 1 = Forward
+    uint32_t lastSpeedHz = 0; // Last speed commanded to the driver
+};
+
+/**
+ * Controls a FastAccelStepper motor smoothly using analog joystick input.
+ *
+ * @param rawInput     Normalized joystick axis (-1.0 to +1.0)
+ * @param deadzone     Joystick deadzone radius (e.g., 0.15f)
+ * @param maxSpeedHz   Target top speed at 100% stick deflection (e.g., 15000)
+ * @param minSpeedHz   Minimum smooth starting speed in Hz (e.g., 250)
+ * @param hysteresisHz Noise threshold before updating speed mid-flight (e.g., 300)
+ * @param exponent     Exponential curve factor (1.0 = linear, 2.0 = quadratic, 3.0 = cubic)
+ * @param stepper      Pointer to FastAccelStepper instance
+ * @param state        Reference to the persistent AxisControlState tracker
+ */
+void updateAxisFromJoystick(
+    float rawInput,
+    float deadzone,
+    uint32_t maxSpeedHz,
+    uint32_t minSpeedHz,
+    uint32_t hysteresisHz,
+    float exponent,
+    FastAccelStepper *stepper,
+    AxisControlState &state)
+{
+    if (!stepper)
+        return;
+
+    float absInput = fabs(rawInput);
+
+    // =========================================================================
+    // REQUIREMENT 4: Single-Shot Stop on Deadzone Release
+    // =========================================================================
+    if (absInput <= deadzone)
+    {
+        if (state.lastDir != 0)
+        {
+            stepper->stopMove(); // Trigger smooth deceleration ONCE
+            state.lastDir = 0;
+            state.lastSpeedHz = 0;
+        }
+        return; // Exit early so no speed/accel commands disrupt deceleration
+    }
+
+    // =========================================================================
+    // REQUIREMENT 1: Percentage of Stick Travel Past Deadzone (0.0 to 1.0)
+    // =========================================================================
+    float normPct = (absInput - deadzone) / (1.0f - deadzone);
+    if (normPct > 1.0f)
+        normPct = 1.0f;
+
+    // =========================================================================
+    // REQUIREMENT 2: Exponential Response Curve for Low-Speed Precision
+    // =========================================================================
+    float curvedPct = powf(normPct, exponent);
+
+    // Map percentage to target frequency (Hz)
+    uint32_t targetSpeedHz = (uint32_t)(curvedPct * maxSpeedHz);
+    if (targetSpeedHz < minSpeedHz)
+        targetSpeedHz = minSpeedHz;
+
+    int currentDir = (rawInput > 0.0f) ? 1 : -1;
+
+    // =========================================================================
+    // REQUIREMENT 3: Hysteresis Filtering & Minimal Driver Updates
+    // =========================================================================
+    bool dirChanged = (currentDir != state.lastDir);
+    bool speedChangedSignificantly = (abs((long)targetSpeedHz - (long)state.lastSpeedHz) > (long)hysteresisHz);
+
+    if (dirChanged)
+    {
+        // Direction changed OR starting from a stop
+        stepper->setSpeedInHz(targetSpeedHz);
+        if (currentDir > 0)
+        {
+            stepper->runForward();
+        }
+        else
+        {
+            stepper->runBackward();
+        }
+        state.lastDir = currentDir;
+        state.lastSpeedHz = targetSpeedHz;
+    }
+    else if (speedChangedSignificantly)
+    {
+        // Same direction: update speed dynamically ONLY if stick moved past hysteresis band
+        stepper->setSpeedInHz(targetSpeedHz);
+        stepper->applySpeedAcceleration(); // Signal FastAccelStepper to update speed mid-flight
+        state.lastSpeedHz = targetSpeedHz;
+    }
 }
 
 /*
@@ -121,6 +240,11 @@ void processSerialCommands()
                 if (tiltStepper)
                     tiltStepper->moveTo(tiltTarget);
             }
+            else
+            {
+                DB_PRINTLN("[ERROR] Invalid command format received: " + inputBuffer);
+            }
+
             inputBuffer = "";
         }
         else if (c != '\r')
@@ -160,75 +284,93 @@ void setup()
         DB_PRINTF("EEPROM init complete, all preferences deleted, new pref_version: %d\n", PREF_VERSION);
     }
 
+    //
     // Setup Xbox controller
+    //
     xboxController.begin();
 
-    // Disable steppers during startup
-    pinMode(PAN_ENABLE_PIN, OUTPUT);
-    digitalWrite(PAN_ENABLE_PIN, HIGH); // disable driver in hardware
+    //
+    // Setup the TMC2209 Stepper Drivers and FastAccelStepper Engine
+    //
 
-    // setup micro stepping/serial address pins for output
-    pinMode(PAN_USTEP_PIN1, OUTPUT);
-    pinMode(PAN_USTEP_PIN2, OUTPUT);
-    pinMode(PAN_STEP_PIN, OUTPUT);
-    pinMode(PAN_DIR_PIN, OUTPUT);
-    pinMode(TILT_USTEP_PIN1, OUTPUT);
-    pinMode(TILT_USTEP_PIN2, OUTPUT);
-    pinMode(TILT_STEP_PIN, OUTPUT);
-    pinMode(TILT_DIR_PIN, OUTPUT);
+    // Hardware Enable Pin Setup (Shared between Pan and Tilt)
+    pinMode(SHARED_ENABLE_PIN, OUTPUT);
+    digitalWrite(SHARED_ENABLE_PIN, HIGH); // Drive HIGH initially (Keep drivers disabled during UART config)
 
-    // 1. Initialize Hardware UART2 for TMC2209 Drivers
+    // Explicitly lock in TMC2209 UART Addresses via MS1 / MS2
+    // This can be overriden using physical jumpers next to the TMC2209 driver
+    pinMode(PAN_USTEP_PIN1, OUTPUT);  // MS1
+    pinMode(PAN_USTEP_PIN2, OUTPUT);  // MS2
+    pinMode(TILT_USTEP_PIN1, OUTPUT); // MS1
+    pinMode(TILT_USTEP_PIN2, OUTPUT); // MS2
+
+    // --- PAN AXIS ADDRESS: 0 (MS1=LOW, MS2=LOW) ---
+    digitalWrite(PAN_USTEP_PIN1, LOW);
+    digitalWrite(PAN_USTEP_PIN2, LOW);
+
+    // --- TILT AXIS ADDRESS: 1 (MS1=HIGH, MS2=LOW) ---
+    digitalWrite(TILT_USTEP_PIN1, HIGH);
+    digitalWrite(TILT_USTEP_PIN2, LOW);
+
+    // Give hardware pins 10ms to settle to solid voltage levels
+    delay(10);
+
+    // Initialize Hardware UART2 for TMC2209 Drivers
     SERIAL_PORT.begin(115200, SERIAL_8N1, TMC_RX_PIN, TMC_TX_PIN);
 
-    // 2. Configure TMC2209 Registers over UART
-    DB_PRINTLN("[TMC2209] Configuring Drivers...");
-    initTMC2209(panTMC, "PAN", 1200);   // 1200 mA RMS run current
-    initTMC2209(tiltTMC, "TILT", 1000); // 1000 mA RMS run current
+    // Configure TMC2209 Registers over UART
+    initTMC2209(panTMC, "PAN", 1300, true);   // Pan Axis: 1300 mA RMS, SpreadCycle enabled for rapid 180-degree pans
+    initTMC2209(tiltTMC, "TILT", 1200, true); // Tilt Axis: 1200 mA RMS, SpreadCycle enabled to maintain torque against gravity/payload
 
-    // 3. Initialize FastAccelStepper Engine
+    // Enable both drivers in hardware permanently
+    digitalWrite(SHARED_ENABLE_PIN, LOW); // LOW = Drivers Enabled
+
+    // Initialize FastAccelStepper Engine
     engine.init();
 
-    // 4. Connect Pan Stepper to Hardware Timers
+    // Connect Pan Stepper to Hardware Timers
     panStepper = engine.stepperConnectToPin(PAN_STEP_PIN);
     if (panStepper)
     {
         panStepper->setDirectionPin(PAN_DIR_PIN);
-        panStepper->setEnablePin(PAN_ENABLE_PIN);
-        panStepper->setAutoEnable(true); // Automatically disables driver on idle to save power
 
         // Set Kinematics (Steps / sec)
-        panStepper->setSpeedInHz(15000);    // 15000 steps/sec max
-        panStepper->setAcceleration(20000); // 20000 steps/sec^2
-        DB_PRINTLN("[STEPPER] Pan axis hardware timer initialized successfully.");
+        panStepper->setSpeedInHz(15000); // 15000 steps/sec max
+
+        // 12,000 steps/s^2 reaches 15,000 Hz in 1.25 seconds (well under the 2-second limit)
+        // and brings the motor to a full stop from top speed in 1.25 seconds.
+        panStepper->setAcceleration(12000);
     }
     else
     {
         DB_PRINTLN("[ERROR] Failed to attach Pan stepper to hardware timer!");
     }
 
-    // 5. Connect Tilt Stepper to Hardware Timers
+    // Connect Tilt Stepper to Hardware Timers
     tiltStepper = engine.stepperConnectToPin(TILT_STEP_PIN);
     if (tiltStepper)
     {
         tiltStepper->setDirectionPin(TILT_DIR_PIN);
-        tiltStepper->setEnablePin(TILT_ENABLE_PIN);
-        tiltStepper->setAutoEnable(true);
 
         // Set Kinematics
-        tiltStepper->setSpeedInHz(15000);    // 15000 steps/sec max
-        tiltStepper->setAcceleration(20000); // 20000 steps/sec^2
-        DB_PRINTLN("[STEPPER] Tilt axis hardware timer initialized successfully.");
+        tiltStepper->setSpeedInHz(15000); // 15000 steps/sec max
+
+        // 12,000 steps/s^2 reaches 15,000 Hz in 1.25 seconds (well under the 2-second limit)
+        // and brings the motor to a full stop from top speed in 1.25 seconds.
+        tiltStepper->setAcceleration(12000); // 12000 steps/sec^2
     }
     else
     {
         DB_PRINTLN("[ERROR] Failed to attach Tilt stepper to hardware timer!");
     }
-
-    DB_PRINTLN("[SYSTEM] Bombadeer Controller Online. Ready for tracking commands.");
 }
 
 void loop()
 {
+    // Declare persistent state objects outside loop or as static
+    static AxisControlState panState;
+    static AxisControlState tiltState;
+
     // check the battery voltage and if necessary, inform the user
 #ifdef BATTERY_VOLTAGE
     EVERY_N_MILLISECONDS(5000)
@@ -258,111 +400,31 @@ void loop()
     }
 #endif // BATTERY_VOLTAGE
 
+    // handle incoming serial commands from the Raspberry Pi 5
     processSerialCommands();
 
-    // Handle Xbox controller
+    // handle the Xbox controller input
     xboxController.onLoop();
-    if (xboxController.isConnected())
+    if (xboxController.isConnected() && !xboxController.isWaitingForFirstNotification())
     {
-        if (xboxController.isWaitingForFirstNotification())
-        {
-#ifdef DEBUG
-            static const char *spinner = "|/-\\";
-            static int spinner_index = 0;
+        // Dynamically calculate center offset and half-range using maxJoy
+        const float halfJoy = (float)XboxControllerNotificationParser::maxJoy / 2.0f;
 
-            DB_PRINTF("\r%c", spinner[spinner_index]);
-            spinner_index = (spinner_index + 1) % sizeof(spinner);
-#endif // DEBUG
-        }
-        else
-        {
-            //
-            // Pan
-            //
-            // normalize the controller input to the range of -1.0 to 1.0
-            float pan = (float)(xboxController.xboxNotif.joyLHori - (XboxControllerNotificationParser::maxJoy / 2)) / (XboxControllerNotificationParser::maxJoy / 2);
+        // Normalize raw inputs to -1.0 to +1.0 range
+        float rawPan = ((float)xboxController.xboxNotif.joyLHori - halfJoy) / halfJoy;
+        float rawTilt = ((float)xboxController.xboxNotif.joyLVert - halfJoy) / halfJoy;
 
-            // if within the dead zone, zero it out
-            if (pan > -DEADZONE_RADIUS && pan < DEADZONE_RADIUS)
-                pan = 0;
+        // Process Pan Axis:
+        // Deadzone: 0.15 | MaxSpeed: 15000Hz | MinSpeed: 250Hz | Hysteresis: 300Hz | Exponent: 2.0 (Quadratic)
+        updateAxisFromJoystick(rawPan, DEADZONE_RADIUS, 15000, 250, 300, 2.0f, panStepper, panState);
 
-            // use a power of 2 (squared) response curve to dampen the response around center and ramp it up the further you go
-            if (pan < 0)
-                pan = -(pan * pan);
-            else
-                pan = pan * pan;
+        // Process Tilt Axis:
+        updateAxisFromJoystick(rawTilt, DEADZONE_RADIUS, 15000, 250, 300, 2.0f, tiltStepper, tiltState);
 
-            // move in response to the pan input, scaled by a factor of 1000 steps per loop iteration
-            if (panStepper && pan)
-                panStepper->moveTo(panStepper->getCurrentPosition() + pan * 10000);
-
-            //
-            // Tilt
-            //
-            // normalize the controller input to the range of -1.0 to 1.0
-            float tilt = (float)(xboxController.xboxNotif.joyLVert - (XboxControllerNotificationParser::maxJoy / 2)) / (XboxControllerNotificationParser::maxJoy / 2);
-
-            // if within the dead zone, zero it out
-            if (tilt > -DEADZONE_RADIUS && tilt < DEADZONE_RADIUS)
-                tilt = 0;
-
-            // use a power of 2 (squared) response curve to dampen the response around center and ramp it up the further you go
-            if (tilt < 0)
-                tilt = -(tilt * tilt);
-            else
-                tilt = tilt * tilt;
-
-            // move in response to the tilt input, scaled by a factor of 1000 steps per loop iteration
-            if (tiltStepper && tilt)
-                tiltStepper->moveTo(tiltStepper->getCurrentPosition() + tilt * 10000);
-
-            //
-            // Trigger
-            //
-            // normalize the controller input to the range of 0.0 to 1.0
-            float trigger = ((float)xboxController.xboxNotif.trigRT / XboxControllerNotificationParser::maxTrig);
-            if (trigger > TRIGGER_THRESHOLD)
-                DB_PRINTF("trigger = %f\n", trigger);
-
-#if 0
-            // normalize the controller input to the range of 0.0 to 1.0
-            float car_speed_forward = ((float)xboxController.xboxNotif.trigRT / XboxControllerNotificationParser::maxTrig);
-            float car_speed_reverse = ((float)xboxController.xboxNotif.trigLT / XboxControllerNotificationParser::maxTrig);
-
-            // subtract the requested reverse speed from the requested forward speed in case both triggers are requesting different values
-            remoteControl.speed = -(car_speed_forward - car_speed_reverse);
-
-            // if within the dead zone, zero it out
-            if (remoteControl.speed > -SPEED_DEADZONE_RADIUS && remoteControl.speed < SPEED_DEADZONE_RADIUS)
-                remoteControl.speed = 0;
-
-            // adjust the gain and scale the result according to the d-pad input
-            remoteControl.speed = remoteControl.speed * remoteControl.speedGain + remoteControl.speedOffset;
-            remoteControl.steer = remoteControl.steer * remoteControl.steerGain;
-
-            // now scale the output from -1.0 to 1.0 to -100 to 100
-            remoteControl.speed *= 100;
-            remoteControl.steer *= 100;
-
-            // handle other Xbox inputs
-            xboxController.getReceiveNotificationAt();
-            if (xboxController.xboxNotif.btnDirUp)
-                ;
-            if (xboxController.xboxNotif.btnDirDown)
-                ;
-            if (xboxController.xboxNotif.btnDirLeft)
-                ;
-            if (xboxController.xboxNotif.btnDirRight)
-                ;
-            if (xboxController.xboxNotif.btnA)
-                ;
-            if (xboxController.xboxNotif.btnB)
-                ;
-            if (xboxController.xboxNotif.btnLB)
-                ;
-            if (xboxController.xboxNotif.btnRB)
-                ;
-#endif
-        }
+        // Process right trigger:
+        // normalize the controller input to the range of 0.0 to 1.0
+        float trigger = ((float)xboxController.xboxNotif.trigRT / XboxControllerNotificationParser::maxTrig);
+        if (trigger > TRIGGER_THRESHOLD)
+            DB_PRINTF("trigger = %f\n", trigger);
     }
 }

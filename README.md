@@ -106,21 +106,5 @@ P:1200,T:-450
 
 Note: If an Xbox controller is actively connected and generating manual joystick/button input, manual override automatically gates serial commands to prevent trajectory conflict.
 
-## ⚙️ Configuration & Hardware Pinout
-Adjust configuration parameters in globals.h:
-
-```
-// TMC2209 UART Driver Addresses (Configured via MS1 / MS2 Pins)
-#define PAN_DRIVER_ADDR   0b00 // MS1 = LOW,  MS2 = LOW
-#define TILT_DRIVER_ADDR  0b01 // MS1 = HIGH, MS2 = LOW
-
-// Motor Current Calibration
-#define PAN_RMS_CURRENT_MA   1300 // mA RMS (~85% rated capacity)
-#define TILT_RMS_CURRENT_MA  1200 // mA RMS
-
-// Hardware Sense Resistor
-#define R_SENSE 0.11f // Standard 0.11 ohm for TMC2209 StepStick
-```
-
 ## ⚠️ Safety Disclaimer
 This project is intended strictly for agricultural property management and wildlife deterrence. Ensure all hardware deployment complies with local ordinances regarding non-lethal wildlife management. Always verify hardware safety stops and clear line-of-sight before arming the turret.
