@@ -23,7 +23,7 @@ Preferences preferences;
 // Xbox Controller Deadzone and Trigger Thresholds
 #define DEADZONE_RADIUS 0.25f
 #define TRIGGER_THRESHOLD 0.15f
-#define SOLENOID_PULSE_LENGTH 50    // 40-60ms is a good range for the For the Heschen HS-1564B
+#define SOLENOID_PULSE_LENGTH 50 // 40-60ms is a good range for the For the Heschen HS-1564B
 
 // bind to any xbox controller
 XboxSeriesXControllerESP32_asukiaaa::Core xboxController;
@@ -108,14 +108,14 @@ struct AxisControlState
 /**
  * Controls a FastAccelStepper motor smoothly using analog joystick input.
  *
+ * @param stepper      Pointer to FastAccelStepper instance
+ * @param state        Reference to the persistent AxisControlState tracker
  * @param rawInput     Normalized joystick axis (-1.0 to +1.0)
  * @param deadzone     Joystick deadzone radius (e.g., 0.15f)
  * @param maxSpeedHz   Target top speed at 100% stick deflection (e.g., 15000)
  * @param minSpeedHz   Minimum smooth starting speed in Hz (e.g., 250)
  * @param hysteresisHz Noise threshold before updating speed mid-flight (e.g., 300)
  * @param exponent     Exponential curve factor (1.0 = linear, 2.0 = quadratic, 3.0 = cubic)
- * @param stepper      Pointer to FastAccelStepper instance
- * @param state        Reference to the persistent AxisControlState tracker
  */
 void updateAxisFromJoystick(
     FastAccelStepper *stepper,
@@ -192,6 +192,27 @@ void updateAxisFromJoystick(
         stepper->setSpeedInHz(targetSpeedHz);
         stepper->applySpeedAcceleration(); // Signal FastAccelStepper to update speed mid-flight
         state.lastSpeedHz = targetSpeedHz;
+    }
+}
+
+static unsigned long solenoidStartTime = 0;
+void triggerSolenoid()
+{
+    // Prevent overlapping triggers
+    if (!solenoidStartTime)
+    {
+        digitalWrite(PIN_SOLENOID, HIGH);
+        solenoidStartTime = millis();
+    }
+}
+
+void updateSolenoid()
+{
+    // Turn off pin after time expires
+    if (solenoidStartTime && (millis() - solenoidStartTime >= SOLENOID_PULSE_LENGTH))
+    {
+        digitalWrite(PIN_SOLENOID, LOW);
+        solenoidStartTime = 0;
     }
 }
 
@@ -367,7 +388,6 @@ void loop()
         float rawTilt = ((float)xboxController.xboxNotif.joyLVert - halfJoy) / halfJoy;
 
         // Process Pan Axis:
-        // Deadzone: 0.15 | MaxSpeed: 15000Hz | MinSpeed: 250Hz | Hysteresis: 300Hz | Exponent: 2.0 (Quadratic)
         updateAxisFromJoystick(panStepper, panState, rawPan);
 
         // Process Tilt Axis:
@@ -379,9 +399,8 @@ void loop()
         if (trigger > TRIGGER_THRESHOLD)
         {
             DB_PRINTF("trigger = %f\n", trigger);
-            digitalWrite(PIN_SOLENOID, HIGH); // Pull solenoid IN
-            delay(SOLENOID_PULSE_LENGTH);     // Pulse length (e.g., 50ms - 100ms)
-            digitalWrite(PIN_SOLENOID, LOW);  // Release solenoid
+            triggerSolenoid();
         }
     }
+    updateSolenoid();
 }

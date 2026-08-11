@@ -35,13 +35,13 @@ Powered by a **Raspberry Pi 5** with a **26 TOPS Hailo-8 AI accelerator** for re
                                                          UART / Step / Dir
                                                                  |
                                                                  v
-                                                      +-----------------------+
-                                                      |  Dual TMC2209 Drivers |
-                                                      +-----------+-----------+
-                                                                  |
-                                                                  4-Wire Stepper
-                                                                  |
-                                                                  v
+                                                     +-----------------------+
+                                                     |  Dual TMC2209 Drivers |
+                                                     +-----------+-----------+
+                                                                 |
+                                                            4-Wire Stepper
+                                                                 |
+                                                                 v
                                                       +-----------------------+
                                                       | STEPPERONLINE NEMA 17 |
                                                       |   Pan & Tilt Motors   |
