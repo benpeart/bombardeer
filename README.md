@@ -1,6 +1,6 @@
-# 🎯 Bombadeer: Autonomous Vision-Guided Deterrent Turret
+# 🎯 Bombardeer: Autonomous Vision-Guided Deterrent Turret
 
-**Bombadeer** is an open-source, vision-guided autonomous deterrent turret designed to protect outdoor spaces, gardens, orchards, and agricultural property from intrusive wildlife (such as deer). 
+**Bombardeer** is an open-source, vision-guided autonomous deterrent turret designed to protect outdoor spaces, gardens, orchards, and agricultural property from intrusive wildlife (such as deer). 
 
 Powered by a **Raspberry Pi 5** with a **26 TOPS Hailo-8 AI accelerator** for real-time visual tracking and an **ESP32** dedicated microcontroller running `FastAccelStepper` and `TMCStepper` for precision pan/tilt kinematic execution.
 
@@ -13,40 +13,39 @@ Powered by a **Raspberry Pi 5** with a **26 TOPS Hailo-8 AI accelerator** for re
 * **Heavy Payload Mechanics:** Built to handle a full paintball assembly (~4.5–5.0 kg total mass including marker, CO2 tank, and hopper) via a self-locking 30:1 worm gear on tilt and gear reduction on pan.
 * **Dual Control Modes:**
   * **Autonomous Mode:** High-speed UART targeting stream (`P:<pan>,T:<tilt>`) driven by Pi 5 AI inference.
-  * **Manual Override:** Wireless Xbox Series X/S controller integration via Bluetooth with velocity scaling, exponential response curves, and D-Pad precision jogging.
+  * **Manual Override:** Wireless Xbox Series X/S controller integration via Bluetooth with velocity scaling, and exponential response curves.
 * **TMC2209 UART Integration:** Dynamically manages current limits, microstepping (1/16 interpolated to 1/256), and native `ihold` power saving over UART.
-* **Smart Power & Battery Protection:** Built-in battery voltage monitoring with low-voltage alert states and auto-deep sleep power cutoff.
 
 ---
 
 ## 🛠️ System Architecture
 
 ```
-+-------------------------------+
-                   |   Xbox Series X Controller    |
-                   |       (Bluetooth Manual)      |
-                   +---------------+---------------+
-                                   |
-                                   v
+                                                 +-------------------------------+
+                                                 |   Xbox Series X Controller    |
+                                                 |       (Bluetooth Manual)      |
+                                                 +---------------+---------------+
+                                                                 |
+                                                                 v
 +-----------------------+     UART (115200 Baud)     +-----------------------+
 |  Raspberry Pi 5 +     |--------------------------->|    ESP32 Controller   |
 |  Hailo-8 AI (26 TOPS) |   Target Commands (P, T)   |   (FastAccelStepper)  |
 +-----------------------+                            +-----------+-----------+
-|
-UART / Step / Dir
-|
-v
-+-----------------------+
-|  Dual TMC2209 Drivers |
-+-----------+-----------+
-|
-4-Wire Stepper
-|
-v
-+-----------------------+
-| STEPPERONLINE NEMA 17 |
-|   Pan & Tilt Motors   |
-+-----------------------+
+                                                                 |
+                                                         UART / Step / Dir
+                                                                 |
+                                                                 v
+                                                      +-----------------------+
+                                                      |  Dual TMC2209 Drivers |
+                                                      +-----------+-----------+
+                                                                  |
+                                                                  4-Wire Stepper
+                                                                  |
+                                                                  v
+                                                      +-----------------------+
+                                                      | STEPPERONLINE NEMA 17 |
+                                                      |   Pan & Tilt Motors   |
+                                                      +-----------------------+
 ```
 ---
 
@@ -61,7 +60,7 @@ v
 | **Motors** | $2\times$ STEPPERONLINE 17HS19-2004S1 | NEMA 17 ($2.0\text{A}$ Peak, $59\text{ N}\cdot\text{cm}$ Holding Torque) |
 | **Tilt Reduction** | 30:1 Worm Gear | Self-locking anti-backdrive mechanism |
 | **Payload** | Paintball Marker + Hopper + CO2 | Active non-lethal deterrent |
-| **Power Supply** | 12V–24V LiFePO4 / Battery Bank | Voltage divider on ADC pin for voltage monitoring |
+| **Power Supply** | 12V–24V LiFePO4 / Battery Bank|
 
 ---
 

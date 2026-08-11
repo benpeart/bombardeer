@@ -20,47 +20,23 @@ Preferences preferences;
 #define PREF_NAMESPACE "pref"
 #define PREF_KEY_VERSION "ver"
 
-#define BATTERY_VOLTAGE_USB 5       // the voltage when running via USB instead of the battery
-#define BATTERY_VOLTAGE_LOW 20      // the voltage we warn the user
-#define BATTERY_VOLTAGE_SHUTDOWN 18 // the voltage we shutdown to prevent damaging the battery
-#define BATTERY_VOLTAGE_FULL 22.3   // the voltage of a full battery
-
-// bind to any xbox controller
+// Xbox Controller Deadzone and Trigger Thresholds
 #define DEADZONE_RADIUS 0.25f
 #define TRIGGER_THRESHOLD 0.15f
+#define SOLENOID_PULSE_LENGTH 50    // 40-60ms is a good range for the For the Heschen HS-1564B
+
+// bind to any xbox controller
 XboxSeriesXControllerESP32_asukiaaa::Core xboxController;
-
-#ifdef BATTERY_VOLTAGE
-float BatteryVoltage()
-{
-    // Measure battery voltage
-#ifdef BATTERY_VOLTAGE
-    const float R1 = 100000.0;        // 100kΩ
-    const float R2 = 10000.0;         // 10kΩ
-    const float ADC_MAX = 4095.0;     // 12-bit ADC
-    const float V_REF = 3.3;          // Reference voltage
-    const float ALPHA = 0.05;         // low pass filter
-    static float filteredBattery = 0; // use a low-pass filter to smooth battery readings
-
-    int adcValue = analogRead(PIN_BATTERY_VOLTAGE);
-    float voltage = (adcValue / ADC_MAX) * V_REF;
-    float batteryVoltage = voltage * (R1 + R2) / R2;
-
-    // take the first and filter the rest
-    if (!filteredBattery)
-        filteredBattery = batteryVoltage;
-    else
-        filteredBattery = (ALPHA * batteryVoltage) + ((1 - ALPHA) * filteredBattery);
-
-    // return the battery voltage
-    return filteredBattery;
-#endif // BATTERY_VOLTAGE
-}
-#endif // BATTERY_VOLTAGE
 
 // ============================================================================
 // Stepper LIBRARY INSTANTIATIONS
 // ============================================================================
+
+#define STEPPER_ACCELERATION 12000 // 12000 steps/sec^2
+#define STEPPER_SPEEDHZ 16000      // 16000 steps/sec max
+#define STEPPER_MINSPEEDHZ 250
+#define STEPPER_HYSTERESISHZ 300
+#define STEPPER_EXPONENT 2.0f // 1.0f = linear, 2.0f = quadratic, 3.0f = cubic
 
 // TMCStepper Driver Configuration Objects
 TMC2209Stepper panTMC(&SERIAL_PORT, R_SENSE, PAN_DRIVER_ADDR);
@@ -142,14 +118,14 @@ struct AxisControlState
  * @param state        Reference to the persistent AxisControlState tracker
  */
 void updateAxisFromJoystick(
-    float rawInput,
-    float deadzone,
-    uint32_t maxSpeedHz,
-    uint32_t minSpeedHz,
-    uint32_t hysteresisHz,
-    float exponent,
     FastAccelStepper *stepper,
-    AxisControlState &state)
+    AxisControlState &state,
+    float rawInput,
+    float deadzone = DEADZONE_RADIUS,
+    uint32_t maxSpeedHz = STEPPER_SPEEDHZ,
+    uint32_t minSpeedHz = STEPPER_MINSPEEDHZ,
+    uint32_t hysteresisHz = STEPPER_HYSTERESISHZ,
+    float exponent = STEPPER_EXPONENT)
 {
     if (!stepper)
         return;
@@ -157,7 +133,7 @@ void updateAxisFromJoystick(
     float absInput = fabs(rawInput);
 
     // =========================================================================
-    // REQUIREMENT 4: Single-Shot Stop on Deadzone Release
+    // Single-Shot Stop on Deadzone Release
     // =========================================================================
     if (absInput <= deadzone)
     {
@@ -171,14 +147,14 @@ void updateAxisFromJoystick(
     }
 
     // =========================================================================
-    // REQUIREMENT 1: Percentage of Stick Travel Past Deadzone (0.0 to 1.0)
+    // Percentage of Stick Travel Past Deadzone (0.0 to 1.0)
     // =========================================================================
     float normPct = (absInput - deadzone) / (1.0f - deadzone);
     if (normPct > 1.0f)
         normPct = 1.0f;
 
     // =========================================================================
-    // REQUIREMENT 2: Exponential Response Curve for Low-Speed Precision
+    // Exponential Response Curve for Low-Speed Precision
     // =========================================================================
     float curvedPct = powf(normPct, exponent);
 
@@ -190,7 +166,7 @@ void updateAxisFromJoystick(
     int currentDir = (rawInput > 0.0f) ? 1 : -1;
 
     // =========================================================================
-    // REQUIREMENT 3: Hysteresis Filtering & Minimal Driver Updates
+    // Hysteresis Filtering & Minimal Driver Updates
     // =========================================================================
     bool dirChanged = (currentDir != state.lastDir);
     bool speedChangedSignificantly = (abs((long)targetSpeedHz - (long)state.lastSpeedHz) > (long)hysteresisHz);
@@ -335,11 +311,11 @@ void setup()
         panStepper->setDirectionPin(PAN_DIR_PIN);
 
         // Set Kinematics (Steps / sec)
-        panStepper->setSpeedInHz(15000); // 15000 steps/sec max
+        panStepper->setSpeedInHz(STEPPER_SPEEDHZ);
 
         // 12,000 steps/s^2 reaches 15,000 Hz in 1.25 seconds (well under the 2-second limit)
         // and brings the motor to a full stop from top speed in 1.25 seconds.
-        panStepper->setAcceleration(12000);
+        panStepper->setAcceleration(STEPPER_ACCELERATION);
     }
     else
     {
@@ -353,52 +329,28 @@ void setup()
         tiltStepper->setDirectionPin(TILT_DIR_PIN);
 
         // Set Kinematics
-        tiltStepper->setSpeedInHz(15000); // 15000 steps/sec max
+        tiltStepper->setSpeedInHz(STEPPER_SPEEDHZ);
 
         // 12,000 steps/s^2 reaches 15,000 Hz in 1.25 seconds (well under the 2-second limit)
         // and brings the motor to a full stop from top speed in 1.25 seconds.
-        tiltStepper->setAcceleration(12000); // 12000 steps/sec^2
+        tiltStepper->setAcceleration(STEPPER_ACCELERATION);
     }
     else
     {
         DB_PRINTLN("[ERROR] Failed to attach Tilt stepper to hardware timer!");
     }
+
+    //
+    // Setup trigger solenoid
+    //
+    pinMode(PIN_SOLENOID, OUTPUT);
+    digitalWrite(PIN_SOLENOID, LOW);
 }
 
 void loop()
 {
-    // Declare persistent state objects outside loop or as static
     static AxisControlState panState;
     static AxisControlState tiltState;
-
-    // check the battery voltage and if necessary, inform the user
-#ifdef BATTERY_VOLTAGE
-    EVERY_N_MILLISECONDS(5000)
-    {
-        static float batteryVoltage = BATTERY_VOLTAGE_FULL;
-        batteryVoltage = BatteryVoltage();
-
-        // check to see if we're running via USB instead of the battery
-        if (batteryVoltage < BATTERY_VOLTAGE_USB)
-            batteryVoltage = BATTERY_VOLTAGE_FULL;
-
-        if (batteryVoltage < BATTERY_VOLTAGE_LOW)
-        {
-            LED_set(LED_BATTERY, CRGB::Yellow);
-        }
-        if (batteryVoltage <= BATTERY_VOLTAGE_SHUTDOWN)
-        {
-            DB_PRINTF("Battery voltage is critically low (%.1f). Entering deep sleep mode...\n", batteryVoltage);
-            LED_set(LED_BATTERY, CRGB::Red);
-
-            // shut off the motors
-            bc.setState(Disabled::GetInstance(), 0, NULL);
-            LED_loop();
-            esp_deep_sleep_start(); // Enter deep sleep mode
-            return;
-        }
-    }
-#endif // BATTERY_VOLTAGE
 
     // handle incoming serial commands from the Raspberry Pi 5
     processSerialCommands();
@@ -416,15 +368,20 @@ void loop()
 
         // Process Pan Axis:
         // Deadzone: 0.15 | MaxSpeed: 15000Hz | MinSpeed: 250Hz | Hysteresis: 300Hz | Exponent: 2.0 (Quadratic)
-        updateAxisFromJoystick(rawPan, DEADZONE_RADIUS, 15000, 250, 300, 2.0f, panStepper, panState);
+        updateAxisFromJoystick(panStepper, panState, rawPan);
 
         // Process Tilt Axis:
-        updateAxisFromJoystick(rawTilt, DEADZONE_RADIUS, 15000, 250, 300, 2.0f, tiltStepper, tiltState);
+        updateAxisFromJoystick(tiltStepper, tiltState, rawTilt);
 
         // Process right trigger:
         // normalize the controller input to the range of 0.0 to 1.0
         float trigger = ((float)xboxController.xboxNotif.trigRT / XboxControllerNotificationParser::maxTrig);
         if (trigger > TRIGGER_THRESHOLD)
+        {
             DB_PRINTF("trigger = %f\n", trigger);
+            digitalWrite(PIN_SOLENOID, HIGH); // Pull solenoid IN
+            delay(SOLENOID_PULSE_LENGTH);     // Pulse length (e.g., 50ms - 100ms)
+            digitalWrite(PIN_SOLENOID, LOW);  // Release solenoid
+        }
     }
 }
