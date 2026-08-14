@@ -42,10 +42,10 @@ Powered by a **Raspberry Pi 5** with a **26 TOPS Hailo-8 AI accelerator** for re
                                                             4-Wire Stepper
                                                                  |
                                                                  v
-                                                      +-----------------------+
-                                                      | STEPPERONLINE NEMA 17 |
-                                                      |   Pan & Tilt Motors   |
-                                                      +-----------------------+
+                                                     +-----------------------+
+                                                     | STEPPERONLINE NEMA 17 |
+                                                     |   Pan & Tilt Motors   |
+                                                     +-----------------------+
 ```
 ---
 

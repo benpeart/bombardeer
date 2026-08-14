@@ -32,8 +32,8 @@ XboxSeriesXControllerESP32_asukiaaa::Core xboxController;
 // Stepper LIBRARY INSTANTIATIONS
 // ============================================================================
 
-#define STEPPER_ACCELERATION 12000 // 12000 steps/sec^2
-#define STEPPER_SPEEDHZ 16000      // 16000 steps/sec max
+#define STEPPER_ACCELERATION 25000 // 12000 steps/sec^2
+#define STEPPER_SPEEDHZ 25000      // 16000 steps/sec max
 #define STEPPER_MINSPEEDHZ 250
 #define STEPPER_HYSTERESISHZ 300
 #define STEPPER_EXPONENT 2.0f // 1.0f = linear, 2.0f = quadratic, 3.0f = cubic
