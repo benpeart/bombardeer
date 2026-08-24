@@ -23,7 +23,18 @@ Preferences preferences;
 // Xbox Controller Deadzone and Trigger Thresholds
 #define DEADZONE_RADIUS 0.25f
 #define TRIGGER_THRESHOLD 0.15f
-#define SOLENOID_PULSE_LENGTH 50 // 40-60ms is a good range for the For the Heschen HS-1564B
+
+/*
+    Recommended Timing for Auto-Fire Code
+
+    To tune your rapid-fire code to the 5-7 BPS sweet spot with a Gravity Hopper:
+    * SOLENOID_PULSE_LENGTH = 70 ms
+    * SOLENOID_COOLDOWN_LENGTH = 130 ms
+    * Result: 5.0 BPS (Extremely reliable, zero chopped paint)
+*/
+#define SOLENOID_PULSE_LENGTH 60     // 40-60ms is a good range for the For the Heschen HS-1564B
+#define SOLENOID_COOLDOWN_LENGTH 190 // Time (ms) solenoid rests before next allowed cycle
+                                     // Total cycle = 250ms (4 shots per second)
 
 // bind to any xbox controller
 XboxSeriesXControllerESP32_asukiaaa::Core xboxController;
@@ -32,9 +43,12 @@ XboxSeriesXControllerESP32_asukiaaa::Core xboxController;
 // Stepper LIBRARY INSTANTIATIONS
 // ============================================================================
 
-#define STEPPER_ACCELERATION 12000 // 12000 steps/sec^2
-#define STEPPER_SPEEDHZ 16000      // 16000 steps/sec max
-#define STEPPER_MINSPEEDHZ 250
+#define PAN_STEPPER_ACCELERATION 16000 // 16000 steps/sec^2
+#define PAN_STEPPER_MAXSPEEDHZ 16000   // 16000 steps/sec max
+#define PAN_STEPPER_MINSPEEDHZ 250
+#define TILT_STEPPER_ACCELERATION 32000 // 32000 steps/sec^2
+#define TILT_STEPPER_MAXSPEEDHZ 32000   // 32000 steps/sec max
+#define TILT_STEPPER_MINSPEEDHZ 250
 #define STEPPER_HYSTERESISHZ 300
 #define STEPPER_EXPONENT 2.0f // 1.0f = linear, 2.0f = quadratic, 3.0f = cubic
 
@@ -52,13 +66,13 @@ FastAccelStepper *tiltStepper = NULL;
 // ============================================================================
 
 /*
- * Configure TMC2209 Driver Parameters over UART using teemuatlut/TMCStepper
+ * Configure TMC2209 Driver Parameters deterministically over UART
  */
-void initTMC2209(TMC2209Stepper &driver, const char *axisName, uint16_t current_mA, bool useSpreadCycle)
+void initTMC2209(TMC2209Stepper &driver, const char *axisName, uint16_t current_mA, bool forceSpreadCycle = false)
 {
     driver.begin();
 
-    // Verify UART Communication
+    // 1. Verify UART Communication
     uint8_t result = driver.test_connection();
     if (result != 0)
     {
@@ -66,36 +80,48 @@ void initTMC2209(TMC2209Stepper &driver, const char *axisName, uint16_t current_
         return;
     }
 
-    driver.toff(4);        // Enable driver chopper (TOFF = 4 is recommended for 24V/12V systems)
-    driver.blank_time(24); // Set comparator blank time
+    // 2. Clear fault flags & configure operating mode
+    driver.toff(0);                // Disable driver during initial register writes
+    driver.pdn_disable(true);      // Use PDN pin exclusively for UART communication
+    driver.mstep_reg_select(true); // Microsteps configured via UART registers, not hardware pins
 
-    // Set RMS current and holding current ratio (0.5 = 50% hold current)
-    // 17HS19-2004S1 is rated 2.0A Peak (~1414mA RMS).
-    // Setting 1200mA RMS is ~85% max capacity to keep drivers cool without active fans.
-    driver.rms_current(current_mA, 0.5);
+    // 3. Set RMS active current and 50% holding current
+    driver.rms_current(current_mA, 0.5); // 50% hold current drops heat & hum at standstill
 
-    driver.microsteps(16); // 1/16 Microstepping from controller
-    driver.intpol(true);   // Interpolate to 1/256 microsteps internally (Ultra smooth)
+    // 4. Microstepping & Internal Interpolation
+    driver.microsteps(16); // 1/16 Microstepping from FastAccelStepper
+    driver.intpol(true);   // Interpolate to 1/256 internally for smooth motion
 
-    driver.iholddelay(10); // Delays ~0.3 seconds after last step before entering hold current
-    driver.TPOWERDOWN(20); // Delay between standstill and powerdown
+    // 5. Standstill & Powerdown Timing
+    driver.iholddelay(8);  // ~0.25s delay after motion stops before dropping to hold current
+    driver.TPOWERDOWN(20); // Standstill to powerdown delay
+    driver.freewheel(0);   // Normal current reduction during hold (0 = standard hold current)
 
-    if (useSpreadCycle)
+    // 6. Chopper Configuration
+    driver.blank_time(24); // Comparator blank time
+
+    if (forceSpreadCycle)
     {
-        // High-torque mode: Recommended for high speed/accel (15000 steps/sec)
+        // Pure SpreadCycle (Higher torque across all speeds, but hums at standstill)
         driver.en_spreadCycle(true);
         driver.pwm_autoscale(false);
-        DB_PRINTF("[TMC2209] %s Configured: %d mA RMS, SpreadCycle (High Torque)\n", axisName, current_mA);
+        DB_PRINTF("[TMC2209] %s Configured: %d mA RMS, Pure SpreadCycle\n", axisName, current_mA);
     }
     else
     {
-        // Quiet mode with automatic StealthChop -> SpreadCycle velocity threshold
-        driver.en_spreadCycle(false);
-        driver.pwm_autoscale(true);
-        // Automatically switch from StealthChop to SpreadCycle at higher RPM to prevent lost steps
-        driver.TPWMTHRS(100);
-        DB_PRINTF("[TMC2209] %s Configured: %d mA RMS, StealthChop + Hybrid Switch\n", axisName, current_mA);
+        // Hybrid Mode: Silent StealthChop at standstill and low speed,
+        // automatically transitions to SpreadCycle at high speed to avoid step loss.
+        driver.en_spreadCycle(false); // Enable StealthChop for dead-silent standstill
+        driver.pwm_autoscale(true);   // Automatically scale StealthChop voltage
+
+        // Threshold where driver switches from StealthChop to SpreadCycle:
+        // Set so standstill and low/mid speeds remain silent, while top speeds (>3000 Hz) engage SpreadCycle
+        driver.TPWMTHRS(200);
+        DB_PRINTF("[TMC2209] %s Configured: %d mA RMS, StealthChop Standstill + Hybrid Switch\n", axisName, current_mA);
     }
+
+    // 7. Enable chopper with TOFF = 4
+    driver.toff(4);
 }
 
 // Persistent state tracker per axis to manage hysteresis and single-shot stops
@@ -121,9 +147,9 @@ void updateAxisFromJoystick(
     FastAccelStepper *stepper,
     AxisControlState &state,
     float rawInput,
+    uint32_t maxSpeedHz,
+    uint32_t minSpeedHz,
     float deadzone = DEADZONE_RADIUS,
-    uint32_t maxSpeedHz = STEPPER_SPEEDHZ,
-    uint32_t minSpeedHz = STEPPER_MINSPEEDHZ,
     uint32_t hysteresisHz = STEPPER_HYSTERESISHZ,
     float exponent = STEPPER_EXPONENT)
 {
@@ -195,24 +221,57 @@ void updateAxisFromJoystick(
     }
 }
 
-static unsigned long solenoidStartTime = 0;
+/**
+ * --- Full-Auto Fire State Machine ---
+ */
+enum SolenoidState
+{
+    SOLENOID_IDLE,    // Ready to fire
+    SOLENOID_FIRING,  // Active HIGH (pulling trigger)
+    SOLENOID_COOLDOWN // Active LOW (waiting to reset sear & prevent rapid-fire stall)
+};
+
+static SolenoidState solenoidState = SOLENOID_IDLE;
+static unsigned long solenoidTimer = 0;
+
 void triggerSolenoid()
 {
-    // Prevent overlapping triggers
-    if (!solenoidStartTime)
+    // Only fire if completely idle and cooldown has elapsed
+    if (solenoidState == SOLENOID_IDLE)
     {
         digitalWrite(PIN_SOLENOID, HIGH);
-        solenoidStartTime = millis();
+        solenoidTimer = millis();
+        solenoidState = SOLENOID_FIRING;
     }
 }
 
 void updateSolenoid()
 {
-    // Turn off pin after time expires
-    if (solenoidStartTime && (millis() - solenoidStartTime >= SOLENOID_PULSE_LENGTH))
+    unsigned long now = millis();
+
+    switch (solenoidState)
     {
-        digitalWrite(PIN_SOLENOID, LOW);
-        solenoidStartTime = 0;
+    case SOLENOID_FIRING:
+        // Pulse time expired -> Turn OFF and begin cooldown/reset window
+        if (now - solenoidTimer >= SOLENOID_PULSE_LENGTH)
+        {
+            digitalWrite(PIN_SOLENOID, LOW);
+            solenoidTimer = now;
+            solenoidState = SOLENOID_COOLDOWN;
+        }
+        break;
+
+    case SOLENOID_COOLDOWN:
+        // Cooldown expired -> Return to IDLE so next cycle or held trigger can fire
+        if (now - solenoidTimer >= SOLENOID_COOLDOWN_LENGTH)
+        {
+            solenoidState = SOLENOID_IDLE;
+        }
+        break;
+
+    case SOLENOID_IDLE:
+    default:
+        break;
     }
 }
 
@@ -316,8 +375,10 @@ void setup()
     SERIAL_PORT.begin(115200, SERIAL_8N1, TMC_RX_PIN, TMC_TX_PIN);
 
     // Configure TMC2209 Registers over UART
-    initTMC2209(panTMC, "PAN", 1300, true);   // Pan Axis: 1300 mA RMS, SpreadCycle enabled for rapid 180-degree pans
-    initTMC2209(tiltTMC, "TILT", 1200, true); // Tilt Axis: 1200 mA RMS, SpreadCycle enabled to maintain torque against gravity/payload
+    // Passing 'false' runs StealthChop at standstill (eliminates the hum completely)
+    // while switching over to SpreadCycle dynamically when moving.
+    initTMC2209(panTMC, "PAN", 1300, false);   // Pan Axis: 1300 mA RMS
+    initTMC2209(tiltTMC, "TILT", 1200, false); // Tilt Axis: 1200 mA RMS
 
     // Enable both drivers in hardware permanently
     digitalWrite(SHARED_ENABLE_PIN, LOW); // LOW = Drivers Enabled
@@ -332,11 +393,11 @@ void setup()
         panStepper->setDirectionPin(PAN_DIR_PIN);
 
         // Set Kinematics (Steps / sec)
-        panStepper->setSpeedInHz(STEPPER_SPEEDHZ);
+        panStepper->setSpeedInHz(PAN_STEPPER_MAXSPEEDHZ);
 
         // 12,000 steps/s^2 reaches 15,000 Hz in 1.25 seconds (well under the 2-second limit)
         // and brings the motor to a full stop from top speed in 1.25 seconds.
-        panStepper->setAcceleration(STEPPER_ACCELERATION);
+        panStepper->setAcceleration(PAN_STEPPER_ACCELERATION);
     }
     else
     {
@@ -350,11 +411,11 @@ void setup()
         tiltStepper->setDirectionPin(TILT_DIR_PIN);
 
         // Set Kinematics
-        tiltStepper->setSpeedInHz(STEPPER_SPEEDHZ);
+        tiltStepper->setSpeedInHz(TILT_STEPPER_MAXSPEEDHZ);
 
         // 12,000 steps/s^2 reaches 15,000 Hz in 1.25 seconds (well under the 2-second limit)
         // and brings the motor to a full stop from top speed in 1.25 seconds.
-        tiltStepper->setAcceleration(STEPPER_ACCELERATION);
+        tiltStepper->setAcceleration(TILT_STEPPER_ACCELERATION);
     }
     else
     {
@@ -388,19 +449,21 @@ void loop()
         float rawTilt = ((float)xboxController.xboxNotif.joyLVert - halfJoy) / halfJoy;
 
         // Process Pan Axis:
-        updateAxisFromJoystick(panStepper, panState, rawPan);
+        updateAxisFromJoystick(panStepper, panState, rawPan, PAN_STEPPER_MAXSPEEDHZ, PAN_STEPPER_MINSPEEDHZ);
 
         // Process Tilt Axis:
-        updateAxisFromJoystick(tiltStepper, tiltState, rawTilt);
+        updateAxisFromJoystick(tiltStepper, tiltState, rawTilt, TILT_STEPPER_MAXSPEEDHZ, TILT_STEPPER_MINSPEEDHZ);
 
-        // Process right trigger:
-        // normalize the controller input to the range of 0.0 to 1.0
+        // Process Right Trigger (Normalized to 0.0 to 1.0)
         float trigger = ((float)xboxController.xboxNotif.trigRT / XboxControllerNotificationParser::maxTrig);
         if (trigger > TRIGGER_THRESHOLD)
         {
-            DB_PRINTF("trigger = %f\n", trigger);
+            // When trigger is held down, triggerSolenoid() is called every loop,
+            // but will safely fire only once every (PULSE_LENGTH + COOLDOWN_LENGTH) ms
             triggerSolenoid();
         }
     }
+
+    // Non-blocking timer update for the solenoid states
     updateSolenoid();
 }

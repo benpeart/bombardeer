@@ -15,7 +15,7 @@ $fn = 64; // Smooth curve resolution
 /* --- GRIP BRASS INSERT DIMENSIONS --- */
 // True caliper center-to-center diagonal distance desired on the physical part
 grip_target_pitch  = 85.0;  // True 3D straight-line distance (mm)
-grip_offset_x      = -9.0; // Grip backstrap angle offset (mm)
+grip_offset_x      = -21.0; // Grip backstrap angle offset (mm)
 
 // Calculated vertical Y-span so straight-line distance is exactly 85.0mm:
 // sqrt(85.0^2 - 12.0^2) = 84.1487mm
@@ -26,8 +26,8 @@ grip_head_cbore_d  = 7.0;   // Recessed screw head / driver access diameter (mm)
 
 /* --- HESCHEN HS-1564B SOLENOID POSITION & PATTERN --- */
 // Standard 1564 open-frame bottom pattern: 28mm (Length X) x 20mm (Width Y)
-sol_pitch_x        = 28.0;  // Length pitch between M3 tapped holes along plunger axis (mm)
-sol_pitch_y        = 20.0;  // Width pitch between M3 tapped holes across frame (mm)
+sol_pitch_x        = 27.5;  // Length pitch between M3 tapped holes along plunger axis (mm)
+sol_pitch_y        = 19.6;  // Width pitch between M3 tapped holes across frame (mm)
 sol_plate_l        = 52.0;  // Solenoid bed plate length (mm)
 sol_plate_w        = 34.0;  // Solenoid bed plate width (mm)
 sol_m3_dia         = 3.4;   // M3 clearance hole (mm)
