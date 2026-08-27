@@ -2,7 +2,9 @@
 
 **Bombardeer** is an open-source, vision-guided autonomous deterrent turret designed to protect outdoor spaces, gardens, orchards, and agricultural property from intrusive wildlife (such as deer). 
 
-Powered by a **Raspberry Pi 5** with a **26 TOPS Hailo-8 AI accelerator** for real-time visual tracking and an **ESP32** dedicated microcontroller running `FastAccelStepper` and `TMCStepper` for precision pan/tilt kinematic execution.
+<img src="images/bombardeer.jpg" alt="Bombardeer: Autonomous Vision-Guided Deterrent Turret" width="480"  />
+
+Powered by a **Raspberry Pi 5** with a **26 TOPS Hailo-8 AI accelerator** for real-time visual tracking and an **ESP32** dedicated microcontroller for precision pan/tilt kinematic execution.
 
 ---
 
