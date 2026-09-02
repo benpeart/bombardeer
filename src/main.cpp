@@ -7,18 +7,42 @@
 */
 
 #include <Arduino.h>
-#include <Preferences.h>
 #include <XboxSeriesXControllerESP32_asukiaaa.hpp>
 #include <TMCStepper.h>
 #include <FastAccelStepper.h>
-#include "globals.h"
 #include "debug.h"
 
-// -- EEPROM
-Preferences preferences;
-#define PREF_VERSION 1 // if setting structure has been changed, count this number up to delete all settings
-#define PREF_NAMESPACE "pref"
-#define PREF_KEY_VERSION "ver"
+// ESP32 Pin Assignments
+
+// Driver 1: Pan Axis
+#define PAN_USTEP_PIN1 04
+#define PAN_USTEP_PIN2 27
+#define PAN_STEP_PIN 26
+#define PAN_DIR_PIN 25
+
+// Driver 2: Tilt Axis
+#define TILT_USTEP_PIN1 18
+#define TILT_USTEP_PIN2 05
+#define TILT_STEP_PIN 33
+#define TILT_DIR_PIN 32
+
+#define SHARED_ENABLE_PIN 19
+
+// TMC2209 Single-Wire UART Pins (Shared UART2)
+#define TMC_RX_PIN 16 // ESP32 RX2 connected to TMC2209 TX/RX pins
+#define TMC_TX_PIN 17 // ESP32 TX2 connected through 1k ohm resistor
+#define SERIAL_PORT Serial2
+#define R_SENSE 0.11f // Standard sense resistor value for stepsticks
+
+// Driver Addresses on the shared UART bus
+#define PAN_DRIVER_ADDR 0b00  // MS1=GND, MS2=GND
+#define TILT_DRIVER_ADDR 0b01 // MS1=VCC, MS2=GND
+
+// -- Others
+#define PIN_SOLENOID 13      // pin to control the solenoid
+#define PIN_I2C_SDA 21       // MPU SDA pin
+#define PIN_I2C_SCL 22       // MPU SCL pin
+#define PIN_MPU_INTERRUPT 23 // MPU interrupt pin, RISING triggers interrupt
 
 // Xbox Controller Deadzone and Trigger Thresholds
 #define DEADZONE_RADIUS 0.25f
@@ -43,11 +67,11 @@ XboxSeriesXControllerESP32_asukiaaa::Core xboxController;
 // Stepper LIBRARY INSTANTIATIONS
 // ============================================================================
 
-#define PAN_STEPPER_ACCELERATION 16000 // 16000 steps/sec^2
-#define PAN_STEPPER_MAXSPEEDHZ 16000   // 16000 steps/sec max
+#define PAN_STEPPER_ACCELERATION 8000 // 8000 steps/sec^2
+#define PAN_STEPPER_MAXSPEEDHZ 8000   // 8000 steps/sec max
 #define PAN_STEPPER_MINSPEEDHZ 250
-#define TILT_STEPPER_ACCELERATION 32000 // 32000 steps/sec^2
-#define TILT_STEPPER_MAXSPEEDHZ 32000   // 32000 steps/sec max
+#define TILT_STEPPER_ACCELERATION 16000 // 16000 steps/sec^2
+#define TILT_STEPPER_MAXSPEEDHZ 16000   // 16000 steps/sec max
 #define TILT_STEPPER_MINSPEEDHZ 250
 #define STEPPER_HYSTERESISHZ 300
 #define STEPPER_EXPONENT 2.0f // 1.0f = linear, 2.0f = quadratic, 3.0f = cubic
@@ -239,6 +263,7 @@ void triggerSolenoid()
     // Only fire if completely idle and cooldown has elapsed
     if (solenoidState == SOLENOID_IDLE)
     {
+        DB_PRINTLN("[SOLENOID] Firing!");
         digitalWrite(PIN_SOLENOID, HIGH);
         solenoidTimer = millis();
         solenoidState = SOLENOID_FIRING;
@@ -255,6 +280,7 @@ void updateSolenoid()
         // Pulse time expired -> Turn OFF and begin cooldown/reset window
         if (now - solenoidTimer >= SOLENOID_PULSE_LENGTH)
         {
+            DB_PRINTLN("[SOLENOID] Pulse expired, turning OFF.");
             digitalWrite(PIN_SOLENOID, LOW);
             solenoidTimer = now;
             solenoidState = SOLENOID_COOLDOWN;
@@ -265,6 +291,7 @@ void updateSolenoid()
         // Cooldown expired -> Return to IDLE so next cycle or held trigger can fire
         if (now - solenoidTimer >= SOLENOID_COOLDOWN_LENGTH)
         {
+            DB_PRINTLN("[SOLENOID] Cooldown expired, returning to IDLE.");
             solenoidState = SOLENOID_IDLE;
         }
         break;
@@ -330,15 +357,6 @@ void setup()
     DB_PRINTLN("ESP32 Flash Speed: " + String(ESP.getFlashChipSpeed() / 1000000) + " MHz");
     DB_PRINTLN("ESP32 PSRAM Size: " + String(ESP.getPsramSize()));
     DB_PRINTLN("ESP32 Free PSRAM: " + String(ESP.getFreePsram()));
-
-    // Init preferences EEPROM, if not done before
-    preferences.begin(PREF_NAMESPACE, false); // false = RW-mode
-    if (preferences.getUInt(PREF_KEY_VERSION, 0) != PREF_VERSION)
-    {
-        preferences.clear(); // Remove all preferences under the opened namespace
-        preferences.putUInt(PREF_KEY_VERSION, PREF_VERSION);
-        DB_PRINTF("EEPROM init complete, all preferences deleted, new pref_version: %d\n", PREF_VERSION);
-    }
 
     //
     // Setup Xbox controller
