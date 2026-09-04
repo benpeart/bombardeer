@@ -5,11 +5,14 @@ Bombardeer Wildlife Targeting & Archival Vision System
 Priorities:
 1. Low-Light Dawn/Dusk Detection Accuracy (Dynamic AEC with deep exposure ceiling).
 2. High-Quality Event-Based Hardware Video Recording (Pre-roll circular buffer).
-3. Balanced hardware utilization (IMX708 ISP + Hailo-8 NPU + Pi5 DMA).
+3. Automated Storage Management (Oldest-file FIFO pruning based on free disk & quota).
+4. Balanced hardware utilization (IMX708 ISP + Hailo-8 NPU + Pi5 DMA).
 """
 
 import os
+import glob
 import time
+import shutil
 import datetime
 import threading
 import queue
@@ -42,6 +45,10 @@ STATIC_DIR = "/home/ben/Bombardeer/static"
 RECORDINGS_DIR = "/home/ben/Bombardeer/recordings"
 os.makedirs(RECORDINGS_DIR, exist_ok=True)
 
+# Storage Management Constraints
+MIN_FREE_SPACE_GB = 5.0           # Minimum free space to preserve on drive
+MAX_RECORDINGS_STORAGE_GB = 16.0  # Max capacity allocated for wildlife archive
+
 INFER_SIZE = 1280
 OPTICAL_CENTER_INFER = (INFER_SIZE // 2, INFER_SIZE // 2)
 
@@ -66,6 +73,51 @@ active_detections = []
 npu_latency_ms = 0.0
 npu_fps = 0.0
 actual_sensor_fps = 0.0
+free_disk_gb = 0.0
+
+
+# -------------------------------------------------------------------------
+# Storage Manager: Prune Oldest Files
+# -------------------------------------------------------------------------
+def ensure_storage_headroom():
+    """
+    Checks storage usage and purges the oldest MP4 recordings in FIFO order
+    if free drive space drops below MIN_FREE_SPACE_GB or total archive
+    size exceeds MAX_RECORDINGS_STORAGE_GB.
+    """
+    global free_disk_gb
+    try:
+        total, used, free = shutil.disk_usage(RECORDINGS_DIR)
+        free_disk_gb = free / (1024 ** 3)
+
+        recordings = glob.glob(os.path.join(RECORDINGS_DIR, "wildlife_*.mp4"))
+        if not recordings:
+            return
+
+        # Sort files chronologically by modification time (oldest first)
+        recordings.sort(key=os.path.getmtime)
+
+        total_archive_size = sum(os.path.getsize(f) for f in recordings)
+        total_archive_gb = total_archive_size / (1024 ** 3)
+
+        # Remove oldest files while constraints are violated
+        for fpath in recordings:
+            if free_disk_gb >= MIN_FREE_SPACE_GB and total_archive_gb <= MAX_RECORDINGS_STORAGE_GB:
+                break
+
+            fsize = os.path.getsize(fpath)
+            try:
+                os.remove(fpath)
+                total_archive_gb -= fsize / (1024 ** 3)
+                # Re-check actual disk free space
+                _, _, updated_free = shutil.disk_usage(RECORDINGS_DIR)
+                free_disk_gb = updated_free / (1024 ** 3)
+                print(f"[Storage Manager] Pruned oldest recording: {os.path.basename(fpath)}")
+            except OSError as e:
+                print(f"[Storage Manager] Error deleting {fpath}: {e}")
+
+    except Exception as e:
+        print(f"[Storage Manager] Storage audit error: {e}")
 
 
 # -------------------------------------------------------------------------
@@ -218,13 +270,16 @@ def video_recorder_worker(record_queue):
 
         if cmd == "start":
             if not recording_active:
+                # Enforce storage limits and purge old files before saving new video
+                ensure_storage_headroom()
+
                 ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
                 filename = os.path.join(RECORDINGS_DIR, f"wildlife_{ts}.mp4")
                 writer = cv2.VideoWriter(filename, fourcc, TARGET_FPS, (INFER_SIZE, INFER_SIZE))
                 recording_active = True
                 print(f"[Recorder] Wildlife event started. Writing: {filename}")
 
-                # Flush pre-roll buffer to disk
+                # Flush circular pre-roll buffer to disk
                 pre_roll = item.get("pre_roll", [])
                 for f in pre_roll:
                     writer.write(cv2.cvtColor(f, cv2.COLOR_RGB2BGR))
@@ -240,6 +295,8 @@ def video_recorder_worker(record_queue):
                 writer = None
             recording_active = False
             print("[Recorder] Wildlife event ended. Video saved.")
+            # Re-evaluate storage after file completion
+            ensure_storage_headroom()
 
 
 # -------------------------------------------------------------------------
@@ -247,6 +304,9 @@ def video_recorder_worker(record_queue):
 # -------------------------------------------------------------------------
 def vision_thread():
     global latest_jpeg, actual_sensor_fps
+
+    # Periodic storage check on boot
+    ensure_storage_headroom()
 
     picam2 = Picamera2()
 
@@ -359,9 +419,10 @@ def vision_thread():
             cv2.putText(annotated, "REC", (DISPLAY_SIZE - 65, 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 1, cv2.LINE_AA)
 
-        status_text = f"SENSOR: {display_fps:.1f} FPS | NPU: {n_fps:.1f} FPS ({lat:.1f}ms) | 1280p | Targets: {len(current_dets)}"
+        # Telemetry Display
+        status_text = f"SENSOR: {display_fps:.1f} FPS | NPU: {n_fps:.1f} FPS ({lat:.1f}ms) | FREE: {free_disk_gb:.1f}GB"
         cv2.putText(annotated, status_text, (10, 22),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 255), 1, cv2.LINE_AA)
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
 
         success, buffer = cv2.imencode(".jpg", annotated, [int(cv2.IMWRITE_JPEG_QUALITY), 75])
         if success:
@@ -425,7 +486,7 @@ def index():
         <div class="hud-card">
             <h1>Bombardeer Active Targeting HUD</h1>
             <img src="/video_feed" alt="Targeting Stream">
-            <div class="meta">MegaDetector v6 1280p | Auto Exposure | Auto Event Recording</div>
+            <div class="meta">MegaDetector v6 1280p | Auto Low-Light | Auto Pruning Archive</div>
         </div>
     </body>
     </html>
