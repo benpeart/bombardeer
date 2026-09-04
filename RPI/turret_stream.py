@@ -1,127 +1,163 @@
-import io
+#!/usr/bin/env python3
+"""
+Bombardeer Wildlife Targeting & Archival Vision System
+------------------------------------------------------
+Priorities:
+1. Low-Light Dawn/Dusk Detection Accuracy (Dynamic AEC with deep exposure ceiling).
+2. High-Quality Event-Based Hardware Video Recording (Pre-roll circular buffer).
+3. Balanced hardware utilization (IMX708 ISP + Hailo-8 NPU + Pi5 DMA).
+"""
+
 import os
-import threading
 import time
-import cv2
+import datetime
+import threading
+import queue
+from collections import deque
 import numpy as np
-from flask import Flask, Response, send_from_directory
-from picamera2 import Picamera2
+import cv2
+from flask import Flask, Response, render_template_string, send_from_directory
+
 from hailo_platform import (
     HEF,
+    VDevice,
     ConfigureParams,
-    FormatType,
-    HailoStreamInterface,
     InferVStreams,
     InputVStreamParams,
     OutputVStreamParams,
-    VDevice,
+    FormatType,
+    HailoStreamInterface,
 )
+from picamera2 import Picamera2
+from libcamera import Transform
 
-# Target configuration: Class 0 = Animal (Deer) in MegaDetector v6
-TARGET_CLASS_ID = 0
-CONF_THRESH = 0.40
-IOU_THRESH = 0.50
-MODEL_PATH = "/home/ben/Bombardeer/MDV6-yolov9-c.hef"
-BASE_DIR = "/home/ben/Bombardeer"
+# -------------------------------------------------------------------------
+# Configuration
+# -------------------------------------------------------------------------
+MODEL_PATH = "/home/ben/Bombardeer/MDV6-yolov9-c-1280.hef"
+if not os.path.exists(MODEL_PATH):
+    MODEL_PATH = "/home/ben/Bombardeer/models/MDV6-yolov9-c-1280.hef"
+
+STATIC_DIR = "/home/ben/Bombardeer/static"
+RECORDINGS_DIR = "/home/ben/Bombardeer/recordings"
+os.makedirs(RECORDINGS_DIR, exist_ok=True)
+
+INFER_SIZE = 1280
+OPTICAL_CENTER_INFER = (INFER_SIZE // 2, INFER_SIZE // 2)
+
+DISPLAY_SIZE = 640
+SCALE_FACTOR = DISPLAY_SIZE / INFER_SIZE
+OPTICAL_CENTER_DISP = (DISPLAY_SIZE // 2, DISPLAY_SIZE // 2)
+
+# Detection & Recording Parameters
+CONF_THRESH = 0.28
+IOU_THRESH = 0.45
+RECORD_PRE_ROLL_SEC = 3.0    # Seconds preserved before trigger
+RECORD_POST_ROLL_SEC = 5.0   # Seconds preserved after animal leaves
+TARGET_FPS = 12.0            # Nominal target recording rate
 
 app = Flask(__name__)
-output_frame = None
+frame_lock = threading.Lock()
+latest_jpeg = None
+
+# Telemetry & Target Tracking
+detections_lock = threading.Lock()
+active_detections = []
+npu_latency_ms = 0.0
+npu_fps = 0.0
+actual_sensor_fps = 0.0
 
 
-class MDV6Decoder:
-    """Decodes MegaDetector v6 multi-scale DFL bounding boxes and classification heads."""
-    def __init__(self, input_size=640, reg_max=16):
+# -------------------------------------------------------------------------
+# Vectorized MDV6 YOLOv9-c Post-Processor (1280p)
+# -------------------------------------------------------------------------
+class MDV6Decoder1280:
+    def __init__(self, input_size=1280):
         self.input_size = input_size
-        self.reg_max = reg_max
         self.strides = [8, 16, 32]
-        self.project = np.arange(reg_max, dtype=np.float32)
-        self.grids, self.stride_factors = self._generate_anchors()
+        self.reg_max = 16
+        self.project = np.arange(self.reg_max, dtype=np.float32)
+        self.anchors, self.stride_scales = self._generate_anchors_and_scales()
 
-    def _generate_anchors(self):
-        grids, strides = [], []
-        for s in self.strides:
-            dim = self.input_size // s
-            gx, gy = np.meshgrid(np.arange(dim), np.arange(dim))
-            grid = np.stack([gx, gy], axis=-1).reshape(-1, 2) + 0.5
-            grids.append(grid)
-            strides.append(np.full((dim * dim, 1), s, dtype=np.float32))
-        return np.vstack(grids), np.vstack(strides)
+    def _generate_anchors_and_scales(self):
+        anchors = []
+        scales = []
+        for stride in self.strides:
+            grid_size = self.input_size // stride
+            grid_y, grid_x = np.meshgrid(
+                np.arange(grid_size, dtype=np.float32),
+                np.arange(grid_size, dtype=np.float32),
+                indexing="ij",
+            )
+            anchor = np.stack((grid_x + 0.5, grid_y + 0.5), axis=-1) * stride
+            flat_anchors = anchor.reshape(-1, 2)
+            anchors.append(flat_anchors)
+            scales.append(np.full(len(flat_anchors), stride, dtype=np.float32))
+        return np.vstack(anchors), np.concatenate(scales)
+
+    def _softmax(self, x, axis=-1):
+        e_x = np.exp(x - np.max(x, axis=axis, keepdims=True))
+        return e_x / np.sum(e_x, axis=axis, keepdims=True)
 
     def decode(self, raw_outputs):
-        # Stride 8 (80x80)
-        b8 = raw_outputs["MDV6-yolov9-c/conv98"].reshape(-1, 4, self.reg_max)
         c8 = raw_outputs["MDV6-yolov9-c/conv100"].reshape(-1, 3)
-
-        # Stride 16 (40x40)
-        b16 = raw_outputs["MDV6-yolov9-c/conv121"].reshape(-1, 4, self.reg_max)
         c16 = raw_outputs["MDV6-yolov9-c/conv122"].reshape(-1, 3)
-
-        # Stride 32 (20x20)
-        b32 = raw_outputs["MDV6-yolov9-c/conv143"].reshape(-1, 4, self.reg_max)
         c32 = raw_outputs["MDV6-yolov9-c/conv144"].reshape(-1, 3)
+        raw_classes = np.vstack([c8, c16, c32])
 
-        raw_boxes = np.vstack([b8, b16, b32])
-        raw_scores = np.vstack([c8, c16, c32])
+        scores = 1.0 / (1.0 + np.exp(-raw_classes[:, 0]))
 
-        # Softmax over regression distribution bins
-        exp_boxes = np.exp(raw_boxes - np.max(raw_boxes, axis=-1, keepdims=True))
-        dist = np.dot(exp_boxes / np.sum(exp_boxes, axis=-1, keepdims=True), self.project)
-
-        # Reconstruct coordinates [x1, y1, x2, y2]
-        x1 = (self.grids[:, 0] - dist[:, 0]) * self.stride_factors[:, 0]
-        y1 = (self.grids[:, 1] - dist[:, 1]) * self.stride_factors[:, 0]
-        x2 = (self.grids[:, 0] + dist[:, 2]) * self.stride_factors[:, 0]
-        y2 = (self.grids[:, 1] + dist[:, 3]) * self.stride_factors[:, 0]
-        boxes = np.stack([x1, y1, x2, y2], axis=-1)
-
-        # Sigmoid on classification logits
-        scores = 1.0 / (1.0 + np.exp(-raw_scores))
-        animal_scores = scores[:, TARGET_CLASS_ID]
-        mask = animal_scores > CONF_THRESH
-
-        filtered_boxes = boxes[mask]
-        filtered_scores = animal_scores[mask]
-
-        if len(filtered_boxes) == 0:
+        mask = scores > CONF_THRESH
+        if not np.any(mask):
             return []
 
-        # Convert to [x, y, w, h] for NMS
-        xywh = filtered_boxes.copy()
-        xywh[:, 2] -= xywh[:, 0]
-        xywh[:, 3] -= xywh[:, 1]
+        cand_scores = scores[mask]
+        cand_anchors = self.anchors[mask]
+        cand_scales = self.stride_scales[mask]
 
-        indices = cv2.dnn.NMSBoxes(xywh.tolist(), filtered_scores.tolist(), CONF_THRESH, IOU_THRESH)
+        b8 = raw_outputs["MDV6-yolov9-c/conv98"].reshape(-1, 4, self.reg_max)
+        b16 = raw_outputs["MDV6-yolov9-c/conv121"].reshape(-1, 4, self.reg_max)
+        b32 = raw_outputs["MDV6-yolov9-c/conv143"].reshape(-1, 4, self.reg_max)
+        raw_boxes = np.vstack([b8, b16, b32])[mask]
+
+        dist = self._softmax(raw_boxes, axis=-1)
+        ltrb = np.dot(dist, self.project) * cand_scales[:, None]
+
+        x1 = np.clip(cand_anchors[:, 0] - ltrb[:, 0], 0, self.input_size)
+        y1 = np.clip(cand_anchors[:, 1] - ltrb[:, 1], 0, self.input_size)
+        x2 = np.clip(cand_anchors[:, 0] + ltrb[:, 2], 0, self.input_size)
+        y2 = np.clip(cand_anchors[:, 1] + ltrb[:, 3], 0, self.input_size)
+
+        w = x2 - x1
+        h = y2 - y1
+
+        cv_boxes = [[int(x1[i]), int(y1[i]), int(w[i]), int(h[i])] for i in range(len(cand_scores))]
+        indices = cv2.dnn.NMSBoxes(cv_boxes, cand_scores.tolist(), CONF_THRESH, IOU_THRESH)
 
         detections = []
-        for idx in indices:
-            i = idx[0] if isinstance(idx, (list, tuple, np.ndarray)) else idx
-            bx = filtered_boxes[i]
-            cx = (bx[0] + bx[2]) / 2.0
-            cy = (bx[1] + bx[3]) / 2.0
-            detections.append({
-                "box": bx.astype(int),
-                "center": (cx, cy),
-                "score": float(filtered_scores[i])
-            })
+        if len(indices) > 0:
+            for idx in indices.flatten():
+                bx, by, bw, bh = cv_boxes[idx]
+                score = float(cand_scores[idx])
+                cx = bx + (bw / 2.0)
+                cy = by + (bh / 2.0)
+                detections.append({
+                    "box_1280": [bx, by, bx + bw, by + bh],
+                    "score": score,
+                    "center": (cx, cy),
+                    "error": (cx - OPTICAL_CENTER_INFER[0], cy - OPTICAL_CENTER_INFER[1]),
+                })
         return detections
 
 
-def tracking_worker():
-    global output_frame
-    decoder = MDV6Decoder(input_size=640)
+# -------------------------------------------------------------------------
+# Worker Thread: Hailo-8 NPU Inference Engine
+# -------------------------------------------------------------------------
+def hailo_worker(infer_queue):
+    global active_detections, npu_latency_ms, npu_fps
 
-    # 1. Start Picamera2 with 640x640 RGB hardware ISP stream
-    picam2 = Picamera2()
-    cam_config = picam2.create_video_configuration(
-        main={"size": (640, 640), "format": "RGB888"},
-        controls={"FrameRate": 25}
-    )
-    picam2.configure(cam_config)
-    picam2.start()
-    time.sleep(1.0)
-    print("[Camera] Picamera2 ISP active at 640x640 RGB @ 25 FPS")
+    decoder = MDV6Decoder1280(input_size=INFER_SIZE)
 
-    # 2. Configure Hailo-8 Device & Pipelines
     hef = HEF(MODEL_PATH)
     params = VDevice.create_params()
     with VDevice(params) as target:
@@ -133,145 +169,295 @@ def tracking_worker():
         output_vparams = OutputVStreamParams.make(network_group, quantized=False, format_type=FormatType.FLOAT32)
         input_name = hef.get_input_vstream_infos()[0].name
 
-        # Explicitly activate network group for 4-context model
         with network_group.activate(network_group_params):
             with InferVStreams(network_group, input_vparams, output_vparams) as pipeline:
-                print("[Hailo-8] All 4 contexts activated. Running inference...")
-                fps_start = time.perf_counter()
-                frames = 0
-                fps_display = "0.0 FPS"
+                last_time = time.time()
+                frames_processed = 0
 
                 while True:
-                    # Capture unbatched (640, 640, 3) frame
-                    frame_rgb = picam2.capture_array("main")
+                    try:
+                        frame_raw = infer_queue.get(timeout=1.0)
+                    except queue.Empty:
+                        continue
 
-                    # Add batch dimension: shape becomes (1, 640, 640, 3)
-                    input_tensor = np.expand_dims(frame_rgb, axis=0)
+                    tensor = np.expand_dims(frame_raw, axis=0)
 
-                    # Hardware inference
-                    raw_outputs = pipeline.infer({input_name: input_tensor})
-                    detections = decoder.decode(raw_outputs)
+                    t0 = time.perf_counter()
+                    raw_outputs = pipeline.infer({input_name: tensor})
+                    dt = (time.perf_counter() - t0) * 1000.0
 
-                    # Visual HUD rendering
-                    vis_frame = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+                    dets = decoder.decode(raw_outputs)
 
-                    # Optical center reticle (320, 320)
-                    cv2.drawMarker(vis_frame, (320, 320), (255, 255, 255), cv2.MARKER_CROSS, 20, 1)
+                    with detections_lock:
+                        active_detections = dets
+                        npu_latency_ms = dt
 
-                    for det in detections:
-                        x1, y1, x2, y2 = det["box"]
-                        cx, cy = int(det["center"][0]), int(det["center"][1])
-                        score = det["score"]
-
-                        # Green target bounding box
-                        cv2.rectangle(vis_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                        # Red target center dot
-                        cv2.circle(vis_frame, (cx, cy), 4, (0, 0, 255), -1)
-                        # Yellow tracking displacement vector
-                        cv2.line(vis_frame, (320, 320), (cx, cy), (0, 255, 255), 1)
-
-                        dx = cx - 320
-                        dy = cy - 320
-                        label = f"Deer: {score:.2f} (dx:{dx:+d}, dy:{dy:+d})"
-                        cv2.putText(vis_frame, label, (x1, max(y1 - 8, 15)),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1)
-
-                    frames += 1
-                    if frames % 15 == 0:
-                        fps_val = 15.0 / (time.perf_counter() - fps_start)
-                        fps_display = f"{fps_val:.1f} FPS"
-                        fps_start = time.perf_counter()
-
-                    # System telemetry overlay
-                    cv2.putText(vis_frame, f"BOMBARDEER | {fps_display}", (15, 25),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 204), 2)
-
-                    ret, buffer = cv2.imencode(".jpg", vis_frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
-                    if ret:
-                        output_frame = buffer.tobytes()
+                    frames_processed += 1
+                    now = time.time()
+                    if now - last_time >= 1.0:
+                        npu_fps = frames_processed / (now - last_time)
+                        frames_processed = 0
+                        last_time = now
 
 
-def generate_mjpeg():
-    global output_frame
+# -------------------------------------------------------------------------
+# High-Quality Video Archiver Thread
+# -------------------------------------------------------------------------
+def video_recorder_worker(record_queue):
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = None
+    recording_active = False
+
     while True:
-        if output_frame is not None:
-            yield (b"--frame\r\n"
-                   b"Content-Type: image/jpeg\r\n\r\n" + output_frame + b"\r\n")
-        time.sleep(0.02)
+        try:
+            item = record_queue.get(timeout=1.0)
+        except queue.Empty:
+            continue
+
+        cmd = item.get("cmd")
+
+        if cmd == "start":
+            if not recording_active:
+                ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                filename = os.path.join(RECORDINGS_DIR, f"wildlife_{ts}.mp4")
+                writer = cv2.VideoWriter(filename, fourcc, TARGET_FPS, (INFER_SIZE, INFER_SIZE))
+                recording_active = True
+                print(f"[Recorder] Wildlife event started. Writing: {filename}")
+
+                # Flush pre-roll buffer to disk
+                pre_roll = item.get("pre_roll", [])
+                for f in pre_roll:
+                    writer.write(cv2.cvtColor(f, cv2.COLOR_RGB2BGR))
+
+        elif cmd == "frame" and recording_active:
+            frame = item.get("frame")
+            if writer:
+                writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+
+        elif cmd == "stop" and recording_active:
+            if writer:
+                writer.release()
+                writer = None
+            recording_active = False
+            print("[Recorder] Wildlife event ended. Video saved.")
 
 
-@app.route("/favicon.ico")
-def favicon():
-    icon_path = os.path.join(BASE_DIR, "bombardeer.ico")
-    if os.path.exists(icon_path):
-        return send_from_directory(BASE_DIR, "bombardeer.ico", mimetype="image/vnd.microsoft.icon")
-    return ("", 204)
+# -------------------------------------------------------------------------
+# Vision Loop: Dynamic Low-Light Auto-Exposure Pipeline
+# -------------------------------------------------------------------------
+def vision_thread():
+    global latest_jpeg, actual_sensor_fps
+
+    picam2 = Picamera2()
+
+    # Hardware Tuning for Dynamic Lighting:
+    # 1. Output binned 2304x1296 mode for superior SNR without sensor cropping.
+    # 2. Re-enable Auto Exposure (AeEnable=True) to prevent washing out in daylight.
+    # 3. Allow exposure to scale automatically down to 10 FPS (100ms) in twilight.
+    cam_config = picam2.create_video_configuration(
+        sensor={"output_size": (2304, 1296)},
+        main={"size": (INFER_SIZE, INFER_SIZE), "format": "RGB888"},
+        buffer_count=6,
+        controls={
+            "AeEnable": True,
+            "AwbMode": 1,
+            "AeExposureMode": 0,
+            "FrameDurationLimits": (33333, 100000)
+        },
+        transform=Transform(vflip=True)
+    )
+    picam2.configure(cam_config)
+    picam2.start()
+    time.sleep(1.0)
+
+    infer_queue = queue.Queue(maxsize=1)
+    record_queue = queue.Queue(maxsize=120)
+
+    threading.Thread(target=hailo_worker, args=(infer_queue,), daemon=True).start()
+    threading.Thread(target=video_recorder_worker, args=(record_queue,), daemon=True).start()
+
+    buffer_capacity = int(RECORD_PRE_ROLL_SEC * TARGET_FPS)
+    pre_roll_buffer = deque(maxlen=buffer_capacity)
+
+    fps_time = time.time()
+    frame_count = 0
+    display_fps = 0.0
+
+    last_detection_time = 0
+    is_recording = False
+
+    while True:
+        frame_raw = picam2.capture_array("main")
+
+        # Hand off to Hailo-8 NPU if ready
+        if not infer_queue.full():
+            infer_queue.put_nowait(frame_raw.copy())
+
+        # FPS Telemetry
+        frame_count += 1
+        now = time.time()
+        if now - fps_time >= 1.0:
+            display_fps = frame_count / (now - fps_time)
+            actual_sensor_fps = display_fps
+            frame_count = 0
+            fps_time = now
+
+        # Target Assessment & Recording Trigger
+        with detections_lock:
+            current_dets = list(active_detections)
+            lat = npu_latency_ms
+            n_fps = npu_fps
+
+        has_target = len(current_dets) > 0
+
+        if has_target:
+            last_detection_time = now
+            if not is_recording:
+                is_recording = True
+                record_queue.put({
+                    "cmd": "start",
+                    "pre_roll": list(pre_roll_buffer)
+                })
+
+        if is_recording:
+            if not record_queue.full():
+                record_queue.put({"cmd": "frame", "frame": frame_raw.copy()})
+
+            if not has_target and (now - last_detection_time > RECORD_POST_ROLL_SEC):
+                is_recording = False
+                record_queue.put({"cmd": "stop"})
+        else:
+            pre_roll_buffer.append(frame_raw.copy())
+
+        # Subsample for Web HUD Display (640x640)
+        annotated = cv2.resize(frame_raw, (DISPLAY_SIZE, DISPLAY_SIZE), interpolation=cv2.INTER_NEAREST)
+
+        # Reticle
+        cx_disp, cy_disp = OPTICAL_CENTER_DISP
+        cv2.drawMarker(annotated, (cx_disp, cy_disp), (0, 0, 255), cv2.MARKER_CROSS, 24, 1)
+        cv2.circle(annotated, (cx_disp, cy_disp), 40, (0, 0, 255), 1)
+
+        # Draw Target Vectors
+        for det in current_dets:
+            x1, y1, x2, y2 = [int(v * SCALE_FACTOR) for v in det["box_1280"]]
+            score = det["score"]
+            tcx = int(det["center"][0] * SCALE_FACTOR)
+            tcy = int(det["center"][1] * SCALE_FACTOR)
+            dx, dy = det["error"]
+
+            cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            cv2.line(annotated, (cx_disp, cy_disp), (tcx, tcy), (0, 255, 255), 1)
+            cv2.circle(annotated, (tcx, tcy), 4, (0, 255, 0), -1)
+
+            label = f"ANIMAL {score*100:.0f}% dx:{dx:+.0f} dy:{dy:+.0f}"
+            cv2.putText(annotated, label, (x1, max(y1 - 8, 15)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1, cv2.LINE_AA)
+
+        # Recording Status Indicator
+        if is_recording:
+            cv2.circle(annotated, (DISPLAY_SIZE - 25, 25), 10, (0, 0, 255), -1)
+            cv2.putText(annotated, "REC", (DISPLAY_SIZE - 65, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 1, cv2.LINE_AA)
+
+        status_text = f"SENSOR: {display_fps:.1f} FPS | NPU: {n_fps:.1f} FPS ({lat:.1f}ms) | 1280p | Targets: {len(current_dets)}"
+        cv2.putText(annotated, status_text, (10, 22),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 255), 1, cv2.LINE_AA)
+
+        success, buffer = cv2.imencode(".jpg", annotated, [int(cv2.IMWRITE_JPEG_QUALITY), 75])
+        if success:
+            with frame_lock:
+                latest_jpeg = buffer.tobytes()
 
 
+# -------------------------------------------------------------------------
+# Flask Server & Routes
+# -------------------------------------------------------------------------
 @app.route("/")
 def index():
-    return """
+    return render_template_string("""
     <!DOCTYPE html>
-    <html lang="en">
+    <html>
     <head>
-        <meta charset="UTF-8">
-        <title>Bombardeer HUD</title>
-        <link rel="shortcut icon" href="/favicon.ico">
+        <title>Bombardeer Wildlife Targeting HUD</title>
+        <link rel="icon" type="image/x-icon" href="/favicon.ico">
         <style>
             body {
-                background: #0a0d14;
-                color: #e2e8f0;
-                font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
                 margin: 0;
+                padding: 0;
+                background-color: #0d1117;
+                color: #c9d1d9;
+                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
                 display: flex;
                 flex-direction: column;
                 align-items: center;
                 justify-content: center;
                 min-height: 100vh;
             }
-            .hud-container {
+            .hud-card {
+                background: #161b22;
+                border: 1px solid #30363d;
+                border-radius: 8px;
+                padding: 16px;
+                box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
                 text-align: center;
-                padding: 20px;
             }
             h1 {
-                color: #00ffcc;
-                letter-spacing: 5px;
-                font-size: 24px;
-                margin-bottom: 15px;
-                text-shadow: 0 0 10px rgba(0, 255, 204, 0.4);
+                margin: 0 0 12px 0;
+                font-size: 1.2rem;
+                letter-spacing: 0.05em;
+                text-transform: uppercase;
+                color: #58a6ff;
             }
-            .video-box {
-                border: 2px solid #253346;
-                border-radius: 12px;
-                box-shadow: 0 0 30px rgba(0, 255, 204, 0.15);
-                max-width: 90vw;
-                height: auto;
+            img {
+                border-radius: 4px;
+                background: #000;
+                width: 640px;
+                height: 640px;
             }
-            .status {
-                margin-top: 12px;
-                font-size: 13px;
-                color: #718096;
-                letter-spacing: 2px;
+            .meta {
+                margin-top: 10px;
+                font-size: 0.82rem;
+                color: #8b949e;
             }
         </style>
     </head>
     <body>
-        <div class="hud-container">
-            <h1>BOMBARDEER TURRET HUD</h1>
-            <img class="video-box" src="/video_feed" alt="Turret Video Stream" />
-            <div class="status">HAILO-8 AI ACCELERATED | 640x640 RGB</div>
+        <div class="hud-card">
+            <h1>Bombardeer Active Targeting HUD</h1>
+            <img src="/video_feed" alt="Targeting Stream">
+            <div class="meta">MegaDetector v6 1280p | Auto Exposure | Auto Event Recording</div>
         </div>
     </body>
     </html>
-    """
+    """)
+
+
+def generate_frames():
+    while True:
+        with frame_lock:
+            if latest_jpeg is None:
+                time.sleep(0.01)
+                continue
+            frame = latest_jpeg
+
+        yield (b"--frame\r\n"
+               b"Content-Type: image/jpeg\r\n\r\n" + frame + b"\r\n")
+        time.sleep(0.05)
 
 
 @app.route("/video_feed")
 def video_feed():
-    return Response(generate_mjpeg(), mimetype="multipart/x-mixed-replace; boundary=frame")
+    return Response(generate_frames(), mimetype="multipart/x-mixed-replace; boundary=frame")
+
+
+@app.route("/favicon.ico")
+def favicon():
+    if os.path.exists(os.path.join(STATIC_DIR, "bombardeer.ico")):
+        return send_from_directory(STATIC_DIR, "bombardeer.ico", mimetype="image/vnd.microsoft.icon")
+    return ("", 204)
 
 
 if __name__ == "__main__":
-    t = threading.Thread(target=tracking_worker, daemon=True)
+    t = threading.Thread(target=vision_thread, daemon=True)
     t.start()
     app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)
