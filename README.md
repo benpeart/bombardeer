@@ -1,4 +1,4 @@
-# 🎯 Bombardeer: Autonomous Vision-Guided Deterrent Turret
+# Bombardeer Wildlife Deterrent Turret: System Architecture Specification
 
 **Bombardeer** is an open-source, vision-guided autonomous deterrent turret designed to protect outdoor spaces, gardens, orchards, and agricultural property from intrusive wildlife (such as deer). 
 
@@ -23,32 +23,27 @@ Powered by a **Raspberry Pi 5** with a **26 TOPS Hailo-8 AI accelerator** for re
 ## 🛠️ System Architecture
 
 ```
-                                                 +-------------------------------+
-                                                 |   Xbox Series X Controller    |
-                                                 |       (Bluetooth Manual)      |
-                                                 +---------------+---------------+
-                                                                 |
-                                                                 v
-+-----------------------+     UART (115200 Baud)     +-----------------------+
-|  Raspberry Pi 5 +     |--------------------------->|    ESP32 Controller   |
-|  Hailo-8 AI (26 TOPS) |   Target Commands (P, T)   |   (FastAccelStepper)  |
-+-----------------------+                            +-----------+-----------+
-                                                                 |
-                                                         UART / Step / Dir
-                                                                 |
-                                                                 v
-                                                     +-----------------------+
-                                                     |  Dual TMC2209 Drivers |
-                                                     +-----------+-----------+
-                                                                 |
-                                                            4-Wire Stepper
-                                                                 |
-                                                                 v
-                                                     +-----------------------+
-                                                     | STEPPERONLINE NEMA 17 |
-                                                     |   Pan & Tilt Motors   |
-                                                     +-----------------------+
+       +---------------------------------------------+
+       |             Raspberry Pi 5                  |
+       |  Perception, Kinematic Projection & Safety  |
+       +---------------------------------------------+
+                              |
+                              |  Bidirectional UART (115200 Baud)
+                              |  Packets in Milliradians (mrad)
+                              v
+       +---------------------------------------------+    +-------------------------------+
+       |             ESP32 Microcontroller           |<---|   Xbox Series X Controller    |
+       |  Motion Planning & Low-Level Actuation      |    |       (Bluetooth Manual)      |
+       +---------------------------------------------+    +---------------+---------------+
+               /              |              \
+              v               v               v
+     +----------------+ +----------------+ +--------------------+
+     | TMC2209 / Pan  | | TMC2209 / Tilt | | 24V Firing Circuit |
+     | Stepper Motor  | | Stepper Motor  | | Heschen Solenoid   |
+     +----------------+ +----------------+ +--------------------+
+
 ```
+
 ---
 
 ## 🧰 Hardware Requirements
@@ -66,44 +61,92 @@ Powered by a **Raspberry Pi 5** with a **26 TOPS Hailo-8 AI accelerator** for re
 
 ---
 
-## ⚡ ESP32 Firmware Setup
+## Subsystem Roles
 
-### Software Dependencies
+### 1. Vision & Trajectory Planning (Raspberry Pi 5)
 
-The ESP32 firmware requires the following Arduino libraries:
+* **Sensor Capture:** Sony IMX708 NoIR module operating via `Picamera2` and hardware PiSP color management.
+* **Perception Engine:** OpenCV ArUco detector (diagnostic testing) and Hailo-8 AI neural inference pipeline (production target detection).
+* **Optical Ray Projection:** Converts raw pixel displacement $(\Delta x, \Delta y)$ from optical center into metric angles:
 
-* [TeemuAtlut/TMCStepper](https://github.com/teemuatlut/TMCStepper) — TMC2209 UART configuration
-* [Gin66/FastAccelStepper](https://github.com/Gin66/FastAccelStepper) — Hardware-timer step pulse engine
-* [XboxSeriesXControllerESP32_asukiaaa](https://github.com/asukiaaa/XboxSeriesXControllerESP32_asukiaaa) — Xbox controller Bluetooth library
+$$\Delta \theta_{pan} = \arctan\left(\frac{x - c_x}{f_x}\right) \times 1000 \quad [\text{mrad}]$$
+
+
+$$\Delta \theta_{tilt} = \arctan\left(\frac{y - c_y}{f_y}\right) \times 1000 \quad [\text{mrad}]$$
+
+
+* **Visual Servoing:** Formulates target waypoints in relative or absolute milliradians and streams them to the motion controller.
+* **Diagnostic HUD & Stream:** Flask-based real-time telemetry streaming accompanied by automated rolling buffer video recording.
+
+### 2. Motion & Actuation Engine (ESP32)
+
+* **Hardware Motion Profiler:** `FastAccelStepper` dynamically solves trapezoidal acceleration ramps natively on hardware timers at $16{,}000\text{ steps/s}^2$.
+* **Angular-to-Step Translation:** Maps incoming integer milliradians directly to stepper motor step coordinates:
+
+$$\text{Steps} = \text{Target Angle [mrad]} \times \left(\frac{\text{Steps per Revolution} \times \text{Microsteps} \times \text{Gear Ratio}}{2000 \pi}\right)$$
+
+
+* **Driver Control:** Dual TMC2209 silent stepper drivers driven over a shared single-wire UART bus with runtime current configuration and StealthChop/SpreadCycle dynamic switching.
+* **Actuation State Machine:** Hardware timing driver managing the high-speed pulse-and-cooldown cycles for the Heschen 24-volt firing solenoid.
+* **Safety & Manual Override:** Low-latency Bluetooth listener for an Xbox Series X controller with stick deflection interrupts that instantly take precedence over autonomous tracking.
 
 ---
 
-## 🕹️ Xbox Controller Mapping
+## Serial Communication Interface
 
-| Control | Action | Function |
-| :--- | :--- | :--- |
-| **Left Stick (Horizontal)** | Pan Axis | Dynamic velocity panning (quadratic response curve) |
-| **Left Stick (Vertical)** | Tilt Axis | Dynamic velocity tilting (quadratic response curve) |
-| **Right Trigger (RT)** | Actuation | Payload trigger signal |
+Communication operates over UART at **115,200 baud, 8N1**, utilizing plain ASCII newline-terminated strings.
+
+### Commands: Raspberry Pi -> ESP32
+
+| Command | Arguments | Unit | Description | Example |
+| --- | --- | --- | --- | --- |
+| `M` | `<d_pan> <d_tilt>` | `mrad` | **Move Relative:** Displaces axes by the commanded angular delta from current position. | `M 35 -12` |
+| `A` | `<pan> <tilt>` | `mrad` | **Move Absolute:** Drives axes to the specified angular coordinates referenced to mechanical zero. | `A 120 -45` |
+| `X` | *none* | — | **Halt:** Immediately initiates controlled deceleration to stop and hold current position. | `X` |
+| `T` | `<state: 0|1>` | boolean | **Trigger:** Commands the solenoid firing state machine (`1` = fire cycle, `0` = release). | `T 1` |
+| `H` | *none* | — | **Home:** Clears current motor coordinates to angular zero $(0, 0\text{ mrad})$. | `H` |
+| `Q` | *none* | — | **Status Query:** Requests an immediate diagnostic telemetry packet. | `Q` |
+
+### Telemetry: ESP32 -> Raspberry Pi
+
+| Packet | Arguments | Unit | Description | Example |
+| --- | --- | --- | --- | --- |
+| `S` | `<pan> <tilt> <firing>` | `mrad`, `mrad`, `flag` | **Periodic State (20 Hz):** Broadcasts current pan angle, tilt angle, and solenoid firing state. | `S 32 -10 0` |
+| `R` | `<is_moving> <pan> <tilt>` | `flag`, `mrad`, `mrad` | **Query Response:** Transmitted immediately in response to `Q`. | `R 0 120 -45` |
 
 ---
 
-## 📡 Serial Protocol (Pi 5 $\rightarrow$ ESP32)
+## Hardware Specification & Kinematics
 
-Commands are transmitted over high-speed UART (`115200` baud, `8N1`) formatted as string frames terminated by `\n`:
+### Mechanical & Stepper Parameters
 
-```
-P:<pan_steps>,T:<tilt_steps>\n
-```
+* **Pan Stepper:** 1.8° step angle ($200\text{ steps/rev}$), $16\times$ microstepping $\rightarrow 3{,}200\text{ native steps/rev}$.
+* **Tilt Stepper:** 1.8° step angle ($200\text{ steps/rev}$), $16\times$ microstepping $\rightarrow 3{,}200\text{ native steps/rev}$.
+* **Pan Speed Ceiling:** $16{,}000\text{ steps/s}$ ($5.0\text{ rev/s}$).
+* **Pan Acceleration Ceiling:** $16{,}000\text{ steps/s}^2$.
+* **Travel Envelopes:**
+* Pan: $\pm 10{,}000\text{ steps}$ ($\approx \pm 3{,}125\text{ mrad}$ / $\pm 179.0^\circ$).
+* Tilt: $\pm 15{,}000\text{ steps}$ ($\approx \pm 4{,}687\text{ mrad}$ / $\pm 268.5^\circ$).
 
-## Example:
 
-```
-P:1200,T:-450
-```
 
-* P:1200 — Absolute step position target for Pan axis
-* T:-450 — Absolute step position target for Tilt axis
+### Optical Calibration (Sony IMX708 Wide NoIR)
+
+* **Active Sensor Width ($W_{px}$):** 1280 pixels
+* **Active Sensor Height ($H_{px}$):** 720 pixels
+* **Horizontal Field of View ($\text{HFOV}$):** $\approx 102^\circ$ ($1.780\text{ rad}$)
+* **Calibrated Horizontal Focal Length ($f_x$):**
+
+$$f_x = \frac{W_{px} / 2}{\tan(\text{HFOV} / 2)} = \frac{640}{\tan(51^\circ)} \approx 518.2\text{ pixels}$$
+
+
+* **Milliradians Per Pixel (Center Optical Axis):**
+
+$$\text{mrad/px} = \frac{1000}{f_x} \approx \frac{1000}{518.2} \approx 1.93\text{ mrad/px}$$
+
+
+
+---
 
 Note: If an Xbox controller is actively connected and generating manual joystick/button input, manual override automatically gates serial commands to prevent trajectory conflict.
 
