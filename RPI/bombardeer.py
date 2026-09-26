@@ -1,14 +1,20 @@
 #!/usr/bin/env python3
 """
 Bombardeer Turret Hybrid Visual Servoing Controller
---------------------------------------------------
-- Phase 1: Coarse Saccadic Step (> 50 mrad):
-    * Dispatches single waypoint displacement: M <d_pan> <d_tilt>
-    * Enters settling blanking window until ESP32 reports is_moving == 0.
-- Phase 2: Continuous Fine Trim (< 50 mrad):
-    * Dispatches gentle proportional velocity commands: V <p_spd> <t_spd>
-    * Tracks smooth target drift right into the crosshair deadband.
-- Hardened ArUco perception with BGR MP4 recording and live diagnostic console.
+------------------------------------------------
+- Real-Time Predictive Visual Servoing Architecture:
+    * Native milliradian (mrad) / (mrad/s) kinematic control loop.
+    * Dynamic pinhole range estimation (ArUco in test, Bounding Box in prod).
+    * Dynamic parallax compensation for Camera-Bore physical offset.
+    * Constant-Velocity Kalman Filter with Lead Horizon Prediction.
+    * Dynamic Slew-Rate Limiter (Prevents sudden torque spikes & rotor stalls).
+- Hardened Low-Light ArUco Perception (DICT_4X4_50):
+    * Perspective-tolerant geometry validation.
+    * Robust ID-based temporal locking.
+- Diagnostic & Error Reporting Layer:
+    * Reconnecting Serial Worker with packet count auditing.
+    * Verified VideoWriter engine with explicit error tracebacks.
+    * Live on-screen telemetry banner for operational alerts.
 """
 
 import os
@@ -20,6 +26,7 @@ import datetime
 import threading
 import queue
 import logging
+import traceback
 from collections import deque
 import numpy as np
 import cv2
@@ -29,19 +36,40 @@ from flask import Flask, Response, render_template_string, send_from_directory
 from picamera2 import Picamera2
 from libcamera import Transform
 
+# =========================================================================
+# Structured Logging Setup
+# =========================================================================
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s.%(msecs)03d [%(levelname)s] %(message)s",
-    datefmt="%H:%M:%S",
+    datefmt="%H:%M:%S"
 )
 log = logging.getLogger("Bombardeer")
 
+# =========================================================================
+# Configuration & Hardware Calibration
+# =========================================================================
+
 STATIC_DIR = "/home/ben/Bombardeer/static"
 RECORDINGS_DIR = "/home/ben/Bombardeer/test_recordings"
-os.makedirs(RECORDINGS_DIR, exist_ok=True)
 
+# Verify filesystem write access immediately on boot
+try:
+    os.makedirs(RECORDINGS_DIR, exist_ok=True)
+    test_touch = os.path.join(RECORDINGS_DIR, ".write_test")
+    with open(test_touch, "w") as f:
+        f.write("ok")
+    os.remove(test_touch)
+    log.info(f"[STORAGE] Storage directory verified writable: {RECORDINGS_DIR}")
+except Exception as e:
+    log.error(f"[STORAGE ERROR] Cannot write to storage path {RECORDINGS_DIR}: {e}")
+
+# Vision Geometry: 1280x720 Native 16:9[cite: 4]
 FRAME_WIDTH = 1280
 FRAME_HEIGHT = 720
+
+# Hardware HUD Resolution (PiSP Silicon Downscaling)[cite: 4]
 DISPLAY_WIDTH = 640
 DISPLAY_HEIGHT = 360
 
@@ -50,50 +78,63 @@ SCALE_Y = DISPLAY_HEIGHT / FRAME_HEIGHT
 
 OPTICAL_CENTER = (FRAME_WIDTH // 2, FRAME_HEIGHT // 2)
 
-GUN_OFFSET_PAN_PX = 0
-GUN_OFFSET_TILT_PX = 20
+# --- PHYSICAL PARALLAX OFFSETS (Camera relative to Barrel) ---
+# Looking down barrel/camera facing forward:
+# Camera is 170 mm Left (-X) and 60 mm Below (-Y) of barrel bore centerline
+CAMERA_OFFSET_X_MM = -170.0  # mm
+CAMERA_OFFSET_Y_MM = -60.0   # mm
 
-FOCAL_LENGTH_X_PX = 509
-FOCAL_LENGTH_Y_PX = 477
+# Camera Optical Intrinsics (RPi Cam Module 3 @ 1280x720 native crop)
+# Focal length fx ~ 985.5 px => MRAD_PER_PIXEL ~ 1.015 mrad/px
+FOCAL_LENGTH_PX = 985.5
+MRAD_PER_PIXEL_X = 1.015
+MRAD_PER_PIXEL_Y = 1.015
 
-# =========================================================================
-# Hybrid Dual-Phase Tuning Thresholds
-# =========================================================================
-SACCADE_ENTRY_THRESHOLD_MRAD = 50.0  # Above this, fire discrete waypoint move
-SACCADE_TIMEOUT_SEC = 0.85  # Hard limit to exit saccade blanking if packet lost
+# Known Physical Dimensions for Pinhole Range Estimation (D = (Real_Size * f_px) / Pixel_Size)
+ARUCO_REAL_WIDTH_MM = 100.0   # Test: Printed 100 mm ArUco marker edge
+DEER_REAL_HEIGHT_MM = 1000.0  # Prod: Average standing white-tailed deer shoulder height (~1.0 m)
 
-# =========================================================================
-# Phase 2 Fine Trim Proportional Gains (Unit: (mrad/s) / mrad error = 1/s)
-# -------------------------------------------------------------------------
-# HOW TO DETERMINE THESE VALUES:
-# 1. Physical Meaning: Kp sets how fast error decays (Time to settle ~= 3 / Kp).
-#    * Kp = 4.0  -> Settles in ~0.75s (sluggish, feels like a crawl).
-#    * Kp = 8.5  -> Settles in ~0.35s (brisk, smooth closure).
-#    * Kp > 15.0 -> Unstable. Exceeds loop latency (dt ~= 65ms), causing oscillation.
-# 2. Tuning Method:
-#    * Start low (e.g., 5.0) and increase in increments of 1.0.
-#    * If the axis crawls into the deadband, INCREASE Kp.
-#    * If the axis overshoots the crosshair reticle during Phase 2, DECREASE Kp.
-#    * Pan requires slightly higher gain (8.0 - 9.0) due to taller gearing (6.67:1).
-#    * Tilt requires lower gain (4.5 - 6.0) due to 50:1 worm reduction mechanical damping.
-# =========================================================================
-KP_TRIM_PAN = 4.25
-KP_TRIM_TILT = 2.5
+MIN_VALID_RANGE_M = 2.0
+MAX_VALID_RANGE_M = 50.0
 
-MAX_TRIM_SPEED_PAN = 900.0  # Cap to prevent blur (mrad/s, ~3000 steps/s)
-MAX_TRIM_SPEED_TILT = 350.0  # Cap to prevent worm gear whip (mrad/s)
+# --- CONTROL GAINS (mrad/s per mrad error) ---
+KP_PAN = 3.5
+KD_PAN = 0.0
+KF_PAN = 0.0
 
-# Settling Deadbands
-PAN_DEADBAND_MRAD = 14.0
-TILT_DEADBAND_MRAD = 10.0
-FIRE_DEADBAND_MRAD = 38.0
+KP_TILT = 3.5
+KD_TILT = 0.0
+KF_TILT = 0.0
 
+# Physical Motor Ceilings in Milliradians/sec (mrad/s)
+# Pan Max: 11,600 steps/s / 3.386 = ~3425 mrad/s
+# Tilt Max: 14,800 steps/s / 25.465 = ~581 mrad/s
+MAX_PAN_SPEED = 3400
+MAX_TILT_SPEED = 580
+MIN_RUN_SPEED = 20
+
+# Slew-Rate Limiter: Maximum allowed speed step per frame (~33ms) in mrad/s
+MAX_ACCEL_PAN_PER_FRAME = 250
+MAX_ACCEL_TILT_PER_FRAME = 60
+
+# Latency Prediction Horizon (Projects target forward by 65 ms)[cite: 4]
+PREDICTION_LEAD_SEC = 0.065
+
+# Derivative & Velocity Safety Clamps[cite: 4]
+MAX_ESTIMATED_VEL_PX_PER_SEC = 3500.0
+MAX_DERIVATIVE_RATE = 3000.0
+
+# Deadbands in Milliradians
+MOTION_DEADBAND_MRAD = 20.0
+FIRE_DEADBAND_MRAD = 35.0
 MAX_TRIGGER_DURATION_SEC = 2.0
 TRIGGER_COOLDOWN_SEC = 1.5
 
+# Target Identification & Verification[cite: 4]
 TARGET_MARKER_ID = 0
 CONFIRMATION_FRAMES = 2
 
+# Serial Configuration[cite: 4]
 DEFAULT_SERIAL_PORTS = ["/dev/ttyUSB0", "/dev/ttyACM0", "/dev/ttyUSB1"]
 BAUD_RATE = 115200
 
@@ -110,63 +151,136 @@ app = Flask(__name__)
 frame_lock = threading.Lock()
 latest_jpeg = None
 
+# Global Diagnostic & Runtime State
 state_lock = threading.Lock()
 active_detections = []
 primary_target = None
+predicted_target = None
 turret_pan_mrad = 0
 turret_tilt_mrad = 0
-turret_is_moving = False
 is_firing = False
 free_disk_gb = 0.0
 
+# Telemetry Health Status Monitors
 system_health = {
     "serial_connected": False,
     "serial_tx_count": 0,
     "serial_rx_count": 0,
-    "active_phase": "IDLE",
     "recorder_active": False,
     "recorder_error": None,
     "last_alert": None,
-    "alert_time": 0.0,
+    "alert_time": 0.0
 }
 
 
 def set_alert(message, duration=3.0):
+    """Publish a visible diagnostic alert to the HUD ribbon."""
     with state_lock:
         system_health["last_alert"] = message
         system_health["alert_time"] = time.time() + duration
     log.warning(f"[ALERT] {message}")
 
 
+# =========================================================================
+# Predictive State Estimator: Constant Velocity Kalman Filter[cite: 4]
+# =========================================================================
+
+class TargetKalmanFilter:
+    def __init__(self):
+        self.kf = cv2.KalmanFilter(4, 2)
+        self.kf.measurementMatrix = np.array([
+            [1, 0, 0, 0],
+            [0, 1, 0, 0]
+        ], dtype=np.float32)
+
+        self.kf.processNoiseCov = np.eye(4, dtype=np.float32) * 1e-2
+        self.kf.processNoiseCov[2, 2] = 2.0
+        self.kf.processNoiseCov[3, 3] = 2.0
+
+        self.kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * 1.5
+        self.kf.errorCovPost = np.eye(4, dtype=np.float32) * 10.0
+
+        self.last_time = None
+        self.initialized = False
+
+    def reset(self):
+        self.initialized = False
+        self.last_time = None
+
+    def update(self, z_x, z_y, current_time):
+        try:
+            if not self.initialized:
+                self.kf.statePost = np.array([[z_x], [z_y], [0.0], [0.0]], dtype=np.float32)
+                self.last_time = current_time
+                self.initialized = True
+                return z_x, z_y, 0.0, 0.0
+
+            dt = max(0.001, min(0.20, current_time - self.last_time))
+            self.last_time = current_time
+
+            self.kf.transitionMatrix = np.array([
+                [1, 0, dt, 0],
+                [0, 1, 0, dt],
+                [0, 0, 1,  0],
+                [0, 0, 0,  1]
+            ], dtype=np.float32)
+
+            self.kf.predict()
+            measurement = np.array([[np.float32(z_x)], [np.float32(z_y)]])
+            estimate = self.kf.correct(measurement)
+
+            pos_x = float(estimate[0, 0])
+            pos_y = float(estimate[1, 0])
+            vel_x = float(np.clip(estimate[2, 0], -MAX_ESTIMATED_VEL_PX_PER_SEC, MAX_ESTIMATED_VEL_PX_PER_SEC))
+            vel_y = float(np.clip(estimate[3, 0], -MAX_ESTIMATED_VEL_PX_PER_SEC, MAX_ESTIMATED_VEL_PX_PER_SEC))
+
+            self.kf.statePost[2, 0] = vel_x
+            self.kf.statePost[3, 0] = vel_y
+
+            return pos_x, pos_y, vel_x, vel_y
+        except Exception as e:
+            log.error(f"[KALMAN ERROR] Exception during state update: {e}")
+            return z_x, z_y, 0.0, 0.0
+
+    def predict_future(self, lead_time_sec):
+        if not self.initialized:
+            return 0.0, 0.0
+        state = self.kf.statePost
+        pred_x = float(state[0, 0] + state[2, 0] * lead_time_sec)
+        pred_y = float(state[1, 0] + state[3, 0] * lead_time_sec)
+        return pred_x, pred_y
+
+
+# =========================================================================
+# Perception Layer: Hardened Low-Light ArUco Detector[cite: 4]
+# =========================================================================
+
 class ArucoTargetDetector:
     def __init__(self, target_id=TARGET_MARKER_ID):
         self.target_id = target_id
         self.dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
         self.parameters = cv2.aruco.DetectorParameters()
+        
         self.parameters.errorCorrectionRate = 0.55
         self.parameters.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
         self.parameters.perspectiveRemovePixelPerCell = 8
         self.parameters.perspectiveRemoveIgnoredMarginPerCell = 0.18
         self.parameters.minMarkerPerimeterRate = 0.02
         self.parameters.maxMarkerPerimeterRate = 4.0
+        
         self.detector = cv2.aruco.ArucoDetector(self.dictionary, self.parameters)
         self.clahe = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8, 8))
 
     def detect(self, frame_raw):
         try:
             if isinstance(frame_raw, list):
-                frame_raw = np.asarray(
-                    frame_raw[0]
-                    if len(frame_raw) > 0
-                    and isinstance(frame_raw[0], (np.ndarray, list))
-                    else frame_raw
-                )
+                frame_raw = np.asarray(frame_raw[0] if len(frame_raw) > 0 and isinstance(frame_raw[0], (np.ndarray, list)) else frame_raw)
 
-            gray = (
-                cv2.cvtColor(frame_raw, cv2.COLOR_RGB2GRAY)
-                if len(frame_raw.shape) == 3
-                else frame_raw
-            )
+            if len(frame_raw.shape) == 3:
+                gray = cv2.cvtColor(frame_raw, cv2.COLOR_RGB2GRAY)
+            else:
+                gray = frame_raw
+
             enhanced_gray = self.clahe.apply(gray)
             corners, ids, _ = self.detector.detectMarkers(enhanced_gray)
             detections = []
@@ -185,7 +299,7 @@ class ArucoTargetDetector:
                     ratio = d01 / max(1.0, d12)
                     if not (0.35 <= ratio <= 2.85):
                         continue
-
+                    
                     cx = float(np.mean(pts[:, 0]))
                     cy = float(np.mean(pts[:, 1]))
                     x1 = int(np.min(pts[:, 0]))
@@ -194,22 +308,35 @@ class ArucoTargetDetector:
                     y2 = int(np.max(pts[:, 1]))
                     area = float(cv2.contourArea(pts.astype(np.float32)))
 
-                    detections.append(
-                        {
-                            "box": [x1, y1, x2, y2],
-                            "center": (cx, cy),
-                            "score": 0.99,
-                            "area": area,
-                            "id": int(marker_id),
-                        }
-                    )
+                    # Test Range Estimation from ArUco marker edge length in pixels
+                    marker_px = max(1.0, (d01 + d12) / 2.0)
+                    estimated_range_m = (ARUCO_REAL_WIDTH_MM * FOCAL_LENGTH_PX) / (marker_px * 1000.0)
+
+                    # In Production: Replace with bounding-box height calculation for deer:
+                    # bbox_h = max(1.0, float(y2 - y1))
+                    # estimated_range_m = (DEER_REAL_HEIGHT_MM * FOCAL_LENGTH_PX) / (bbox_h * 1000.0)
+
+                    detections.append({
+                        "box": [x1, y1, x2, y2],
+                        "center": (cx, cy),
+                        "score": 0.99,
+                        "area": area,
+                        "range_m": float(np.clip(estimated_range_m, MIN_VALID_RANGE_M, MAX_VALID_RANGE_M)),
+                        "id": int(marker_id)
+                    })
+
             return detections
         except Exception as e:
             log.error(f"[DETECTOR ERROR] Vision parsing failed: {e}")
             return []
 
 
+# =========================================================================
+# Serial Worker Thread with Auto-Reconnect & Heartbeat Watchdog
+# =========================================================================
+
 def find_working_serial_port():
+    """Iterate through candidate serial ports to locate the ESP32."""
     for port in DEFAULT_SERIAL_PORTS:
         if os.path.exists(port):
             try:
@@ -222,22 +349,23 @@ def find_working_serial_port():
 
 
 def turret_serial_worker(cmd_queue):
-    global turret_pan_mrad, turret_tilt_mrad, turret_is_moving, is_firing
+    global turret_pan_mrad, turret_tilt_mrad, is_firing
 
     ser = None
     active_port = None
+    reconnect_delay = 2.0
     next_reconnect_time = 0.0
 
-    last_p_spd = None
-    last_t_spd = None
+    last_pan_spd = 0
+    last_tilt_spd = 0
     trigger_state = 0
     trigger_start_time = 0.0
     cooldown_until = 0.0
-    pending_velocity = None
 
     while True:
         now = time.time()
 
+        # Reconnection Watchdog
         if ser is None or not ser.is_open:
             with state_lock:
                 system_health["serial_connected"] = False
@@ -249,46 +377,38 @@ def turret_serial_worker(cmd_queue):
                         ser = serial.Serial(active_port, BAUD_RATE, timeout=0.02)
                         with state_lock:
                             system_health["serial_connected"] = True
-                        log.info(f"[SERIAL] Connected on {active_port}")
+                        log.info(f"[SERIAL] Successfully opened ESP32 link on {active_port}")
                         set_alert(f"Connected: {active_port}", duration=2.0)
                     except Exception as e:
                         ser = None
-                        next_reconnect_time = now + 2.0
-                        log.error(f"[SERIAL ERROR] Link failed: {e}")
+                        next_reconnect_time = now + reconnect_delay
+                        set_alert(f"Serial Open Error: {e}", duration=2.0)
+                        log.error(f"[SERIAL ERROR] Failed connecting to {active_port}: {e}")
                 else:
-                    next_reconnect_time = now + 2.0
+                    next_reconnect_time = now + reconnect_delay
 
+        # Process Outgoing Motor & Trigger Commands
         try:
             while not cmd_queue.empty():
                 item = cmd_queue.get_nowait()
                 cmd = item.get("cmd")
 
-                if cmd == "SACCADE":
-                    d_p = item["d_pan"]
-                    d_t = item["d_tilt"]
-                    pending_velocity = None
-                    last_p_spd = 0
-                    last_t_spd = 0
-                    if ser and ser.is_open:
-                        try:
-                            ser.write(f"M {d_p} {d_t}\n".encode())
-                            with state_lock:
-                                system_health["serial_tx_count"] += 1
-                        except Exception as e:
-                            log.error(f"[SERIAL TX ERROR] Saccade write failed: {e}")
+                if cmd == "VELOCITY":
+                    p_spd = item["pan_spd"]   # in mrad/s
+                    t_spd = item["tilt_spd"]  # in mrad/s
 
-                elif cmd == "VELOCITY":
-                    pending_velocity = item
-
-                elif cmd == "HALT":
-                    pending_velocity = None
-                    if ser and ser.is_open:
-                        try:
-                            ser.write(b"X\n")
-                            with state_lock:
-                                system_health["serial_tx_count"] += 1
-                        except Exception:
-                            pass
+                    if abs(p_spd - last_pan_spd) >= 15 or abs(t_spd - last_tilt_spd) >= 15:
+                        last_pan_spd = p_spd
+                        last_tilt_spd = t_spd
+                        if ser and ser.is_open:
+                            try:
+                                ser.write(f"V {p_spd} {t_spd}\n".encode())
+                                with state_lock:
+                                    system_health["serial_tx_count"] += 1
+                            except Exception as e:
+                                log.error(f"[SERIAL TX ERROR] Write failed: {e}")
+                                ser.close()
+                                ser = None
 
                 elif cmd == "TRIGGER":
                     req_state = item["state"]
@@ -303,9 +423,9 @@ def turret_serial_worker(cmd_queue):
                                     ser.write(b"T 1\n")
                                     with state_lock:
                                         system_health["serial_tx_count"] += 1
-                                    log.info("[SERIAL] Solenoid FIRED")
-                                except Exception:
-                                    pass
+                                    log.info("[SERIAL] Solenoid trigger pulse FIRED")
+                                except Exception as e:
+                                    log.error(f"[SERIAL TX ERROR] Trigger write failed: {e}")
                     elif req_state == 0:
                         if trigger_state == 1:
                             trigger_state = 0
@@ -317,28 +437,13 @@ def turret_serial_worker(cmd_queue):
                                     ser.write(b"T 0\n")
                                     with state_lock:
                                         system_health["serial_tx_count"] += 1
-                                except Exception:
-                                    pass
+                                except Exception as e:
+                                    log.error(f"[SERIAL TX ERROR] Trigger release failed: {e}")
         except queue.Empty:
             pass
 
-        if pending_velocity and ser and ser.is_open:
-            p_spd = pending_velocity["pan_spd"]
-            t_spd = pending_velocity["tilt_spd"]
-            if p_spd != last_p_spd or t_spd != last_t_spd:
-                try:
-                    ser.write(f"V {p_spd} {t_spd}\n".encode())
-                    last_p_spd = p_spd
-                    last_t_spd = t_spd
-                    with state_lock:
-                        system_health["serial_tx_count"] += 1
-                except Exception as e:
-                    log.error(f"[SERIAL TX ERROR] Velocity write failed: {e}")
-            pending_velocity = None
-
-        if trigger_state == 1 and (
-            now - trigger_start_time >= MAX_TRIGGER_DURATION_SEC
-        ):
+        # Internal Failsafe: Solenoid Timeout Enforcer
+        if trigger_state == 1 and (now - trigger_start_time >= MAX_TRIGGER_DURATION_SEC):
             trigger_state = 0
             with state_lock:
                 is_firing = False
@@ -346,61 +451,74 @@ def turret_serial_worker(cmd_queue):
             if ser and ser.is_open:
                 try:
                     ser.write(b"T 0\n")
-                except Exception:
-                    pass
+                    log.warning("[SERIAL FAILSAFE] Max trigger duration exceeded. Disengaged.")
+                except Exception as e:
+                    log.error(f"[SERIAL ERROR] Failsafe write failed: {e}")
 
+        # Ingest Telemetry Status from ESP32: S <pan_mrad> <tilt_mrad> <firing> <moving>
         if ser and ser.is_open and ser.in_waiting:
             try:
                 line = ser.readline().decode(errors="ignore").strip()
                 if line.startswith("S "):
                     parts = line.split()
-                    if len(parts) >= 5:
+                    if len(parts) >= 3:
                         with state_lock:
                             turret_pan_mrad = int(parts[1])
                             turret_tilt_mrad = int(parts[2])
-                            turret_is_moving = int(parts[4]) == 1
                             system_health["serial_rx_count"] += 1
-            except Exception:
-                pass
+            except Exception as e:
+                log.warning(f"[SERIAL RX ERROR] Malformed telemetry line: {e}")
 
         time.sleep(0.005)
 
+
+# =========================================================================
+# Video Storage Worker with Explicit Codec Fallbacks & Error Reporting
+# =========================================================================
 
 def ensure_storage_headroom():
     global free_disk_gb
     try:
         _, _, free = shutil.disk_usage(RECORDINGS_DIR)
-        free_disk_gb = free / (1024**3)
+        free_disk_gb = free / (1024 ** 3)
+
+        if free_disk_gb < MIN_FREE_SPACE_GB:
+            set_alert(f"LOW STORAGE: {free_disk_gb:.1f} GB Free", duration=4.0)
+
         files = glob.glob(os.path.join(RECORDINGS_DIR, "test_*.mp4"))
         if not files:
             return
+
         files.sort(key=os.path.getmtime)
-        archive_gb = sum(os.path.getsize(f) for f in files) / (1024**3)
+        archive_gb = sum(os.path.getsize(f) for f in files) / (1024 ** 3)
+
         for fpath in files:
-            if (
-                free_disk_gb >= MIN_FREE_SPACE_GB
-                and archive_gb <= MAX_RECORDINGS_STORAGE_GB
-            ):
+            if free_disk_gb >= MIN_FREE_SPACE_GB and archive_gb <= MAX_RECORDINGS_STORAGE_GB:
                 break
             size = os.path.getsize(fpath)
             try:
                 os.remove(fpath)
-                archive_gb -= size / (1024**3)
+                log.info(f"[STORAGE PURGE] Cleared old recording: {fpath}")
+                archive_gb -= size / (1024 ** 3)
                 _, _, updated_free = shutil.disk_usage(RECORDINGS_DIR)
-                free_disk_gb = updated_free / (1024**3)
-            except OSError:
-                pass
-    except Exception:
-        pass
+                free_disk_gb = updated_free / (1024 ** 3)
+            except OSError as e:
+                log.error(f"[STORAGE ERROR] Purge failed on {fpath}: {e}")
+    except Exception as e:
+        log.error(f"[STORAGE EXCEPTION] Disk check failed: {e}")
 
 
 def video_recorder_worker(record_queue):
     writer = None
     recording_active = False
     current_filepath = None
+    frames_written = 0
+
     CODECS = [
         ("mp4v", cv2.VideoWriter_fourcc(*"mp4v")),
         ("avc1", cv2.VideoWriter_fourcc(*"avc1")),
+        ("MJPG", cv2.VideoWriter_fourcc(*"MJPG")),
+        ("XVID", cv2.VideoWriter_fourcc(*"XVID"))
     ]
 
     while True:
@@ -408,94 +526,140 @@ def video_recorder_worker(record_queue):
             item = record_queue.get(timeout=0.5)
         except queue.Empty:
             continue
+
         cmd = item.get("cmd")
 
-        if cmd == "start" and not recording_active:
-            ensure_storage_headroom()
-            ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            current_filepath = os.path.join(RECORDINGS_DIR, f"test_{ts}.mp4")
-            writer = None
-            for tag, fourcc in CODECS:
-                try:
-                    c = cv2.VideoWriter(
-                        current_filepath,
-                        fourcc,
-                        TARGET_FPS,
-                        (FRAME_WIDTH, FRAME_HEIGHT),
-                    )
-                    if c and c.isOpened():
-                        writer = c
-                        break
-                    elif c:
-                        c.release()
-                except Exception:
-                    continue
+        if cmd == "start":
+            if not recording_active:
+                ensure_storage_headroom()
+                ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                current_filepath = os.path.join(RECORDINGS_DIR, f"test_{ts}.mp4")
+                writer = None
+                frames_written = 0
 
+                for tag, fourcc in CODECS:
+                    try:
+                        cand = cv2.VideoWriter(current_filepath, fourcc, TARGET_FPS, (FRAME_WIDTH, FRAME_HEIGHT))
+                        if cand is not None and cand.isOpened():
+                            writer = cand
+                            log.info(f"[RECORDER] VideoWriter opened with codec '{tag}' -> {current_filepath}")
+                            break
+                        else:
+                            if cand is not None:
+                                cand.release()
+                    except Exception as e:
+                        log.debug(f"[RECORDER] Codec {tag} rejected: {e}")
+
+                if writer and writer.isOpened():
+                    recording_active = True
+                    with state_lock:
+                        system_health["recorder_active"] = True
+                        system_health["recorder_error"] = None
+
+                    # Write pre-roll buffer
+                    for f in item.get("pre_roll", []):
+                        try:
+                            bgr = cv2.cvtColor(f, cv2.COLOR_RGB2BGR)
+                            writer.write(bgr)
+                            frames_written += 1
+                        except Exception as e:
+                            log.error(f"[RECORDER ERROR] Pre-roll write failure: {e}")
+                else:
+                    err_msg = "All VideoWriter codecs failed to open."
+                    log.error(f"[RECORDER ERROR] {err_msg} Path: {current_filepath}")
+                    with state_lock:
+                        system_health["recorder_active"] = False
+                        system_health["recorder_error"] = err_msg
+                    set_alert("RECORDER FAILED: Check Codecs", duration=5.0)
+                    recording_active = False
+
+        elif cmd == "frame" and recording_active:
+            frame = item.get("frame")
             if writer and writer.isOpened():
-                recording_active = True
-                with state_lock:
-                    system_health["recorder_active"] = True
-                for f in item.get("pre_roll", []):
-                    writer.write(cv2.cvtColor(f, cv2.COLOR_RGB2BGR))
-        elif cmd == "frame" and recording_active and writer and writer.isOpened():
-            writer.write(cv2.cvtColor(item.get("frame"), cv2.COLOR_RGB2BGR))
+                try:
+                    bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                    writer.write(bgr)
+                    frames_written += 1
+                except Exception as e:
+                    log.error(f"[RECORDER ERROR] Frame write fault: {e}")
+                    with state_lock:
+                        system_health["recorder_error"] = str(e)
+
         elif cmd == "stop" and recording_active:
             recording_active = False
             with state_lock:
                 system_health["recorder_active"] = False
-            if writer:
-                writer.release()
-                writer = None
 
+            if writer:
+                try:
+                    writer.release()
+                    writer = None
+                    if os.path.exists(current_filepath):
+                        file_sz_kb = os.path.getsize(current_filepath) / 1024.0
+                        log.info(f"[RECORDER] Finalized {current_filepath} ({frames_written} frames, {file_sz_kb:.1f} KB)")
+                        set_alert(f"Saved: {os.path.basename(current_filepath)}", duration=3.0)
+                    else:
+                        log.error(f"[RECORDER ERROR] Finalized file missing on disk: {current_filepath}")
+                except Exception as e:
+                    log.error(f"[RECORDER ERROR] Failed releasing writer: {e}")
+            ensure_storage_headroom()
+
+
+# =========================================================================
+# Predictive Visual Servoing Tracking Loop with Diagnostics
+# =========================================================================
 
 def vision_thread():
-    global latest_jpeg, primary_target, active_detections
+    global latest_jpeg, primary_target, predicted_target, active_detections
 
     ensure_storage_headroom()
     detector = ArucoTargetDetector()
+    tracker = TargetKalmanFilter()
 
-    picam2 = Picamera2()
-    cam_config = picam2.create_video_configuration(
-        sensor={"output_size": (2304, 1296)},
-        main={"size": (FRAME_WIDTH, FRAME_HEIGHT), "format": "RGB888"},
-        lores={"size": (DISPLAY_WIDTH, DISPLAY_HEIGHT), "format": "RGB888"},
-        buffer_count=6,
-        controls={
-            "AeEnable": True,
-            "AwbMode": 2,
-            "AeExposureMode": 0,
-            "ExposureValue": 1.0,
-        },
-        transform=Transform(hflip=True, vflip=True),
-    )
-    picam2.configure(cam_config)
-    picam2.start()
-    time.sleep(0.5)
+    try:
+        picam2 = Picamera2()
+        cam_config = picam2.create_video_configuration(
+            sensor={"output_size": (2304, 1296)},
+            main={"size": (FRAME_WIDTH, FRAME_HEIGHT), "format": "RGB888"},
+            lores={"size": (DISPLAY_WIDTH, DISPLAY_HEIGHT), "format": "RGB888"},
+            buffer_count=6,
+            controls={
+                "AeEnable": True,
+                "AwbMode": 2,
+                "AeExposureMode": 0,
+                "FrameDurationLimits": (20000, 40000),
+                "ExposureValue": 1.0
+            },
+            transform=Transform(hflip=True, vflip=True)
+        )
+        picam2.configure(cam_config)
+        picam2.start()
+        log.info("[CAMERA] Picamera2 dual-stream configuration initialized successfully")
+        time.sleep(0.5)
+    except Exception as e:
+        log.critical(f"[CAMERA FATAL] Could not initialize Picamera2: {e}\n{traceback.format_exc()}")
+        set_alert("FATAL: Camera init failed", duration=10.0)
+        return
 
-    turret_queue = queue.Queue(maxsize=15)
+    turret_queue = queue.Queue(maxsize=25)
     record_queue = queue.Queue(maxsize=90)
 
-    threading.Thread(
-        target=turret_serial_worker,
-        args=(turret_queue,),
-        daemon=True,
-        name="SerialWorker",
-    ).start()
-    threading.Thread(
-        target=video_recorder_worker,
-        args=(record_queue,),
-        daemon=True,
-        name="RecorderWorker",
-    ).start()
+    threading.Thread(target=turret_serial_worker, args=(turret_queue,), daemon=True, name="SerialWorker").start()
+    threading.Thread(target=video_recorder_worker, args=(record_queue,), daemon=True, name="RecorderWorker").start()
 
     pre_roll_buffer = deque(maxlen=int(RECORD_PRE_ROLL_SEC * TARGET_FPS))
-
-    gun_aim_x = OPTICAL_CENTER[0] + GUN_OFFSET_PAN_PX
-    gun_aim_y = OPTICAL_CENTER[1] + GUN_OFFSET_TILT_PX
 
     fps_time = time.time()
     frame_count = 0
     sensor_fps = 0.0
+
+    last_err_pan_mrad = 0.0
+    last_err_tilt_mrad = 0.0
+    last_control_time = time.time()
+
+    active_cmd_pan_spd = 0
+    active_cmd_tilt_spd = 0
+    last_valid_range_m = 10.0  # Persistent range memory across frames
 
     tentative_target = None
     tentative_streak = 0
@@ -505,10 +669,6 @@ def vision_thread():
     last_detection_time = 0.0
     recording_start_time = 0.0
 
-    # Hybrid Tracking State Machine
-    in_saccade_wait = False
-    saccade_start_time = 0.0
-
     while True:
         now = time.time()
 
@@ -517,7 +677,8 @@ def vision_thread():
             frame_main = request.make_array("main")
             annotated = request.make_array("lores")
             request.release()
-        except Exception:
+        except Exception as e:
+            log.error(f"[CAMERA ERROR] Capture dropped: {e}")
             time.sleep(0.02)
             continue
 
@@ -530,6 +691,7 @@ def vision_thread():
         detections = detector.detect(frame_main)
         best_candidate = detections[0] if len(detections) > 0 else None
 
+        # Lock Confirmation Gate
         verified_detection = None
         if best_candidate is not None:
             if primary_target is not None:
@@ -547,104 +709,118 @@ def vision_thread():
             tentative_target = None
             tentative_streak = 0
 
+        # Target State Estimation
         with state_lock:
             active_detections = detections
+
             if verified_detection is not None:
+                raw_cx, raw_cy = verified_detection["center"]
+                filt_x, filt_y, vel_x, vel_y = tracker.update(raw_cx, raw_cy, now)
+                pred_x, pred_y = tracker.predict_future(PREDICTION_LEAD_SEC)
+
                 primary_target = {
-                    "center": verified_detection["center"],
+                    "center": (filt_x, filt_y),
                     "box": verified_detection["box"],
+                    "score": verified_detection["score"],
+                    "area": verified_detection["area"],
+                    "range_m": verified_detection.get("range_m", 10.0),
+                    "vel": (vel_x, vel_y),
                     "last_seen": now,
-                    "id": verified_detection.get("id", 0),
+                    "id": verified_detection.get("id", 0)
                 }
-            elif primary_target and (now - primary_target["last_seen"] >= 0.40):
+                predicted_target = (pred_x, pred_y)
+            elif primary_target and (now - primary_target["last_seen"] >= 0.45):
                 primary_target = None
+                predicted_target = None
+                tracker.reset()
 
             local_target = dict(primary_target) if primary_target else None
-            is_moving = turret_is_moving
+            local_pred = tuple(predicted_target) if predicted_target else None
 
-        # Check if active saccade move has completed
-        if in_saccade_wait:
-            time_in_saccade = now - saccade_start_time
-            if (
-                not is_moving and time_in_saccade >= 0.12
-            ) or time_in_saccade >= SACCADE_TIMEOUT_SEC:
-                in_saccade_wait = False
-
+        # Closed-Loop Servoing in Milliradians
         target_locked = False
         target_in_deadband = False
+        current_range_m = last_valid_range_m
 
-        if local_target and (now - local_target["last_seen"] < 0.35):
+        if local_target and (now - local_target["last_seen"] < 0.40):
             target_locked = True
-            tx, ty = local_target["center"]
+            filt_x, filt_y = local_target["center"]
 
-            err_px_x = tx - gun_aim_x
-            err_px_y = ty - gun_aim_y
+            # Update memory only when an active target has fresh range data
+            if "range_m" in local_target:
+                last_valid_range_m = local_target["range_m"]
+                current_range_m = last_valid_range_m
 
-            err_pan_mrad = math.atan2(err_px_x, FOCAL_LENGTH_X_PX) * 1000.0
-            err_tilt_mrad = math.atan2(-err_px_y, FOCAL_LENGTH_Y_PX) * 1000.0
+            # Dynamic parallax convergence: angle_mrad = (offset_mm / range_mm) * 1000
+            # Camera is left (-X) -> bore is right (+X) -> require positive pan offset
+            # Camera is below (-Y) -> bore is above (+Y) -> turret must tilt DOWNWARD (negative mrad)
+            parallax_pan_mrad = (-CAMERA_OFFSET_X_MM / (current_range_m * 1000.0)) * 1000.0
+            parallax_tilt_mrad = (CAMERA_OFFSET_Y_MM / (current_range_m * 1000.0)) * 1000.0
 
-            radial_err = math.hypot(err_pan_mrad, err_tilt_mrad)
+            # Convert pixel errors to milliradians
+            # Sign inversion on Pan: positive image error (target on right) requires negative pan (slew left)
+            err_pan_mrad = (-(filt_x - OPTICAL_CENTER[0]) * MRAD_PER_PIXEL_X) + parallax_pan_mrad
+            err_tilt_mrad = (-(filt_y - OPTICAL_CENTER[1]) * MRAD_PER_PIXEL_Y) + parallax_tilt_mrad
+            radial_error_mrad = math.hypot(err_pan_mrad, err_tilt_mrad)
 
-            # Autonomous Trigger Authorization Gate
-            if radial_err <= FIRE_DEADBAND_MRAD:
+            if radial_error_mrad <= FIRE_DEADBAND_MRAD:
                 target_in_deadband = True
                 turret_queue.put({"cmd": "TRIGGER", "state": 1})
             else:
                 turret_queue.put({"cmd": "TRIGGER", "state": 0})
 
-            # =============================================================
-            # HYBRID DUAL-PHASE DECISION ENGINE
-            # =============================================================
-            if in_saccade_wait:
-                # Motor is actively slewing in hardware: DO NOT issue steering commands,
-                # but DO NOT call continue so video recording and HUD continue running!
-                with state_lock:
-                    system_health["active_phase"] = "SACCADE"
+            dt_ctrl = max(0.005, min(0.15, now - last_control_time))
+            d_err_pan = float(np.clip((err_pan_mrad - last_err_pan_mrad) / dt_ctrl, -MAX_DERIVATIVE_RATE, MAX_DERIVATIVE_RATE))
+            d_err_tilt = float(np.clip((err_tilt_mrad - last_err_tilt_mrad) / dt_ctrl, -MAX_DERIVATIVE_RATE, MAX_DERIVATIVE_RATE))
 
-            elif radial_err >= SACCADE_ENTRY_THRESHOLD_MRAD:
-                # PHASE 1: DISPATCH NEW SACCADIC DISPLACEMENT
-                with state_lock:
-                    system_health["active_phase"] = "SACCADE"
+            last_err_pan_mrad = err_pan_mrad
+            last_err_tilt_mrad = err_tilt_mrad
+            last_control_time = now
 
-                d_pan_cmd = int(round(err_pan_mrad))
-                d_tilt_cmd = int(round(err_tilt_mrad))
+            if radial_error_mrad > MOTION_DEADBAND_MRAD:
+                raw_pan_spd = int((err_pan_mrad * KP_PAN) + (d_err_pan * KD_PAN))
+                raw_tilt_spd = int((err_tilt_mrad * KP_TILT) + (d_err_tilt * KD_TILT))
 
-                turret_queue.put(
-                    {"cmd": "SACCADE", "d_pan": d_pan_cmd, "d_tilt": d_tilt_cmd}
-                )
-                in_saccade_wait = True
-                saccade_start_time = now
+                raw_pan_spd = max(-MAX_PAN_SPEED, min(MAX_PAN_SPEED, raw_pan_spd))
+                raw_tilt_spd = max(-MAX_TILT_SPEED, min(MAX_TILT_SPEED, raw_tilt_spd))
 
+                if 0 < abs(raw_pan_spd) < MIN_RUN_SPEED:
+                    raw_pan_spd = MIN_RUN_SPEED if raw_pan_spd > 0 else -MIN_RUN_SPEED
+                if 0 < abs(raw_tilt_spd) < MIN_RUN_SPEED:
+                    raw_tilt_spd = MIN_RUN_SPEED if raw_tilt_spd > 0 else -MIN_RUN_SPEED
             else:
-                # PHASE 2: CONTINUOUS FINE TRIM (< 50 mrad)
-                with state_lock:
-                    system_health["active_phase"] = "FINE_TRIM"
+                raw_pan_spd = 0
+                raw_tilt_spd = 0
 
-                if abs(err_pan_mrad) > PAN_DEADBAND_MRAD:
-                    v_pan = err_pan_mrad * KP_TRIM_PAN
-                    v_pan = max(-MAX_TRIM_SPEED_PAN, min(MAX_TRIM_SPEED_PAN, v_pan))
-                    cmd_p_spd = int(round(v_pan))
-                else:
-                    cmd_p_spd = 0
+            # Slew rate ramp limiter in mrad/s
+            delta_pan = np.clip(raw_pan_spd - active_cmd_pan_spd, -MAX_ACCEL_PAN_PER_FRAME, MAX_ACCEL_PAN_PER_FRAME)
+            delta_tilt = np.clip(raw_tilt_spd - active_cmd_tilt_spd, -MAX_ACCEL_TILT_PER_FRAME, MAX_ACCEL_TILT_PER_FRAME)
 
-                if abs(err_tilt_mrad) > TILT_DEADBAND_MRAD:
-                    v_tilt = err_tilt_mrad * KP_TRIM_TILT
-                    v_tilt = max(-MAX_TRIM_SPEED_TILT, min(MAX_TRIM_SPEED_TILT, v_tilt))
-                    cmd_t_spd = int(round(v_tilt))
-                else:
-                    cmd_t_spd = 0
+            active_cmd_pan_spd += int(delta_pan)
+            active_cmd_tilt_spd += int(delta_tilt)
 
-                turret_queue.put(
-                    {"cmd": "VELOCITY", "pan_spd": cmd_p_spd, "tilt_spd": cmd_t_spd}
-                )
-
+            turret_queue.put({
+                "cmd": "VELOCITY",
+                "pan_spd": active_cmd_pan_spd,   # in mrad/s
+                "tilt_spd": active_cmd_tilt_spd   # in mrad/s
+            })
         else:
-            with state_lock:
-                system_health["active_phase"] = "IDLE"
             turret_queue.put({"cmd": "TRIGGER", "state": 0})
-            turret_queue.put({"cmd": "HALT"})
 
-        # Video Recorder Management
+            if abs(active_cmd_pan_spd) > 0 or abs(active_cmd_tilt_spd) > 0:
+                delta_p = np.clip(-active_cmd_pan_spd, -MAX_ACCEL_PAN_PER_FRAME, MAX_ACCEL_PAN_PER_FRAME)
+                delta_t = np.clip(-active_cmd_tilt_spd, -MAX_ACCEL_TILT_PER_FRAME, MAX_ACCEL_TILT_PER_FRAME)
+                active_cmd_pan_spd += int(delta_p)
+                active_cmd_tilt_spd += int(delta_t)
+                turret_queue.put({"cmd": "VELOCITY", "pan_spd": active_cmd_pan_spd, "tilt_spd": active_cmd_tilt_spd})
+            else:
+                turret_queue.put({"cmd": "VELOCITY", "pan_spd": 0, "tilt_spd": 0})
+
+            last_err_pan_mrad = 0.0
+            last_err_tilt_mrad = 0.0
+            last_control_time = now
+
+        # Automatic Video Archiving Pipeline
         if target_locked:
             lock_consecutive_frames += 1
             last_detection_time = now
@@ -656,20 +832,16 @@ def vision_thread():
                 is_recording = True
                 recording_start_time = now
                 try:
-                    record_queue.put_nowait(
-                        {"cmd": "start", "pre_roll": list(pre_roll_buffer)}
-                    )
+                    record_queue.put_nowait({"cmd": "start", "pre_roll": list(pre_roll_buffer)})
                 except queue.Full:
-                    pass
+                    log.warning("[RECORDER QUEUE] Queue saturated on start trigger")
             else:
                 pre_roll_buffer.append(frame_main.copy())
         else:
             time_since_last_seen = now - last_detection_time
             clip_duration = now - recording_start_time
-            if (
-                time_since_last_seen > RECORD_POST_ROLL_SEC
-                or clip_duration > MAX_RECORDING_DURATION_SEC
-            ):
+
+            if time_since_last_seen > RECORD_POST_ROLL_SEC or clip_duration > MAX_RECORDING_DURATION_SEC:
                 is_recording = False
                 try:
                     record_queue.put_nowait({"cmd": "stop"})
@@ -677,35 +849,27 @@ def vision_thread():
                     pass
             else:
                 try:
-                    record_queue.put_nowait(
-                        {"cmd": "frame", "frame": frame_main.copy()}
-                    )
+                    record_queue.put_nowait({"cmd": "frame", "frame": frame_main.copy()})
                 except queue.Full:
                     pass
 
-        # HUD Rendering
-        aim_x = int(gun_aim_x * SCALE_X)
-        aim_y = int(gun_aim_y * SCALE_Y)
-        db_radius_px = int(
-            math.tan(FIRE_DEADBAND_MRAD / 1000.0) * FOCAL_LENGTH_X_PX * SCALE_X
-        )
-        saccade_radius_px = int(
-            math.tan(SACCADE_ENTRY_THRESHOLD_MRAD / 1000.0)
-            * FOCAL_LENGTH_X_PX
-            * SCALE_X
-        )
+        # -----------------------------------------------------------------
+        # HUD Render & Diagnostic Visual Overlay
+        # -----------------------------------------------------------------
+        oc_x = int(OPTICAL_CENTER[0] * SCALE_X)
+        oc_y = int(OPTICAL_CENTER[1] * SCALE_Y)
+        cv2.drawMarker(annotated, (oc_x, oc_y), (255, 255, 0), cv2.MARKER_CROSS, 16, 1)
 
-        cv2.circle(
-            annotated,
-            (aim_x, aim_y),
-            max(db_radius_px, 8),
-            (0, 255, 255) if target_in_deadband else (0, 0, 255),
-            1,
-        )
-        cv2.circle(
-            annotated, (aim_x, aim_y), max(saccade_radius_px, 12), (80, 80, 80), 1
-        )
-        cv2.drawMarker(annotated, (aim_x, aim_y), (0, 0, 255), cv2.MARKER_CROSS, 20, 1)
+        # Bore Sight convergence marker at estimated target distance
+        conv_px_x = OPTICAL_CENTER[0] + int((-CAMERA_OFFSET_X_MM / (current_range_m * 1000.0)) * FOCAL_LENGTH_PX)
+        conv_px_y = OPTICAL_CENTER[1] + int((CAMERA_OFFSET_Y_MM / (current_range_m * 1000.0)) * FOCAL_LENGTH_PX)
+        aim_x = int(conv_px_x * SCALE_X)
+        aim_y = int(conv_px_y * SCALE_Y)
+        db_radius = int((FIRE_DEADBAND_MRAD / MRAD_PER_PIXEL_X) * SCALE_X)
+
+        ring_color = (0, 255, 255) if target_in_deadband else (0, 0, 255)
+        cv2.circle(annotated, (aim_x, aim_y), db_radius, ring_color, 1)
+        cv2.drawMarker(annotated, (aim_x, aim_y), (0, 0, 255), cv2.MARKER_CROSS, 24, 1)
 
         for det in detections:
             x1 = int(det["box"][0] * SCALE_X)
@@ -714,72 +878,103 @@ def vision_thread():
             y2 = int(det["box"][3] * SCALE_Y)
             cv2.rectangle(annotated, (x1, y1), (x2, y2), (180, 180, 180), 1)
 
-        if local_target and (now - local_target["last_seen"] < 0.35):
+        if local_target and (now - local_target["last_seen"] < 0.40):
             tx1 = int(local_target["box"][0] * SCALE_X)
             ty1 = int(local_target["box"][1] * SCALE_Y)
             tx2 = int(local_target["box"][2] * SCALE_X)
             ty2 = int(local_target["box"][3] * SCALE_Y)
-            tcx = int(local_target["center"][0] * SCALE_X)
-            tcy = int(local_target["center"][1] * SCALE_Y)
+            tcx_d = int(local_target["center"][0] * SCALE_X)
+            tcy_d = int(local_target["center"][1] * SCALE_Y)
+
             cv2.rectangle(annotated, (tx1, ty1), (tx2, ty2), (0, 255, 0), 2)
-            cv2.circle(annotated, (tcx, tcy), 4, (0, 255, 0), -1)
-            cv2.putText(
-                annotated,
-                f"TARGET ID:{local_target['id']}",
-                (tx1, max(ty1 - 8, 15)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.45,
-                (0, 255, 0),
-                1,
-            )
+            cv2.circle(annotated, (tcx_d, tcy_d), 4, (0, 255, 0), -1)
+
+            if local_pred:
+                px_d = int(local_pred[0] * SCALE_X)
+                py_d = int(local_pred[1] * SCALE_Y)
+                cv2.arrowedLine(annotated, (tcx_d, tcy_d), (px_d, py_d), (0, 255, 255), 2, tipLength=0.3)
+                cv2.circle(annotated, (px_d, py_d), 3, (0, 255, 255), -1)
+
+            status_lbl = f"ID:{local_target.get('id', 0)} | {current_range_m:.1f}m"
+            cv2.putText(annotated, status_lbl, (tx1, max(ty1 - 8, 15)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1, cv2.LINE_AA)
 
         with state_lock:
             p_mrad = turret_pan_mrad
             t_mrad = turret_tilt_mrad
             firing = is_firing
             ser_ok = system_health["serial_connected"]
-            phase = system_health["active_phase"]
+            tx_cnt = system_health["serial_tx_count"]
+            rx_cnt = system_health["serial_rx_count"]
+            rec_ok = system_health["recorder_active"]
+            alert_msg = system_health["last_alert"] if now < system_health["alert_time"] else None
 
         if firing:
-            cv2.putText(
-                annotated,
-                "SOLENOID ENGAGED",
-                (aim_x - 70, aim_y - 25),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.45,
-                (0, 0, 255),
-                2,
-            )
+            cv2.putText(annotated, "SOLENOID ENGAGED", (aim_x - 75, aim_y - 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2, cv2.LINE_AA)
 
-        status_text = f"FPS:{sensor_fps:.1f} | POS: P:{p_mrad} T:{t_mrad} | {phase} | {'SERIAL:OK' if ser_ok else 'SERIAL:OFF'}"
-        cv2.putText(
-            annotated,
-            status_text,
-            (10, DISPLAY_HEIGHT - 12),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.38,
-            (0, 255, 0) if ser_ok else (0, 0, 255),
-            1,
-        )
+        if rec_ok:
+            cv2.circle(annotated, (DISPLAY_WIDTH - 25, 25), 8, (0, 0, 255), -1)
+            cv2.putText(annotated, "REC", (DISPLAY_WIDTH - 70, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 1, cv2.LINE_AA)
 
-        success, buffer = cv2.imencode(
-            ".jpg", annotated, [int(cv2.IMWRITE_JPEG_QUALITY), 75]
-        )
+        # Bottom Hardware Telemetry Bar (Displaying calibrated mrad coordinates)
+        ser_badge = "SERIAL: OK" if ser_ok else "SERIAL: DISCONNECTED"
+        badge_color = (0, 255, 0) if ser_ok else (0, 0, 255)
+        status_text = f"FPS:{sensor_fps:.1f} | Pan:{p_mrad}mrad Tilt:{t_mrad}mrad | Range:{current_range_m:.1f}m | {ser_badge}"
+        cv2.putText(annotated, status_text, (10, DISPLAY_HEIGHT - 12),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, badge_color, 1, cv2.LINE_AA)
+
+        # Top Alert Ribbon
+        if alert_msg:
+            cv2.rectangle(annotated, (0, 0), (DISPLAY_WIDTH, 26), (20, 20, 180), -1)
+            cv2.putText(annotated, alert_msg, (12, 18),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
+
+        success, buffer = cv2.imencode(".jpg", annotated, [int(cv2.IMWRITE_JPEG_QUALITY), 75])
         if success:
             with frame_lock:
                 latest_jpeg = buffer.tobytes()
 
 
+# =========================================================================
+# Web Server
+# =========================================================================
+
 @app.route("/")
 def index():
     return render_template_string("""
-    <!DOCTYPE html><html><body style="background:#0d1117;color:#c9d1d9;display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100vh;margin:0;">
-    <div style="background:#161b22;padding:16px;border-radius:8px;border:1px solid #30363d;text-align:center;">
-        <h2 style="color:#39d353;margin:0 0 10px 0;">Bombardeer Hybrid Servoing Suite</h2>
-        <img src="/video_feed" style="border-radius:4px;width:640px;height:360px;background:#000;">
-        <p style="color:#8b949e;font-size:0.85rem;margin:10px 0 0 0;">Phase 1: Saccade (>50 mrad) | Phase 2: Fine Trim (<50 mrad)</p>
-    </div>
-    </body></html>""")
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Bombardeer Diagnostic Console</title>
+        <link rel="icon" type="image/x-icon" href="/favicon.ico">
+        <style>
+            body {
+                margin: 0; padding: 0;
+                background-color: #0d1117; color: #c9d1d9;
+                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+                display: flex; flex-direction: column; align-items: center; justify-content: center;
+                min-height: 100vh;
+            }
+            .hud-card {
+                background: #161b22; border: 1px solid #30363d; border-radius: 8px;
+                padding: 16px; box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5); text-align: center;
+            }
+            h1 { margin: 0 0 12px 0; font-size: 1.2rem; letter-spacing: 0.05em; text-transform: uppercase; color: #39d353; }
+            img { border-radius: 4px; background: #000; width: 640px; height: 360px; }
+            .meta { margin-top: 10px; font-size: 0.82rem; color: #8b949e; }
+        </style>
+    </head>
+    <body>
+        <div class="hud-card">
+            <h1>Bombardeer Diagnostic Suite</h1>
+            <img src="/video_feed" alt="Targeting Stream">
+            <div class="meta">Live Telemetry | Native mrad Kinematics | Auto-Recovery Watchdogs</div>
+        </div>
+    </body>
+    </html>
+    """)
 
 
 def generate_frames():
@@ -789,23 +984,20 @@ def generate_frames():
                 time.sleep(0.01)
                 continue
             frame = latest_jpeg
+
         yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + frame + b"\r\n")
         time.sleep(0.04)
 
 
 @app.route("/video_feed")
 def video_feed():
-    return Response(
-        generate_frames(), mimetype="multipart/x-mixed-replace; boundary=frame"
-    )
+    return Response(generate_frames(), mimetype="multipart/x-mixed-replace; boundary=frame")
 
 
 @app.route("/favicon.ico")
 def favicon():
     if os.path.exists(os.path.join(STATIC_DIR, "bombardeer.ico")):
-        return send_from_directory(
-            STATIC_DIR, "bombardeer.ico", mimetype="image/vnd.microsoft.icon"
-        )
+        return send_from_directory(STATIC_DIR, "bombardeer.ico", mimetype="image/vnd.microsoft.icon")
     return ("", 204)
 
 

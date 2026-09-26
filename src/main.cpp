@@ -13,13 +13,14 @@
     - TMC2209 silent stepping with dynamic torque transition.
     - Automated solenoid trigger pulse state machine.
     - Xbox Series X Bluetooth controller manual override with auto-timeout.
-    - Non-blocking zero-allocation serial streaming parser.
+    - Non-blocking zero-allocation serial streaming parser with framing watchdog.
+    - Failsafe serial timeout watchdog against host disconnect or reboot.
 */
 
 #include <Arduino.h>
-#include <XboxSeriesXControllerESP32_asukiaaa.hpp>
 #include <TMCStepper.h>
 #include <FastAccelStepper.h>
+#include <XboxSeriesXControllerESP32_asukiaaa.hpp>
 #include "debug.h"
 
 // ============================================================================
@@ -54,16 +55,35 @@
 #define PIN_SOLENOID 13
 
 // ============================================================================
-// Milliradian Kinematic Conversion Constants (Standard 200 step / 1.8 deg motor)
+// Milliradian Kinematic Conversion Constants
 // ============================================================================
-// Motor: 200 full steps/rev * 16 usteps = 3200 steps/rev
-// Pan Gearing: 100T ring / 15T pinion = 20/3 (~6.6667:1) -> 21,333.333 steps/rev
-// 1 Full Revolution = 2000 * PI milliradians (~6283.1853 mrad)
-constexpr double PAN_STEPS_PER_MRAD = 32.0 / (3.0 * 3.14159265358979323846); // ~3.395305 steps/mrad
-constexpr double PAN_MRAD_PER_STEP = (3.0 * 3.14159265358979323846) / 32.0;  // ~0.294524 mrad/step
+// Standard 1.8 deg NEMA 17 motor: 200 full steps/rev * 16 usteps = 3200 steps/rev
+#define STEPPER_FULL_STEPS 200.0
+#define STEPPER_MICROSTEPS 16.0
+#define STEPS_PER_MOTOR_REV (STEPPER_FULL_STEPS * STEPPER_MICROSTEPS) // 3200.0 steps/rev
 
-constexpr double TILT_STEPS_PER_MRAD = 80.0 / 3.14159265358979323846; // ~25.464791 steps/mrad
-constexpr double TILT_MRAD_PER_STEP = 3.14159265358979323846 / 80.0;  // ~0.039270 mrad/step
+// Pan Axis: copied from pan_timing_gears.scad
+#define PAN_RING_TEETH 246.0  // ring_teeth
+#define PAN_PINION_TEETH 37.0 // pinion_teeth
+
+// Tilt Axis: copied from tilt_gears.scad
+#define TILT_GEAR_TEETH 50.0 // teeth
+#define TILT_WORM_STARTS 1.0 // starts
+
+// Mathematical constants
+#define K_PI 3.14159265358979323846
+#define MRAD_PER_REV (2000.0 * K_PI) // ~6283.1853 mrad
+
+// Compile-time ratio calculations
+constexpr double PAN_GEAR_RATIO = PAN_RING_TEETH / PAN_PINION_TEETH;
+constexpr double PAN_STEPS_PER_REV = STEPS_PER_MOTOR_REV * PAN_GEAR_RATIO;
+constexpr double PAN_STEPS_PER_MRAD = PAN_STEPS_PER_REV / MRAD_PER_REV;
+constexpr double PAN_MRAD_PER_STEP = MRAD_PER_REV / PAN_STEPS_PER_REV;
+
+constexpr double TILT_GEAR_RATIO = TILT_GEAR_TEETH / TILT_WORM_STARTS;
+constexpr double TILT_STEPS_PER_REV = STEPS_PER_MOTOR_REV * TILT_GEAR_RATIO;
+constexpr double TILT_STEPS_PER_MRAD = TILT_STEPS_PER_REV / MRAD_PER_REV;
+constexpr double TILT_MRAD_PER_STEP = MRAD_PER_REV / TILT_STEPS_PER_REV;
 
 inline long panMradToSteps(long mrad)
 {
@@ -92,28 +112,33 @@ inline long tiltStepsToMrad(long steps)
 // ============================================================================
 // Physical Travel Boundaries (FastAccelStepper Steps)
 // ============================================================================
-// Pan:  +-180 deg (+-1000*PI mrad) = +-21,334 steps (360 deg continuous sweep)
-// Tilt: +-22.5 deg (+-125*PI mrad) = +-10,000 steps (45 deg total vertical envelope)
-const long PAN_MIN_STEPS = -10667;
-const long PAN_MAX_STEPS = 10667;
+// Pan: +-180.0 deg (+-0.5 revs = 360 deg total continuous sweep)
+#define PAN_MAX_DEGREES 180.0
+constexpr long PAN_MAX_STEPS = (long)((PAN_STEPS_PER_REV * (PAN_MAX_DEGREES / 360.0)) + 0.5);
+constexpr long PAN_MIN_STEPS = -PAN_MAX_STEPS;
 
-const long TILT_MIN_STEPS = -10000;
-const long TILT_MAX_STEPS = 10000;
-
-// Xbox Controller Deadzone and Trigger Thresholds
-#define DEADZONE_RADIUS 0.30f
-#define TRIGGER_THRESHOLD 0.15f
+// Tilt: +-22.5 deg (+-1/16 revs = 45 deg total vertical envelope)
+#define TILT_MAX_DEGREES 22.5
+constexpr long TILT_MAX_STEPS = (long)((TILT_STEPS_PER_REV * (TILT_MAX_DEGREES / 360.0)) + 0.5);
+constexpr long TILT_MIN_STEPS = -TILT_MAX_STEPS;
 
 /*
     Timing for Heschen HS-1564B / HS-4564B Solenoid
-    * SOLENOID_PULSE_LENGTH = 60 ms
+    * SOLENOID_PULSE_LENGTH = 40-60 ms
     * SOLENOID_COOLDOWN_LENGTH = 190 ms
     * Total cycle = 250 ms (4.0 BPS)
 */
-#define SOLENOID_PULSE_LENGTH 60     // 40-60ms is a good range for the Heschen HS-1564B
-#define SOLENOID_COOLDOWN_LENGTH 190 // Time (ms) solenoid rests before next allowed cycle
-                                     // Total cycle = 250ms (4 shots per second)
-const uint32_t MAX_AUTONOMOUS_FIRE_DURATION_MS = 2000;
+constexpr uint32_t SOLENOID_PULSE_LENGTH = 60;
+constexpr uint32_t SOLENOID_COOLDOWN_LENGTH = 190;
+constexpr uint32_t MAX_AUTONOMOUS_FIRE_DURATION_MS = 2000;
+
+// Host Serial Link Watchdog Timeout (500ms without serial data -> halt autonomous motion)
+constexpr uint32_t SERIAL_WATCHDOG_TIMEOUT_MS = 500;
+
+// Xbox Controller Deadzone and Trigger Thresholds
+constexpr float DEADZONE_RADIUS = 0.30f;
+constexpr float TRIGGER_THRESHOLD = 0.15f;
+constexpr unsigned long MANUAL_OVERRIDE_TIMEOUT_MS = 400;
 
 // Bind to any Xbox controller
 XboxSeriesXControllerESP32_asukiaaa::Core xboxController;
@@ -122,12 +147,12 @@ XboxSeriesXControllerESP32_asukiaaa::Core xboxController;
 // Stepper Library Configuration & Instantiations
 // ============================================================================
 
-#define PAN_STEPPER_ACCELERATION 15000 // 15,000 steps/s^2 for zero-lag trajectory tracking
-#define PAN_STEPPER_MAXSPEEDHZ 30000
+#define PAN_STEPPER_ACCELERATION 13500 // Benchmarked production acceleration (75% limit)
+#define PAN_STEPPER_MAXSPEEDHZ 11600   // Benchmarked production max speed (80% limit)
 #define PAN_STEPPER_MINSPEEDHZ 15
 
-#define TILT_STEPPER_ACCELERATION 20000 // 20,000 steps/s^2
-#define TILT_STEPPER_MAXSPEEDHZ 30000
+#define TILT_STEPPER_ACCELERATION 50000 // Benchmarked production acceleration (~72% limit)
+#define TILT_STEPPER_MAXSPEEDHZ 14800   // Benchmarked production max speed (80% limit)
 #define TILT_STEPPER_MINSPEEDHZ 15
 
 #define STEPPER_HYSTERESISHZ 300
@@ -144,8 +169,10 @@ FastAccelStepper *tiltStepper = NULL;
 
 static bool autoFireRequested = false;
 static uint32_t autoFireStartTime = 0;
+static bool manualOverrideActive = false;
+static unsigned long lastSerialRxTime = 0;
 
-// Autonomous Target Speeds
+// Autonomous Target Speeds (mrad/s)
 static long commandedPanSpeed = 0;
 static long commandedTiltSpeed = 0;
 
@@ -183,8 +210,8 @@ bool initTMC2209(TMC2209Stepper &driver, const char *axisName, uint16_t current_
     driver.rms_current(current_mA, hold_multiplier);
 
     // 4. Microstepping & Internal Interpolation
-    driver.microsteps(16); // 1/16 Microstepping from FastAccelStepper
-    driver.intpol(true);   // Interpolate to 1/256 internally for smooth motion
+    driver.microsteps(STEPPER_MICROSTEPS); // 1/16 Microstepping from FastAccelStepper
+    driver.intpol(true);                   // Interpolate to 1/256 internally for smooth motion
 
     // 5. Standstill & Powerdown Timing (drops to hold current ~0.15s after motion stops)
     driver.iholddelay(4);   // Delay before current reduction begins
@@ -222,7 +249,7 @@ bool initTMC2209(TMC2209Stepper &driver, const char *axisName, uint16_t current_
     uint16_t readCurrent = driver.cs2rms(driver.irun());
     bool regSelectActive = driver.mstep_reg_select();
 
-    if (!regSelectActive || readMicrosteps != 16)
+    if (!regSelectActive || readMicrosteps != STEPPER_MICROSTEPS)
     {
         DB_PRINTF("[TMC2209] ERROR: %s register read-back failed! (Microsteps: %u, RegSelect: %d)\n",
                   axisName, readMicrosteps, regSelectActive ? 1 : 0);
@@ -243,15 +270,6 @@ struct AxisControlState
 
 /**
  * Controls a FastAccelStepper motor smoothly using analog joystick input.
- *
- * @param stepper      Pointer to FastAccelStepper instance
- * @param state        Reference to the persistent AxisControlState tracker
- * @param rawInput     Normalized joystick axis (-1.0 to +1.0)
- * @param maxSpeedHz   Target top speed at 100% stick deflection (e.g., 16000)
- * @param minSpeedHz   Minimum smooth starting speed in Hz (e.g., 250)
- * @param deadzone     Joystick deadzone radius (e.g., 0.30f)
- * @param hysteresisHz Noise threshold before updating speed mid-flight (e.g., 300)
- * @param exponent     Exponential curve factor (1.0 = linear, 2.0 = quadratic, 3.0 = cubic)
  */
 void updateAxisFromJoystick(
     FastAccelStepper *stepper,
@@ -268,65 +286,49 @@ void updateAxisFromJoystick(
 
     float absInput = fabs(rawInput);
 
-    // =========================================================================
     // Single-Shot Stop on Deadzone Release
-    // =========================================================================
     if (absInput <= deadzone)
     {
         if (state.lastDir != 0)
         {
-            stepper->stopMove(); // Trigger smooth deceleration ONCE
+            stepper->stopMove();
             state.lastDir = 0;
             state.lastSpeedHz = 0;
         }
-        return; // Exit early so no speed/accel commands disrupt deceleration
+        return;
     }
 
-    // =========================================================================
     // Percentage of Stick Travel Past Deadzone (0.0 to 1.0)
-    // =========================================================================
     float normPct = (absInput - deadzone) / (1.0f - deadzone);
     if (normPct > 1.0f)
         normPct = 1.0f;
 
-    // =========================================================================
-    // Exponential Response Curve for Low-Speed Precision
-    // =========================================================================
+    // Exponential Response Curve
     float curvedPct = powf(normPct, exponent);
 
-    // Map percentage to target frequency (Hz)
     uint32_t targetSpeedHz = (uint32_t)(curvedPct * maxSpeedHz);
     if (targetSpeedHz < minSpeedHz)
         targetSpeedHz = minSpeedHz;
 
     int currentDir = (rawInput > 0.0f) ? 1 : -1;
 
-    // =========================================================================
-    // Hysteresis Filtering & Minimal Driver Updates
-    // =========================================================================
     bool dirChanged = (currentDir != state.lastDir);
     bool speedChangedSignificantly = (abs((long)targetSpeedHz - (long)state.lastSpeedHz) > (long)hysteresisHz);
 
     if (dirChanged)
     {
-        // Direction changed OR starting from a stop
         stepper->setSpeedInHz(targetSpeedHz);
         if (currentDir > 0)
-        {
             stepper->runForward();
-        }
         else
-        {
             stepper->runBackward();
-        }
         state.lastDir = currentDir;
         state.lastSpeedHz = targetSpeedHz;
     }
     else if (speedChangedSignificantly)
     {
-        // Same direction: update speed dynamically ONLY if stick moved past hysteresis band
         stepper->setSpeedInHz(targetSpeedHz);
-        stepper->applySpeedAcceleration(); // Signal FastAccelStepper to update speed mid-flight
+        stepper->applySpeedAcceleration();
         state.lastSpeedHz = targetSpeedHz;
     }
 }
@@ -337,9 +339,9 @@ void updateAxisFromJoystick(
 
 enum SolenoidState
 {
-    SOLENOID_IDLE,    // Ready to fire
-    SOLENOID_FIRING,  // Active HIGH (pulling trigger)
-    SOLENOID_COOLDOWN // Active LOW (waiting to reset sear & prevent rapid-fire stall)
+    SOLENOID_IDLE,
+    SOLENOID_FIRING,
+    SOLENOID_COOLDOWN
 };
 
 static SolenoidState solenoidState = SOLENOID_IDLE;
@@ -347,7 +349,6 @@ static unsigned long solenoidTimer = 0;
 
 void triggerSolenoid()
 {
-    // Only fire if completely idle and cooldown has elapsed
     if (solenoidState == SOLENOID_IDLE)
     {
         DB_PRINTLN("[SOLENOID] Firing!");
@@ -364,7 +365,6 @@ void updateSolenoid()
     switch (solenoidState)
     {
     case SOLENOID_FIRING:
-        // Pulse time expired -> Turn OFF and begin cooldown/reset window
         if (now - solenoidTimer >= SOLENOID_PULSE_LENGTH)
         {
             DB_PRINTLN("[SOLENOID] Pulse expired, turning OFF.");
@@ -375,7 +375,6 @@ void updateSolenoid()
         break;
 
     case SOLENOID_COOLDOWN:
-        // Cooldown expired -> Return to IDLE so next cycle or held trigger can fire
         if (now - solenoidTimer >= SOLENOID_COOLDOWN_LENGTH)
         {
             DB_PRINTLN("[SOLENOID] Cooldown expired, returning to IDLE.");
@@ -386,6 +385,94 @@ void updateSolenoid()
     case SOLENOID_IDLE:
     default:
         break;
+    }
+}
+
+// ============================================================================
+// Xbox Controller Processing Engine
+// ============================================================================
+
+void processXboxOverride(AxisControlState &panState, AxisControlState &tiltState)
+{
+    static unsigned long lastManualInputTime = 0;
+    static bool lastBtnA = false;
+
+    float rawPan = 0.0f;
+    float rawTilt = 0.0f;
+    float trigger = 0.0f;
+    bool stickActive = false;
+    bool triggerActive = false;
+
+    xboxController.onLoop();
+
+    if (xboxController.isConnected() && !xboxController.isWaitingForFirstNotification())
+    {
+        constexpr float invHalfJoy = 2.0f / (float)XboxControllerNotificationParser::maxJoy;
+        constexpr float invMaxTrig = 1.0f / (float)XboxControllerNotificationParser::maxTrig;
+
+        rawPan = ((float)xboxController.xboxNotif.joyLHori * invHalfJoy) - 1.0f;
+        rawTilt = ((float)xboxController.xboxNotif.joyLVert * invHalfJoy) - 1.0f;
+        trigger = (float)xboxController.xboxNotif.trigRT * invMaxTrig;
+
+        stickActive = (fabs(rawPan) > DEADZONE_RADIUS || fabs(rawTilt) > DEADZONE_RADIUS);
+        triggerActive = (trigger > TRIGGER_THRESHOLD);
+
+        // Single-Shot 'A' Button: Zero Current Mechanical Coordinates
+        bool btnAPressed = xboxController.xboxNotif.btnA;
+        if (btnAPressed && !lastBtnA)
+        {
+            if (panStepper)  panStepper->forceStopAndNewPosition(0);
+            if (tiltStepper) tiltStepper->forceStopAndNewPosition(0);
+
+            panState = AxisControlState();
+            tiltState = AxisControlState();
+            commandedPanSpeed = 0;
+            commandedTiltSpeed = 0;
+            activePanDir = 0;
+            activeTiltDir = 0;
+            appliedPanSpeed = 0;
+            appliedTiltSpeed = 0;
+
+            DB_PRINTLN("[XBOX] Re-zeroed home coordinates via 'A' button.");
+        }
+        lastBtnA = btnAPressed;
+
+        if (stickActive || triggerActive || btnAPressed)
+        {
+            lastManualInputTime = millis();
+            commandedPanSpeed = 0;
+            commandedTiltSpeed = 0;
+        }
+    }
+    else
+    {
+        rawPan = 0.0f;
+        rawTilt = 0.0f;
+        trigger = 0.0f;
+        lastBtnA = false;
+    }
+
+    manualOverrideActive = (millis() - lastManualInputTime < MANUAL_OVERRIDE_TIMEOUT_MS);
+
+    if (manualOverrideActive)
+    {
+        updateAxisFromJoystick(panStepper, panState, rawPan, PAN_STEPPER_MAXSPEEDHZ, PAN_STEPPER_MINSPEEDHZ);
+        updateAxisFromJoystick(tiltStepper, tiltState, rawTilt, TILT_STEPPER_MAXSPEEDHZ, TILT_STEPPER_MINSPEEDHZ);
+
+        if (triggerActive)
+        {
+            triggerSolenoid();
+        }
+    }
+    else
+    {
+        if (panState.lastDir != 0 || tiltState.lastDir != 0)
+        {
+            if (panStepper && panStepper->isRunning())   panStepper->stopMove();
+            if (tiltStepper && tiltStepper->isRunning()) tiltStepper->stopMove();
+            panState = AxisControlState();
+            tiltState = AxisControlState();
+        }
     }
 }
 
@@ -404,7 +491,7 @@ void commandRelativeMoveMrad(long dPanMrad, long dTiltMrad)
 
     if (panStepper)
     {
-        panStepper->setSpeedInHz(PAN_STEPPER_MAXSPEEDHZ); // Restore full slew speed
+        panStepper->setSpeedInHz(PAN_STEPPER_MAXSPEEDHZ);
         long dPanSteps = panMradToSteps(dPanMrad);
         long curPan = panStepper->getCurrentPosition();
         long targetPan = constrain(curPan + dPanSteps, PAN_MIN_STEPS, PAN_MAX_STEPS);
@@ -413,7 +500,7 @@ void commandRelativeMoveMrad(long dPanMrad, long dTiltMrad)
 
     if (tiltStepper)
     {
-        tiltStepper->setSpeedInHz(TILT_STEPPER_MAXSPEEDHZ); // Restore full slew speed
+        tiltStepper->setSpeedInHz(TILT_STEPPER_MAXSPEEDHZ);
         long dTiltSteps = tiltMradToSteps(dTiltMrad);
         long curTilt = tiltStepper->getCurrentPosition();
         long targetTilt = constrain(curTilt + dTiltSteps, TILT_MIN_STEPS, TILT_MAX_STEPS);
@@ -422,7 +509,7 @@ void commandRelativeMoveMrad(long dPanMrad, long dTiltMrad)
 }
 
 // ============================================================================
-// Continuous Dynamic Velocity Slew Actuation (mrad/s)
+// Continuous Dynamic Velocity Slew Actuation (mrad/s to Steps/s)
 // ============================================================================
 
 void applyVelocityActuation()
@@ -434,12 +521,13 @@ void applyVelocityActuation()
     long curTilt = tiltStepper->getCurrentPosition();
 
     // --- 1. PAN AXIS VELOCITY ---
-    long targetPan = commandedPanSpeed;
+    long targetPan = commandedPanSpeed; // in mrad/s
     if (targetPan > 0 && curPan >= PAN_MAX_STEPS)
         targetPan = 0;
     if (targetPan < 0 && curPan <= PAN_MIN_STEPS)
         targetPan = 0;
 
+    // Convert mrad/s directly into steps/s (Hz)
     long targetPanHz = (long)(fabs((double)targetPan) * PAN_STEPS_PER_MRAD);
     if (targetPanHz > PAN_STEPPER_MAXSPEEDHZ)
         targetPanHz = PAN_STEPPER_MAXSPEEDHZ;
@@ -475,12 +563,13 @@ void applyVelocityActuation()
     }
 
     // --- 2. TILT AXIS VELOCITY ---
-    long targetTilt = commandedTiltSpeed;
+    long targetTilt = commandedTiltSpeed; // in mrad/s
     if (targetTilt > 0 && curTilt >= TILT_MAX_STEPS)
         targetTilt = 0;
     if (targetTilt < 0 && curTilt <= TILT_MIN_STEPS)
         targetTilt = 0;
 
+    // Convert mrad/s directly into steps/s (Hz)
     long targetTiltHz = (long)(fabs((double)targetTilt) * TILT_STEPS_PER_MRAD);
     if (targetTiltHz > TILT_STEPPER_MAXSPEEDHZ)
         targetTiltHz = TILT_STEPPER_MAXSPEEDHZ;
@@ -522,22 +611,41 @@ void applyVelocityActuation()
 
 void processSerialCommands()
 {
+    if (manualOverrideActive)
+    {
+        while (Serial.available() > 0)
+            Serial.read();
+        return;
+    }
+
     static char rxBuffer[64];
     static uint8_t rxIdx = 0;
+    static unsigned long rxStartTime = 0;
 
     while (Serial.available() > 0)
     {
         char c = (char)Serial.read();
+
+        if (rxIdx == 0)
+        {
+            rxStartTime = millis();
+        }
+        else if (millis() - rxStartTime > 250)
+        {
+            rxIdx = 0;
+            rxStartTime = millis();
+        }
+
         if (c == '\n')
         {
             rxBuffer[rxIdx] = '\0';
             if (rxIdx > 0)
             {
+                lastSerialRxTime = millis();
                 char cmdType = rxBuffer[0];
 
                 switch (cmdType)
                 {
-                // Move Relative in milliradians: M <d_pan_mrad> <d_tilt_mrad>
                 case 'M':
                 {
                     long dPan = 0, dTilt = 0;
@@ -548,7 +656,6 @@ void processSerialCommands()
                     break;
                 }
 
-                // Dynamic Velocity Trim in milliradians/second: V <pan_spd> <tilt_spd>
                 case 'V':
                 {
                     long pSpd = 0, tSpd = 0;
@@ -560,7 +667,6 @@ void processSerialCommands()
                     break;
                 }
 
-                // Controlled dynamic halt
                 case 'X':
                 {
                     commandedPanSpeed = 0;
@@ -570,13 +676,12 @@ void processSerialCommands()
                     appliedPanSpeed = 0;
                     appliedTiltSpeed = 0;
                     if (panStepper)
-                        panStepper->stopMove();
+                        panStepper->forceStopAndNewPosition(panStepper->getCurrentPosition());
                     if (tiltStepper)
-                        tiltStepper->stopMove();
+                        tiltStepper->forceStopAndNewPosition(tiltStepper->getCurrentPosition());
                     break;
                 }
 
-                // Autonomous trigger control: T <0|1>
                 case 'T':
                 {
                     int reqState = 0;
@@ -598,7 +703,6 @@ void processSerialCommands()
                     break;
                 }
 
-                // Home: set current mechanical positions to coordinate zero
                 case 'H':
                 {
                     commandedPanSpeed = 0;
@@ -620,7 +724,6 @@ void processSerialCommands()
                     break;
                 }
 
-                // Query: Immediate motion and position status in milliradians
                 case 'Q':
                 {
                     bool isMoving = (panStepper && panStepper->isRunning()) ||
@@ -635,10 +738,9 @@ void processSerialCommands()
                     break;
                 }
 
-                // Unknown command — ignore or handle as needed
                 default:
                     break;
-                } // end switch
+                }
             }
             rxIdx = 0;
         }
@@ -650,7 +752,7 @@ void processSerialCommands()
             }
             else
             {
-                rxIdx = 0; // Prevent buffer overrun
+                rxIdx = 0;
             }
         }
     }
@@ -663,74 +765,45 @@ void processSerialCommands()
 void setup()
 {
     Serial.begin(115200);
-    Serial.setTimeout(2); // Fail-safe: prevent any blocking stream reads
-    while (!Serial)
-        ; // wait for serial port to connect. Needed for native USB port only
+    Serial.setTimeout(2);
+
+    unsigned long startWait = millis();
+    while (!Serial && (millis() - startWait < 1500))
+        ;
+
     DB_PRINTLN("\nStarting Bombardeer Turret Controller on " + String(ARDUINO_BOARD));
 
-    // Debug info about the ESP32 we are running on
-    DB_PRINTLN("ESP32 Chip Model: " + String(ESP.getChipModel()));
-    DB_PRINTLN("ESP32 Chip Revision: " + String(ESP.getChipRevision()));
-    DB_PRINTLN("ESP32 Chip Cores: " + String(ESP.getChipCores()));
-    DB_PRINTLN("ESP32 CPU Frequency: " + String(ESP.getCpuFreqMHz()) + " MHz");
-    DB_PRINTLN("ESP32 Flash Size: " + String(ESP.getFlashChipSize() / (1024 * 1024)) + " MB");
-    DB_PRINTLN("ESP32 Flash Speed: " + String(ESP.getFlashChipSpeed() / 1000000) + " MHz");
-    DB_PRINTLN("ESP32 PSRAM Size: " + String(ESP.getPsramSize()));
-    DB_PRINTLN("ESP32 Free PSRAM: " + String(ESP.getFreePsram()));
-
-    //
-    // Setup Xbox controller
-    //
     xboxController.begin();
 
-    //
-    // Setup the TMC2209 Stepper Drivers and FastAccelStepper Engine
-    //
-
-    // Hardware Enable Pin Setup (Shared between Pan and Tilt)
     pinMode(SHARED_ENABLE_PIN, OUTPUT);
-    digitalWrite(SHARED_ENABLE_PIN, HIGH); // Drive HIGH initially (Keep drivers disabled during UART config)
+    digitalWrite(SHARED_ENABLE_PIN, HIGH);
 
-    // Explicitly lock in TMC2209 UART Addresses via MS1 / MS2
-    // This can be overriden using physical jumpers next to the TMC2209 driver
-    pinMode(PAN_USTEP_PIN1, OUTPUT);  // MS1
-    pinMode(PAN_USTEP_PIN2, OUTPUT);  // MS2
-    pinMode(TILT_USTEP_PIN1, OUTPUT); // MS1
-    pinMode(TILT_USTEP_PIN2, OUTPUT); // MS2
+    pinMode(PAN_USTEP_PIN1, OUTPUT);
+    pinMode(PAN_USTEP_PIN2, OUTPUT);
+    pinMode(TILT_USTEP_PIN1, OUTPUT);
+    pinMode(TILT_USTEP_PIN2, OUTPUT);
 
-    // --- PAN AXIS ADDRESS: 0 (MS1=LOW, MS2=LOW) ---
     digitalWrite(PAN_USTEP_PIN1, LOW);
     digitalWrite(PAN_USTEP_PIN2, LOW);
 
-    // --- TILT AXIS ADDRESS: 1 (MS1=HIGH, MS2=LOW) ---
     digitalWrite(TILT_USTEP_PIN1, HIGH);
     digitalWrite(TILT_USTEP_PIN2, LOW);
 
-    // Give hardware pins 10ms to settle to solid voltage levels
     delay(10);
 
-    // Initialize Hardware UART2 for TMC2209 Drivers
     SERIAL_PORT.begin(115200, SERIAL_8N1, TMC_RX_PIN, TMC_TX_PIN);
 
-    // Configure TMC2209 Registers over UART
-    // Passing 'false' runs StealthChop at standstill (eliminates the hum completely)
-    // while switching over to SpreadCycle dynamically when moving.
-    initTMC2209(panTMC, "PAN", 1200, 0.25f, false);
-    initTMC2209(tiltTMC, "TILT", 1100, 0.15f, false);
+    initTMC2209(panTMC, "PAN", 1200, 0.25f);
+    initTMC2209(tiltTMC, "TILT", 1100, 0.15f);
 
-    // Enable both drivers in hardware permanently
-    digitalWrite(SHARED_ENABLE_PIN, LOW); // LOW = Drivers Enabled
+    digitalWrite(SHARED_ENABLE_PIN, LOW);
 
-    // Initialize FastAccelStepper Engine
     engine.init();
 
-    // Connect Pan Stepper to Hardware Timers
     panStepper = engine.stepperConnectToPin(PAN_STEP_PIN);
     if (panStepper)
     {
         panStepper->setDirectionPin(PAN_DIR_PIN);
-
-        // Set Kinematics (Steps / sec)
         panStepper->setSpeedInHz(PAN_STEPPER_MAXSPEEDHZ);
         panStepper->setAcceleration(PAN_STEPPER_ACCELERATION);
         panStepper->setCurrentPosition(0);
@@ -740,13 +813,10 @@ void setup()
         DB_PRINTLN("[ERROR] Failed to attach Pan stepper to hardware timer!");
     }
 
-    // Connect Tilt Stepper to Hardware Timers
     tiltStepper = engine.stepperConnectToPin(TILT_STEP_PIN);
     if (tiltStepper)
     {
         tiltStepper->setDirectionPin(TILT_DIR_PIN);
-
-        // Set Kinematics
         tiltStepper->setSpeedInHz(TILT_STEPPER_MAXSPEEDHZ);
         tiltStepper->setAcceleration(TILT_STEPPER_ACCELERATION);
         tiltStepper->setCurrentPosition(0);
@@ -756,11 +826,10 @@ void setup()
         DB_PRINTLN("[ERROR] Failed to attach Tilt stepper to hardware timer!");
     }
 
-    //
-    // Setup trigger solenoid
-    //
     pinMode(PIN_SOLENOID, OUTPUT);
     digitalWrite(PIN_SOLENOID, LOW);
+
+    lastSerialRxTime = millis();
 }
 
 // ============================================================================
@@ -779,94 +848,58 @@ void loop()
     {
         lastDriverCheck = millis();
 
-        // If mstep_reg_select dropped to 0 or microsteps reset to 8, re-initialize
         if (!panTMC.mstep_reg_select() || panTMC.microsteps() != 16 ||
             !tiltTMC.mstep_reg_select() || tiltTMC.microsteps() != 16)
         {
             DB_PRINTLN("[TMC2209] Driver reset detected! Re-applying UART parameters...");
-            initTMC2209(panTMC, "PAN", 1200, 0.25f, false);
-            initTMC2209(tiltTMC, "TILT", 1100, 0.15f, false);
+            initTMC2209(panTMC, "PAN", 1200, 0.25f);
+            initTMC2209(tiltTMC, "TILT", 1100, 0.15f);
         }
     }
 
-    // 1. Process Autonomous Commands
+    // 1. Process Xbox Controller Input & Manual Overrides
+    processXboxOverride(panState, tiltState);
+
+    // 2. Process Incoming Host Serial Commands (Gated by manualOverrideActive)
     processSerialCommands();
 
-    // 2. Xbox Controller Handling (Manual Override with Auto-Timeout)
-    static unsigned long lastManualInputTime = 0;
-    const unsigned long MANUAL_OVERRIDE_TIMEOUT_MS = 400; // Return to auto 400ms after stick release
-
-    xboxController.onLoop();
-    bool manualOverrideActive = false;
-
-    if (xboxController.isConnected() && !xboxController.isWaitingForFirstNotification())
+    // 3. Failsafe Watchdog: Prevent runaway motion if serial link is lost during autonomous slew
+    if ((millis() - lastSerialRxTime > SERIAL_WATCHDOG_TIMEOUT_MS) && !manualOverrideActive)
     {
-        const float halfJoy = (float)XboxControllerNotificationParser::maxJoy / 2.0f;
-        float rawPan = ((float)xboxController.xboxNotif.joyLHori - halfJoy) / halfJoy;
-        float rawTilt = ((float)xboxController.xboxNotif.joyLVert - halfJoy) / halfJoy;
-        float trigger = ((float)xboxController.xboxNotif.trigRT / XboxControllerNotificationParser::maxTrig);
-
-        bool stickDeflected = (fabs(rawPan) > 0.30f || fabs(rawTilt) > 0.30f);
-        bool triggerPressed = (trigger > TRIGGER_THRESHOLD);
-
-        if (stickDeflected || triggerPressed)
+        if (commandedPanSpeed != 0 || commandedTiltSpeed != 0)
         {
-            lastManualInputTime = millis();
-        }
-
-        // Active manual override window
-        if (millis() - lastManualInputTime < MANUAL_OVERRIDE_TIMEOUT_MS)
-        {
-            manualOverrideActive = true;
-
-            // Direct joystick velocity control
-            updateAxisFromJoystick(panStepper, panState, rawPan, PAN_STEPPER_MAXSPEEDHZ, PAN_STEPPER_MINSPEEDHZ, 0.30f);
-            updateAxisFromJoystick(tiltStepper, tiltState, rawTilt, TILT_STEPPER_MAXSPEEDHZ, TILT_STEPPER_MINSPEEDHZ, 0.30f);
-
-            if (triggerPressed)
-            {
-                triggerSolenoid();
-            }
-        }
-        else
-        {
-            // Human let go and timeout elapsed: ensure deceleration completed and reset state
-            if (panState.lastDir != 0 || tiltState.lastDir != 0)
-            {
+            commandedPanSpeed = 0;
+            commandedTiltSpeed = 0;
+            if (panStepper)
                 panStepper->stopMove();
+            if (tiltStepper)
                 tiltStepper->stopMove();
-                panState.lastDir = 0;
-                panState.lastSpeedHz = 0;
-                tiltState.lastDir = 0;
-                tiltState.lastSpeedHz = 0;
-            }
+        }
+        if (autoFireRequested)
+        {
+            autoFireRequested = false;
         }
     }
 
-    // 3. Autonomous Tracking (Executes whenever human is not touching the controller)
+    // 4. Autonomous Tracking Actuation
     if (!manualOverrideActive)
     {
         applyVelocityActuation();
     }
 
-    // 4. Autonomous Firing Logic
+    // 5. Autonomous Firing Logic
     if (autoFireRequested)
     {
-        unsigned long currentMillis = millis();
-        if (currentMillis - autoFireStartTime >= MAX_AUTONOMOUS_FIRE_DURATION_MS)
-        {
+        if (millis() - autoFireStartTime >= MAX_AUTONOMOUS_FIRE_DURATION_MS)
             autoFireRequested = false;
-        }
         else
-        {
             triggerSolenoid();
-        }
     }
 
-    // 5. Update Solenoid Actuator Timing
+    // 6. Update Solenoid Actuator Timing
     updateSolenoid();
 
-    // 6. Broadcast Telemetry to Raspberry Pi at 20 Hz (every 50 ms) in milliradians
+    // 7. Broadcast Telemetry to Raspberry Pi at 20 Hz (every 50 ms) in milliradians
     unsigned long now = millis();
     if (now - lastTelemetryTime >= 50)
     {
