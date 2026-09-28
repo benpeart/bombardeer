@@ -70,9 +70,12 @@ Powered by a **Raspberry Pi 5** for real-time visual perception, range estimatio
 
 ## 🧰 Hardware Requirements
 
+Here is the updated **Hardware Requirements** table including the Hailo-8 AI accelerator:
+
 | Component | Specification | Description |
 | --- | --- | --- |
-| **Compute Board** | Raspberry Pi 5 (8GB) | Target tracking, HUD streaming, telemetry logging |
+| **Compute Board** | Raspberry Pi 5 (8GB) | Target tracking, HUD streaming, and telemetry logging |
+| **AI Accelerator** | Hailo-8 M.2 Module (26 TOPS) | Low-latency neural network inference for real-time target detection |
 | **Vision Sensor** | RPi Camera Module 3 (Wide/Standard) | $1280 \times 720$ native crop @ $30\text{ FPS}$ low-light capture |
 | **Motion MCU** | ESP32-WROOM-32 | Multi-axis hardware timer pulse generation & safety watchdogs |
 | **Stepper Drivers** | $2\times$ TMC2209 (v1.2+) | Single-wire UART addressing (`0b00` Pan, `0b01` Tilt) |
