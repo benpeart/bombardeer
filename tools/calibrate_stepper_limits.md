@@ -15,7 +15,7 @@ This utility benchmarks the maximum stable acceleration and top speed for both t
 ## 2. Running the Benchmark
 
 1. Open the project in your IDE (e.g., PlatformIO or Arduino IDE) and upload `calibrate_stepper_limits.cpp` to the ESP32.
-2. Open the **Serial Monitor** set to **115200 baud**.
+2. Open the **Serial Monitor** set to **921600 baud**.
 3. Follow the serial prompts:
    * Press **Enter** to begin the **PAN** axis calibration.
    * The motor will run an out-and-back sweep (`0 -> +MAX -> -MAX -> 0`) across the envelope.

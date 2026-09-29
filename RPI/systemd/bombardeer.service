@@ -5,8 +5,8 @@ After=network.target
 [Service]
 Type=simple
 User=ben
-WorkingDirectory=/home/ben/Bombardeer
-ExecStart=/usr/bin/python3 /home/ben/Bombardeer/turret_stream.py
+WorkingDirectory=/home/ben/bombardeer
+ExecStart=/usr/bin/python3 /home/ben/bombardeer/bombardeer.py
 Restart=always
 RestartSec=5
 StandardOutput=journal

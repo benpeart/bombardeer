@@ -28,7 +28,7 @@ $$\left\vert{}\arctan\left(\frac{p_1 - c}{f}\right) - \arctan\left(\frac{p_2 - c
 
 ## Hardware & Environment Prerequisites
 
-* **Turret Hardware:** Connected to the host via USB serial (`/dev/ttyUSB0`, `/dev/ttyACM0`, or `/dev/ttyUSB1`) running the ESP32 controller firmware at `115200` baud.
+* **Turret Hardware:** Connected to the host via USB serial (`/dev/ttyUSB0`, `/dev/ttyACM0`, or `/dev/ttyUSB1`) running the ESP32 controller firmware at `921600` baud.
 
 
 * **Camera:** Raspberry Pi Camera Module configured via `picamera2` (native $1280 \times 720$ mode).

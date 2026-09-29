@@ -18,7 +18,7 @@ The results are automatically saved as JSON to `calibration_data.json` for inges
 
 ## ⚙️ How It Works
 
-1. **Hardware Link & Zeroing:** Connects to the ESP32 via serial (`115200` baud) and zeroes the mechanical coordinates using the `H` command.
+1. **Hardware Link & Zeroing:** Connects to the ESP32 via serial (`921600` baud) and zeroes the mechanical coordinates using the `H` command.
 
 
 2. **Camera & Perception:** Captures $1280 \times 720$ video using native `Picamera2` (with horizontal and vertical sensor flip applied). It enhances grayscale frames with CLAHE (Contrast Limited Adaptive Histogram Equalization) and locates a standard ArUco marker (`DICT_4X4_50`).

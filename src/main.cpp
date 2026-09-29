@@ -2,13 +2,12 @@
     Bombardeer Autonomous Wildlife Deterrent Turret Controller
     ----------------------------------------------------------
     - Native Milliradian (mrad) Motion Protocol:
-        * M <d_pan> <d_tilt> : Relative waypoint move (mrad)
-        * V <pan_s> <tilt_s> : Dynamic velocity trim (mrad/s)
-        * X                  : Controlled dynamic halt
-        * H                  : Zero current mechanical coordinates
-        * Q                  : Immediate state & motion query
-        * T <0|1>            : Autonomous solenoid trigger
-        * S <p> <t> <f> <m>  : Periodic 20 Hz telemetry broadcast (mrad)
+        * P <pan_mrad> <tilt_mrad> : Atomic absolute waypoint target (mrad)
+        * V <pan_s> <tilt_s>       : Dynamic continuous velocity trim (mrad/s)
+        * X                        : Immediate dynamic controlled halt
+        * H                        : Zero current mechanical coordinates
+        * T <0|1>                  : Autonomous solenoid trigger enable/disable
+        * S <p> <t> <f> <m>        : 20 Hz deterministic telemetry stream
     - FastAccelStepper hardware-timed trapezoidal acceleration profiles.
     - TMC2209 silent stepping with dynamic torque transition.
     - Automated solenoid trigger pulse state machine.
@@ -171,6 +170,14 @@ static bool autoFireRequested = false;
 static uint32_t autoFireStartTime = 0;
 static bool manualOverrideActive = false;
 static unsigned long lastSerialRxTime = 0;
+
+// Control Modes
+enum MotionMode
+{
+    MODE_VELOCITY,
+    MODE_POSITION
+};
+static MotionMode currentMotionMode = MODE_VELOCITY;
 
 // Autonomous Target Speeds (mrad/s)
 static long commandedPanSpeed = 0;
@@ -421,8 +428,10 @@ void processXboxOverride(AxisControlState &panState, AxisControlState &tiltState
         bool btnAPressed = xboxController.xboxNotif.btnA;
         if (btnAPressed && !lastBtnA)
         {
-            if (panStepper)  panStepper->forceStopAndNewPosition(0);
-            if (tiltStepper) tiltStepper->forceStopAndNewPosition(0);
+            if (panStepper)
+                panStepper->forceStopAndNewPosition(0);
+            if (tiltStepper)
+                tiltStepper->forceStopAndNewPosition(0);
 
             panState = AxisControlState();
             tiltState = AxisControlState();
@@ -432,6 +441,7 @@ void processXboxOverride(AxisControlState &panState, AxisControlState &tiltState
             activeTiltDir = 0;
             appliedPanSpeed = 0;
             appliedTiltSpeed = 0;
+            currentMotionMode = MODE_VELOCITY;
 
             DB_PRINTLN("[XBOX] Re-zeroed home coordinates via 'A' button.");
         }
@@ -442,6 +452,7 @@ void processXboxOverride(AxisControlState &panState, AxisControlState &tiltState
             lastManualInputTime = millis();
             commandedPanSpeed = 0;
             commandedTiltSpeed = 0;
+            currentMotionMode = MODE_VELOCITY;
         }
     }
     else
@@ -468,8 +479,10 @@ void processXboxOverride(AxisControlState &panState, AxisControlState &tiltState
     {
         if (panState.lastDir != 0 || tiltState.lastDir != 0)
         {
-            if (panStepper && panStepper->isRunning())   panStepper->stopMove();
-            if (tiltStepper && tiltStepper->isRunning()) tiltStepper->stopMove();
+            if (panStepper && panStepper->isRunning())
+                panStepper->stopMove();
+            if (tiltStepper && tiltStepper->isRunning())
+                tiltStepper->stopMove();
             panState = AxisControlState();
             tiltState = AxisControlState();
         }
@@ -477,11 +490,12 @@ void processXboxOverride(AxisControlState &panState, AxisControlState &tiltState
 }
 
 // ============================================================================
-// Hardware Positional Waypoint Actuation (Milliradians)
+// Atomic Absolute Waypoint Actuation (P Command)
 // ============================================================================
 
-void commandRelativeMoveMrad(long dPanMrad, long dTiltMrad)
+void commandAbsolutePositionMrad(long targetPanMrad, long targetTiltMrad)
 {
+    currentMotionMode = MODE_POSITION;
     commandedPanSpeed = 0;
     commandedTiltSpeed = 0;
     activePanDir = 0;
@@ -492,29 +506,25 @@ void commandRelativeMoveMrad(long dPanMrad, long dTiltMrad)
     if (panStepper)
     {
         panStepper->setSpeedInHz(PAN_STEPPER_MAXSPEEDHZ);
-        long dPanSteps = panMradToSteps(dPanMrad);
-        long curPan = panStepper->getCurrentPosition();
-        long targetPan = constrain(curPan + dPanSteps, PAN_MIN_STEPS, PAN_MAX_STEPS);
-        panStepper->moveTo(targetPan);
+        long targetSteps = constrain(panMradToSteps(targetPanMrad), PAN_MIN_STEPS, PAN_MAX_STEPS);
+        panStepper->moveTo(targetSteps);
     }
 
     if (tiltStepper)
     {
         tiltStepper->setSpeedInHz(TILT_STEPPER_MAXSPEEDHZ);
-        long dTiltSteps = tiltMradToSteps(dTiltMrad);
-        long curTilt = tiltStepper->getCurrentPosition();
-        long targetTilt = constrain(curTilt + dTiltSteps, TILT_MIN_STEPS, TILT_MAX_STEPS);
-        tiltStepper->moveTo(targetTilt);
+        long targetSteps = constrain(tiltMradToSteps(targetTiltMrad), TILT_MIN_STEPS, TILT_MAX_STEPS);
+        tiltStepper->moveTo(targetSteps);
     }
 }
 
 // ============================================================================
-// Continuous Dynamic Velocity Slew Actuation (mrad/s to Steps/s)
+// Continuous Dynamic Velocity Slew Actuation (V Command)
 // ============================================================================
 
 void applyVelocityActuation()
 {
-    if (!panStepper || !tiltStepper)
+    if (currentMotionMode != MODE_VELOCITY || !panStepper || !tiltStepper)
         return;
 
     long curPan = panStepper->getCurrentPosition();
@@ -646,29 +656,31 @@ void processSerialCommands()
 
                 switch (cmdType)
                 {
-                case 'M':
+                case 'P': // Dynamic Absolute Waypoint Target (mrad)
                 {
-                    long dPan = 0, dTilt = 0;
-                    if (sscanf(rxBuffer, "M %ld %ld", &dPan, &dTilt) == 2)
+                    long targetPan = 0, targetTilt = 0;
+                    if (sscanf(rxBuffer, "P %ld %ld", &targetPan, &targetTilt) == 2)
                     {
-                        commandRelativeMoveMrad(dPan, dTilt);
+                        commandAbsolutePositionMrad(targetPan, targetTilt);
                     }
                     break;
                 }
 
-                case 'V':
+                case 'V': // Continuous Velocity Streaming (mrad/s)
                 {
                     long pSpd = 0, tSpd = 0;
                     if (sscanf(rxBuffer, "V %ld %ld", &pSpd, &tSpd) == 2)
                     {
+                        currentMotionMode = MODE_VELOCITY;
                         commandedPanSpeed = pSpd;
                         commandedTiltSpeed = tSpd;
                     }
                     break;
                 }
 
-                case 'X':
+                case 'X': // Emergency / Commanded Stop
                 {
+                    currentMotionMode = MODE_VELOCITY;
                     commandedPanSpeed = 0;
                     commandedTiltSpeed = 0;
                     activePanDir = 0;
@@ -682,7 +694,7 @@ void processSerialCommands()
                     break;
                 }
 
-                case 'T':
+                case 'T': // Autonomous Solenoid Trigger
                 {
                     int reqState = 0;
                     if (sscanf(rxBuffer, "T %d", &reqState) == 1)
@@ -703,8 +715,9 @@ void processSerialCommands()
                     break;
                 }
 
-                case 'H':
+                case 'H': // Zero Current Coordinates
                 {
+                    currentMotionMode = MODE_VELOCITY;
                     commandedPanSpeed = 0;
                     commandedTiltSpeed = 0;
                     activePanDir = 0;
@@ -724,17 +737,14 @@ void processSerialCommands()
                     break;
                 }
 
-                case 'Q':
+                case 'Y': // Time Sync Ping: Echo Pi's timestamp immediately
                 {
-                    bool isMoving = (panStepper && panStepper->isRunning()) ||
-                                    (tiltStepper && tiltStepper->isRunning());
-                    long cPanSteps = panStepper ? panStepper->getCurrentPosition() : 0;
-                    long cTiltSteps = tiltStepper ? tiltStepper->getCurrentPosition() : 0;
-
-                    Serial.printf("R %d %ld %ld\n",
-                                  isMoving ? 1 : 0,
-                                  panStepsToMrad(cPanSteps),
-                                  tiltStepsToMrad(cTiltSteps));
+                    unsigned long piStamp = 0;
+                    if (sscanf(rxBuffer, "Y %lu", &piStamp) == 1)
+                    {
+                        // Echo: Y <pi_timestamp_sent> <esp32_now_ms>
+                        Serial.printf("Y %lu %lu\n", piStamp, millis());
+                    }
                     break;
                 }
 
@@ -764,7 +774,7 @@ void processSerialCommands()
 
 void setup()
 {
-    Serial.begin(115200);
+    Serial.begin(921600);
     Serial.setTimeout(2);
 
     unsigned long startWait = millis();
@@ -842,7 +852,7 @@ void loop()
     static AxisControlState tiltState;
     static unsigned long lastTelemetryTime = 0;
 
-    // Check every 3 seconds whether the driver brownout reset and lost register config
+    // Periodic check to restore register configuration if TMC2209 brownout reset occurred
     static unsigned long lastDriverCheck = 0;
     if (millis() - lastDriverCheck >= 3000)
     {
@@ -860,13 +870,13 @@ void loop()
     // 1. Process Xbox Controller Input & Manual Overrides
     processXboxOverride(panState, tiltState);
 
-    // 2. Process Incoming Host Serial Commands (Gated by manualOverrideActive)
+    // 2. Process Incoming Host Serial Commands
     processSerialCommands();
 
-    // 3. Failsafe Watchdog: Prevent runaway motion if serial link is lost during autonomous slew
+    // 3. Failsafe Watchdog: Prevent runaway motion if serial link is lost during autonomous tracking
     if ((millis() - lastSerialRxTime > SERIAL_WATCHDOG_TIMEOUT_MS) && !manualOverrideActive)
     {
-        if (commandedPanSpeed != 0 || commandedTiltSpeed != 0)
+        if (currentMotionMode == MODE_VELOCITY && (commandedPanSpeed != 0 || commandedTiltSpeed != 0))
         {
             commandedPanSpeed = 0;
             commandedTiltSpeed = 0;
@@ -875,6 +885,14 @@ void loop()
             if (tiltStepper)
                 tiltStepper->stopMove();
         }
+        else if (currentMotionMode == MODE_POSITION)
+        {
+            if (panStepper && panStepper->isRunning())
+                panStepper->stopMove();
+            if (tiltStepper && tiltStepper->isRunning())
+                tiltStepper->stopMove();
+        }
+
         if (autoFireRequested)
         {
             autoFireRequested = false;
@@ -909,6 +927,11 @@ void loop()
         bool isMoving = (panStepper && panStepper->isRunning()) || (tiltStepper && tiltStepper->isRunning());
         int firingActive = (autoFireRequested || solenoidState != SOLENOID_IDLE) ? 1 : 0;
 
-        Serial.printf("S %ld %ld %d %d\n", panStepsToMrad(currentPanSteps), tiltStepsToMrad(currentTiltSteps), firingActive, isMoving ? 1 : 0);
+        Serial.printf("S %lu %ld %ld %d %d\n",
+                      now,
+                      panStepsToMrad(currentPanSteps),
+                      tiltStepsToMrad(currentTiltSteps),
+                      firingActive,
+                      isMoving ? 1 : 0);
     }
 }

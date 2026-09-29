@@ -285,7 +285,7 @@ void calibrateAxis(const char *axisName, FastAccelStepper *stepper, long minStep
 
 void setup()
 {
-    Serial.begin(115200);
+    Serial.begin(921600);
     delay(1500);
 
     pinMode(SHARED_ENABLE_PIN, OUTPUT);

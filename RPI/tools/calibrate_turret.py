@@ -21,7 +21,7 @@ from libcamera import Transform
 
 CONFIG_OUTPUT_PATH = "/home/ben/Bombardeer/calibration_data.json"
 DEFAULT_PORTS = ["/dev/ttyUSB0", "/dev/ttyACM0"]
-BAUD_RATE = 115200
+BAUD_RATE = 921600
 
 PAN_OFFSETS = [-1200, -600, 0, 600, 1200]
 TILT_OFFSETS = [-1000, -500, 0, 500, 1000]

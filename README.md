@@ -50,7 +50,7 @@ Powered by a **Raspberry Pi 5** for real-time visual perception, range estimatio
        |  Perception, Kinematic Projection & Safety  |
        +---------------------------------------------+
                               |
-                              |  Bidirectional UART (115200 Baud)
+                              |  Bidirectional UART (921600 Baud)
                               |  Packets in Milliradians (mrad / mrad/s)
                               v
        +---------------------------------------------+    +-------------------------------+

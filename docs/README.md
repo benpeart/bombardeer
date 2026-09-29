@@ -53,7 +53,7 @@ Powered by a **Raspberry Pi 5** running low-latency predictive visual servoing w
                                                  +---------------+---------------+
                                                                  |
                                                                  v
-+-----------------------+     UART (115200 Baud)     +-----------------------+
++-----------------------+     UART (921600 Baud)     +-----------------------+
 |    Raspberry Pi 5     |--------------------------->|    ESP32 Controller   |
 |   (Picamera2 / HUD)   |   mrad / mrad/s Commands   |   (FastAccelStepper)  |
 +-----------------------+<---------------------------+-----------+-----------+
@@ -95,7 +95,7 @@ Powered by a **Raspberry Pi 5** running low-latency predictive visual servoing w
 
 ## 📡 Serial Communication Protocol (Pi 5 $\leftrightarrow$ ESP32)
 
-Communication operates over UART at **`115200` baud (8N1)** using non-blocking, zero-allocation newline-terminated frames (`\n`).
+Communication operates over UART at **`921600` baud (8N1)** using non-blocking, zero-allocation newline-terminated frames (`\n`).
 
 ### Host Commands (Pi 5 $\rightarrow$ ESP32)
 

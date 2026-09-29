@@ -31,7 +31,7 @@ SAMPLE_COUNT = 30      # Frames to average per waypoint
 TARGET_MARKER_ID = 0
 
 DEFAULT_SERIAL_PORTS = ["/dev/ttyUSB0", "/dev/ttyACM0", "/dev/ttyUSB1"]
-BAUD_RATE = 115200
+BAUD_RATE = 921600
 
 
 class ArUcoTracker:
