@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 """
-Bombardeer Turret: Fault-Tolerant Waypoint Servoing Controller
---------------------------------------------------------------
-- High-Speed 921600 Baud UART Synchronization:
-    * Perfectly matched to ESP32 Serial.begin(921600) for sub-millisecond latency.
-    * Startup boot-settle discards initial boot noise without triggering false resets.
-    * 2.5s watchdog timeout protects against real disconnections while tolerating boot delays.
+Bombardeer Turret: Dual-Mode (Ballistic Waypoint + Fluid Velocity) Controller
+----------------------------------------------------------------------------
+- Dual-Mode Motion Architecture:
+    * Mode 1 (Ballistic 'P'): Dispatches absolute waypoints for large off-axis
+      errors (>45 mrad) ensuring maximum acceleration single-stroke intercepts.
+    * Mode 2 (Fluid 'V'): Streams continuous proportional velocities for errors
+      <=45 mrad, eliminating FastAccelStepper standstill deceleration shudders.
 - Pinhole Ray Projection (math.atan2):
     * True trigonometric mapping eliminates 60+ mrad wide-angle edge error.
 - World-Space Kalman Filter:
     * Smooths high-frequency optical pixel noise while preserving responsiveness.
-- Continuous 20 Hz Setpoint Streaming:
-    * Avoids startup threshold deadlocks; streams setpoints cleanly outside deadband.
+- High-Speed 921600 Baud UART Synchronization:
+    * Matched to ESP32 Serial.begin(921600) with non-destructive error handling.
 """
 
 import os
@@ -85,9 +86,10 @@ MIN_VALID_RANGE_M = 1.5
 MAX_VALID_RANGE_M = 50.0
 
 # Targeting & Deadbands
-DEADBAND_MRAD = 30.0              # Inner deadband: target considered centered
+BALLISTIC_THRESHOLD_MRAD = 65.0   # Displacements > 65 mrad use 'P', <= 65 mrad use 'V'
+VELOCITY_DEADBAND_MRAD = 4.0      # Deadband in velocity mode: coast to standstill
 FIRE_DEADBAND_MRAD = 40.0         # Allow firing inside this radius
-SETPOINT_MIN_INTERVAL_SEC = 0.050 # Limit 'P' updates to 20 Hz to match ESP32 loop
+SETPOINT_MIN_INTERVAL_SEC = 0.050 # Stream commands at 20 Hz
 
 MAX_TRIGGER_DURATION_SEC = 2.0
 TRIGGER_COOLDOWN_SEC = 1.5
@@ -96,8 +98,8 @@ TARGET_MARKER_ID = 0
 CONFIRMATION_FRAMES = 2
 
 DEFAULT_SERIAL_PORTS = ["/dev/ttyUSB0", "/dev/ttyACM0", "/dev/ttyUSB1"]
-BAUD_RATE = 921600                 # Matches ESP32 setup()
-SERIAL_HEARTBEAT_TIMEOUT_SEC = 2.5 # Allows safe headroom for bootloader and setup()
+BAUD_RATE = 921600
+SERIAL_HEARTBEAT_TIMEOUT_SEC = 2.5
 
 TARGET_FPS = 30.0
 RECORD_PRE_ROLL_SEC = 2.0
@@ -142,7 +144,6 @@ def set_alert(message, duration=3.0):
 
 
 def clear_queue(q):
-    """Purges all pending commands from a queue to prevent backlogs on reconnect."""
     try:
         while not q.empty():
             q.get_nowait()
@@ -177,7 +178,7 @@ def get_turret_pos_at_time(target_mono_sec):
 
 
 # =========================================================================
-# World-Space Kalman Filter
+# World-Space Kalman Filter (Standard Position Formulation)
 # =========================================================================
 
 class TargetKalmanFilter:
@@ -302,6 +303,7 @@ def find_working_serial_port():
                 continue
     return None
 
+
 def turret_serial_worker(cmd_queue):
     global turret_pan_mrad, turret_tilt_mrad, is_turret_moving, is_firing
 
@@ -349,7 +351,7 @@ def turret_serial_worker(cmd_queue):
                         rx_buffer = ""
                         last_telemetry_rx_time = mono_now
 
-                        # Brief settle window
+                        # Settle window
                         time.sleep(0.5)
                         ser.reset_input_buffer()
                         ser.reset_output_buffer()
@@ -372,7 +374,7 @@ def turret_serial_worker(cmd_queue):
                 else:
                     next_reconnect_time = now + reconnect_delay
 
-        # Soft Watchdog: Mark status disconnected, but DO NOT close/reset the port!
+        # Soft Watchdog
         if ser and ser.is_open:
             is_active = (mono_now - last_telemetry_rx_time <= 2.0)
             with state_lock:
@@ -392,6 +394,13 @@ def turret_serial_worker(cmd_queue):
                         with state_lock:
                             system_health["serial_tx_count"] += 1
                         log.info(f"[SERIAL TX] -> P {t_pan} {t_tilt}")
+
+                    elif cmd == "VELOCITY":
+                        p_s = int(item["pan_s"])
+                        t_s = int(item["tilt_s"])
+                        ser.write(f"V {p_s} {t_s}\n".encode())
+                        with state_lock:
+                            system_health["serial_tx_count"] += 1
 
                     elif cmd == "HALT":
                         ser.write(b"X\n")
@@ -434,7 +443,7 @@ def turret_serial_worker(cmd_queue):
                 except Exception:
                     pass
 
-        # Ingest Telemetry Stream (Non-destructive)
+        # Ingest Telemetry Stream
         if ser and ser.is_open:
             try:
                 bytes_avail = ser.in_waiting
@@ -452,7 +461,7 @@ def turret_serial_worker(cmd_queue):
                         parts = line.split()
 
                         try:
-                            # Matches "S <time> <pan> <tilt> <firing> <moving>"
+                            # S <time> <pan> <tilt> <firing> <moving>
                             if len(parts) >= 6:
                                 p_mrad = int(parts[2])
                                 t_mrad = int(parts[3])
@@ -487,6 +496,7 @@ def turret_serial_worker(cmd_queue):
                     system_health["serial_connected"] = False
 
         time.sleep(0.002)
+
 
 # =========================================================================
 # Video Storage Worker
@@ -753,7 +763,7 @@ def vision_thread():
         current_range_m = last_valid_range_m
 
         # =================================================================
-        # WAYPOINT SERVOING ('P')
+        # DUAL-MODE SERVOING ('P' Ballistic vs 'V' Fluid Pursuit)
         # =================================================================
         if verified_detection is not None:
             target_locked = True
@@ -791,15 +801,46 @@ def vision_thread():
             else:
                 turret_queue.put({"cmd": "TRIGGER", "state": 0})
 
-            # Continuous 20 Hz setpoint streaming whenever outside deadband
             time_since_setpoint = now - last_setpoint_time
-            if (radial_error_mrad > DEADBAND_MRAD) and (time_since_setpoint >= SETPOINT_MIN_INTERVAL_SEC):
-                last_setpoint_time = now
-                turret_queue.put({
-                    "cmd": "SETPOINT",
-                    "pan": goal_pan_mrad,
-                    "tilt": goal_tilt_mrad
-                })
+
+            # -------------------------------------------------------------
+            # MODE 1: BALLISTIC INTERCEPT ('P')
+            # For large displacements (> BALLISTIC_THRESHOLD_MRAD mrad), use absolute positioning
+            # -------------------------------------------------------------
+            if radial_error_mrad > BALLISTIC_THRESHOLD_MRAD:
+                if time_since_setpoint >= SETPOINT_MIN_INTERVAL_SEC:
+                    last_setpoint_time = now
+                    turret_queue.put({
+                        "cmd": "SETPOINT",
+                        "pan": goal_pan_mrad,
+                        "tilt": goal_tilt_mrad
+                    })
+
+            # -------------------------------------------------------------
+            # MODE 2: FLUID PURSUIT ('V')
+            # Inside BALLISTIC_THRESHOLD_MRAD mrad, drive velocity smoothly to match target traverse
+            # -------------------------------------------------------------
+            else:
+                if time_since_setpoint >= SETPOINT_MIN_INTERVAL_SEC:
+                    last_setpoint_time = now
+                    if radial_error_mrad < VELOCITY_DEADBAND_MRAD:
+                        v_pan_cmd = 0
+                        v_tilt_cmd = 0
+                    else:
+                        # Increased Kp from 2.0 -> 2.8 to reduce steady-state lag
+                        KP = 2.8  
+                        v_pan_cmd = int(round(err_pan_mrad * KP))
+                        v_tilt_cmd = int(round(err_tilt_mrad * KP))
+
+                        # Clamping bounds
+                        v_pan_cmd = max(-450, min(450, v_pan_cmd))
+                        v_tilt_cmd = max(-300, min(300, v_tilt_cmd))
+
+                    turret_queue.put({
+                        "cmd": "VELOCITY",
+                        "pan_s": v_pan_cmd,
+                        "tilt_s": v_tilt_cmd
+                    })
 
             # Real-Time Telemetry Logging
             if now - last_debug_log_time >= 0.150:
@@ -819,6 +860,7 @@ def vision_thread():
             turret_queue.put({"cmd": "TRIGGER", "state": 0})
         else:
             turret_queue.put({"cmd": "TRIGGER", "state": 0})
+            turret_queue.put({"cmd": "VELOCITY", "pan_s": 0, "tilt_s": 0})
             target_filter.reset()
 
         # Video Archiving
@@ -961,7 +1003,7 @@ def index():
         <div class="hud-card">
             <h1>Bombardeer Diagnostic Suite</h1>
             <img src="/video_feed" alt="Targeting Stream">
-            <div class="meta">921600 Baud Link | Kalman Tracking | Pinhole Linearization</div>
+            <div class="meta">Dual-Mode Servoing (Ballistic 'P' + Fluid 'V') | 921600 Baud Link</div>
         </div>
     </body>
     </html>
