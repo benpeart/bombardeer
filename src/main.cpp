@@ -925,13 +925,13 @@ void loop()
         long currentPanSteps = panStepper ? panStepper->getCurrentPosition() : 0;
         long currentTiltSteps = tiltStepper ? tiltStepper->getCurrentPosition() : 0;
         bool isMoving = (panStepper && panStepper->isRunning()) || (tiltStepper && tiltStepper->isRunning());
-        int firingActive = (autoFireRequested || solenoidState != SOLENOID_IDLE) ? 1 : 0;
+        bool firingActive = (autoFireRequested || solenoidState != SOLENOID_IDLE);
 
         Serial.printf("S %lu %ld %ld %d %d\n",
                       now,
                       panStepsToMrad(currentPanSteps),
                       tiltStepsToMrad(currentTiltSteps),
-                      firingActive,
+                      firingActive ? 1 : 0,
                       isMoving ? 1 : 0);
     }
 }
