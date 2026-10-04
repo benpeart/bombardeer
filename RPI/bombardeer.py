@@ -69,8 +69,9 @@ log = logging.getLogger("Bombardeer")
 # Configuration & Hardware Calibration
 # =========================================================================
 
-STATIC_DIR = "/home/ben/bombardeer/static"
-RECORDINGS_DIR = "/home/ben/bombardeer/recordings"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+STATIC_DIR = os.path.join(BASE_DIR, "static")
+RECORDINGS_DIR = os.path.join(BASE_DIR, "recordings")
 
 try:
     os.makedirs(RECORDINGS_DIR, exist_ok=True)
@@ -502,8 +503,23 @@ def turret_serial_worker(cmd_queue):
             set_serial_connected(is_active)
 
         try:
+            # Drain the entire queue into discrete action slots
+            pending_commands = []
+            latest_velocity = None
+
             while not cmd_queue.empty():
                 item = cmd_queue.get_nowait()
+                if item.get("cmd") == "VELOCITY":
+                    # Coalesce: keep only the newest velocity vector
+                    latest_velocity = item
+                else:
+                    # Preserve chronological order for discrete commands (SETPOINT, TRIGGER, HALT)
+                    pending_commands.append(item)
+
+            if latest_velocity is not None:
+                pending_commands.append(latest_velocity)
+
+            for item in pending_commands:
                 cmd = item.get("cmd")
 
                 if ser and ser.is_open:
@@ -1035,7 +1051,6 @@ def vision_thread():
         best_candidate = detections[0] if len(detections) > 0 else None
         verified_detection = best_candidate
         
-        verified_detection = None
         if best_candidate is not None:
             has_active = (get_primary_target_snapshot() is not None)
             if has_active:

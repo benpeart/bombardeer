@@ -20,6 +20,7 @@
 #include <TMCStepper.h>
 #include <FastAccelStepper.h>
 #include <XboxSeriesXControllerESP32_asukiaaa.hpp>
+#include <errno.h>
 #include "debug.h"
 
 // ============================================================================
@@ -538,7 +539,7 @@ void applyVelocityActuation()
         targetPan = 0;
 
     // Convert mrad/s directly into steps/s (Hz)
-    long targetPanHz = (long)(fabs((double)targetPan) * PAN_STEPS_PER_MRAD);
+    long targetPanHz = labs(targetPan) * PAN_STEPS_PER_MRAD;
     if (targetPanHz > PAN_STEPPER_MAXSPEEDHZ)
         targetPanHz = PAN_STEPPER_MAXSPEEDHZ;
 
@@ -580,7 +581,7 @@ void applyVelocityActuation()
         targetTilt = 0;
 
     // Convert mrad/s directly into steps/s (Hz)
-    long targetTiltHz = (long)(fabs((double)targetTilt) * TILT_STEPS_PER_MRAD);
+    long targetTiltHz = labs(targetTilt) * TILT_STEPS_PER_MRAD;
     if (targetTiltHz > TILT_STEPPER_MAXSPEEDHZ)
         targetTiltHz = TILT_STEPPER_MAXSPEEDHZ;
 
@@ -621,16 +622,16 @@ void applyVelocityActuation()
 
 void processSerialCommands()
 {
+    static char rxBuffer[64];
+    static uint8_t rxIdx = 0;
+    static unsigned long rxStartTime = 0;
+
     if (manualOverrideActive)
     {
         while (Serial.available() > 0)
             Serial.read();
         return;
     }
-
-    static char rxBuffer[64];
-    static uint8_t rxIdx = 0;
-    static unsigned long rxStartTime = 0;
 
     while (Serial.available() > 0)
     {
@@ -658,23 +659,75 @@ void processSerialCommands()
                 {
                 case 'P': // Dynamic Absolute Waypoint Target (mrad)
                 {
-                    long targetPan = 0, targetTilt = 0;
-                    if (sscanf(rxBuffer, "P %ld %ld", &targetPan, &targetTilt) == 2)
+                    char *ptr = rxBuffer + 1;
+                    char *endptr = nullptr;
+
+                    // 1. Parse Pan Target
+                    errno = 0;
+                    long targetPanMrad = strtol(ptr, &endptr, 10);
+                    if (endptr == ptr || errno == ERANGE || *endptr != ' ')
                     {
-                        commandAbsolutePositionMrad(targetPan, targetTilt);
+                        break; // No digits parsed, overflow/underflow, or missing space delimiter
                     }
+
+                    // 2. Parse Tilt Target
+                    ptr = endptr + 1;
+                    errno = 0;
+                    long targetTiltMrad = strtol(ptr, &endptr, 10);
+                    if (endptr == ptr || errno == ERANGE)
+                    {
+                        break; // No digits parsed or overflow/underflow
+                    }
+
+                    // 3. Ensure no trailing garbage characters exist before line end
+                    while (*endptr == ' ' || *endptr == '\t' || *endptr == '\r')
+                    {
+                        endptr++;
+                    }
+                    if (*endptr != '\0')
+                    {
+                        break; // Malformed payload with unparsed trailing bytes
+                    }
+
+                    commandAbsolutePositionMrad(targetPanMrad, targetTiltMrad);
                     break;
                 }
 
                 case 'V': // Continuous Velocity Streaming (mrad/s)
                 {
-                    long pSpd = 0, tSpd = 0;
-                    if (sscanf(rxBuffer, "V %ld %ld", &pSpd, &tSpd) == 2)
+                    char *ptr = rxBuffer + 1;
+                    char *endptr = nullptr;
+
+                    // 1. Parse Pan Speed
+                    errno = 0;
+                    long targetPanSpeed = strtol(ptr, &endptr, 10);
+                    if (endptr == ptr || errno == ERANGE || *endptr != ' ')
                     {
-                        currentMotionMode = MODE_VELOCITY;
-                        commandedPanSpeed = pSpd;
-                        commandedTiltSpeed = tSpd;
+                        break; // No digits parsed, overflow/underflow, or missing space delimiter
                     }
+
+                    // 2. Parse Tilt Speed
+                    ptr = endptr + 1;
+                    errno = 0;
+                    long targetTiltSpeed = strtol(ptr, &endptr, 10);
+                    if (endptr == ptr || errno == ERANGE)
+                    {
+                        break; // No digits parsed or overflow/underflow
+                    }
+
+                    // 3. Ensure no trailing garbage characters exist before line end
+                    while (*endptr == ' ' || *endptr == '\t' || *endptr == '\r')
+                    {
+                        endptr++;
+                    }
+                    if (*endptr != '\0')
+                    {
+                        break; // Malformed payload with unparsed trailing bytes
+                    }
+
+                    currentMotionMode = MODE_VELOCITY;
+                    commandedPanSpeed = targetPanSpeed;
+                    commandedTiltSpeed = targetTiltSpeed;
                     break;
                 }
 
@@ -854,7 +907,7 @@ void loop()
 
     // Periodic check to restore register configuration if TMC2209 brownout reset occurred
     static unsigned long lastDriverCheck = 0;
-    if (millis() - lastDriverCheck >= 3000)
+    if ((millis() - lastDriverCheck >= 3000) && !panStepper->isRunning() && !tiltStepper->isRunning())
     {
         lastDriverCheck = millis();
 
@@ -873,7 +926,7 @@ void loop()
     // 2. Process Incoming Host Serial Commands
     processSerialCommands();
 
-    // 3. Failsafe Watchdog: Prevent runaway motion if serial link is lost during autonomous tracking
+    // 3. Failsafe Watchdog: Prevent runaway motion if serial link is lost
     if ((millis() - lastSerialRxTime > SERIAL_WATCHDOG_TIMEOUT_MS) && !manualOverrideActive)
     {
         if (currentMotionMode == MODE_VELOCITY && (commandedPanSpeed != 0 || commandedTiltSpeed != 0))
@@ -883,13 +936,6 @@ void loop()
             if (panStepper)
                 panStepper->stopMove();
             if (tiltStepper)
-                tiltStepper->stopMove();
-        }
-        else if (currentMotionMode == MODE_POSITION)
-        {
-            if (panStepper && panStepper->isRunning())
-                panStepper->stopMove();
-            if (tiltStepper && tiltStepper->isRunning())
                 tiltStepper->stopMove();
         }
 
