@@ -440,6 +440,7 @@ def turret_serial_worker(cmd_queue):
     active_port = None
     reconnect_delay = 2.0
     next_reconnect_time = 0.0
+    last_port_missing_log_time = 0.0
 
     trigger_state = 0
     trigger_start_time = 0.0
@@ -496,6 +497,14 @@ def turret_serial_worker(cmd_queue):
                         set_alert(f"Serial Open Error: {e}", duration=2.0)
                         log.error(f"[SERIAL ERROR] Failed connecting to {active_port}: {e}")
                 else:
+                    # Log explicitly when none of the candidate USB ports are detected/available
+                    if now - last_port_missing_log_time >= 4.0:
+                        last_port_missing_log_time = now
+                        log.warning(
+                            f"[SERIAL WARN] No hardware ESP32 found on ports {DEFAULT_SERIAL_PORTS}. "
+                            "Check USB connection, power, or /dev permissions."
+                        )
+                        set_alert("ESP32 DISCONNECTED", duration=3.0)
                     next_reconnect_time = now + reconnect_delay
 
         if ser and ser.is_open:
@@ -1008,6 +1017,12 @@ def vision_thread():
     recording_start_time = 0.0
     last_standby_log_time = 0.0
 
+    # Pre-allocated fixed memory ring buffer for 720p pre-roll (Zero heap churn)
+    PRE_ROLL_CAPACITY = int(RECORD_PRE_ROLL_SEC * TARGET_FPS)  # 60 frames = 2.0s at 30 FPS
+    pre_roll_pool = np.empty((PRE_ROLL_CAPACITY, FRAME_HEIGHT, FRAME_WIDTH, 3), dtype=np.uint8)
+    pre_roll_idx = 0
+    pre_roll_count = 0
+    
     while True:
         loop_start_mono = time.monotonic()
         now = time.time()
@@ -1126,31 +1141,54 @@ def vision_thread():
             lock_consecutive_frames = 0
 
         if not is_recording:
+            # 1. Update circular memory slot in-place (No new heap allocations)
+            np.copyto(pre_roll_pool[pre_roll_idx], frame_main)
+            pre_roll_idx = (pre_roll_idx + 1) % PRE_ROLL_CAPACITY
+            if pre_roll_count < PRE_ROLL_CAPACITY:
+                pre_roll_count += 1
+
+            # 2. Trigger recording when lock threshold is met
             if target_locked and lock_consecutive_frames >= MIN_LOCK_FRAMES_TO_RECORD:
                 is_recording = True
                 recording_start_time = now
+
+                # Extract frames in strict chronological order from the ring buffer
+                if pre_roll_count < PRE_ROLL_CAPACITY:
+                    saved_pre_roll = [pre_roll_pool[i].copy() for i in range(pre_roll_count)]
+                else:
+                    saved_pre_roll = [
+                        pre_roll_pool[(pre_roll_idx + i) % PRE_ROLL_CAPACITY].copy()
+                        for i in range(PRE_ROLL_CAPACITY)
+                    ]
+
                 try:
-                    saved_pre_roll = list(pre_roll_buffer)
                     record_queue.put_nowait({"cmd": "start", "pre_roll": saved_pre_roll})
                 except queue.Full:
                     log.warning("[RECORDER QUEUE] Queue full on start trigger")
-            else:
-                pre_roll_buffer.append(frame_main)
+
+                # Reset ring buffer metrics immediately for future clips
+                pre_roll_idx = 0
+                pre_roll_count = 0
         else:
+            # While actively recording: zero-copy pass directly to the recorder queue
             time_since_last_seen = now - last_detection_time
             clip_duration = now - recording_start_time
 
             if time_since_last_seen > RECORD_POST_ROLL_SEC or clip_duration > MAX_RECORDING_DURATION_SEC:
                 is_recording = False
+                pre_roll_idx = 0
+                pre_roll_count = 0
                 try:
                     record_queue.put_nowait({"cmd": "stop"})
                 except queue.Full:
                     pass
             else:
                 try:
+                    # Direct reference handoff: No .copy() during recording
                     record_queue.put_nowait({"cmd": "frame", "frame": frame_main})
                 except queue.Full:
                     pass
+
         t_rec = (time.monotonic() - t4) * 1000.0
 
         # --- Stage 5: Client-Aware HUD Render & Web Stream ---
@@ -1247,33 +1285,171 @@ def vision_thread():
 def index():
     return render_template_string("""
     <!DOCTYPE html>
-    <html>
+    <html lang="en">
     <head>
-        <title>Bombardeer Diagnostic Console</title>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+        <meta name="apple-mobile-web-app-capable" content="yes">
+        <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+        <title>Bombardeer Console</title>
         <link rel="icon" type="image/x-icon" href="/favicon.ico">
         <style>
+            * {
+                box-sizing: border-box;
+                margin: 0;
+                padding: 0;
+            }
             body {
-                margin: 0; padding: 0;
-                background-color: #0d1117; color: #c9d1d9;
+                background-color: #0d1117;
+                color: #c9d1d9;
                 font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-                display: flex; flex-direction: column; align-items: center; justify-content: center;
+                display: flex;
+                flex-direction: column;
+                align-items: center;
+                justify-content: center;
                 min-height: 100vh;
+                padding: 12px;
+                -webkit-touch-callout: none;
             }
             .hud-card {
-                background: #161b22; border: 1px solid #30363d; border-radius: 8px;
-                padding: 16px; box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5); text-align: center;
+                background: #161b22;
+                border: 1px solid #30363d;
+                border-radius: 10px;
+                padding: 14px;
+                box-shadow: 0 8px 24px rgba(0, 0, 0, 0.6);
+                text-align: center;
+                width: 100%;
+                max-width: 680px;
+                display: flex;
+                flex-direction: column;
+                align-items: center;
             }
-            h1 { margin: 0 0 12px 0; font-size: 1.2rem; letter-spacing: 0.05em; text-transform: uppercase; color: #39d353; }
-            img { border-radius: 4px; background: #000; width: 640px; height: 360px; }
-            .meta { margin-top: 10px; font-size: 0.82rem; color: #8b949e; }
+            .header-bar {
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                width: 100%;
+                margin-bottom: 10px;
+            }
+            h1 {
+                font-size: 1.1rem;
+                letter-spacing: 0.05em;
+                text-transform: uppercase;
+                color: #39d353;
+                text-align: left;
+            }
+            .btn-fullscreen {
+                background: #21262d;
+                color: #c9d1d9;
+                border: 1px solid #30363d;
+                border-radius: 6px;
+                padding: 6px 12px;
+                font-size: 0.85rem;
+                font-weight: 600;
+                cursor: pointer;
+                transition: background 0.15s ease;
+                display: inline-flex;
+                align-items: center;
+                gap: 5px;
+            }
+            .btn-fullscreen:active {
+                background: #30363d;
+            }
+            .video-container {
+                position: relative;
+                width: 100%;
+                background: #000;
+                border-radius: 6px;
+                overflow: hidden;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                aspect-ratio: 16 / 9;
+            }
+            .video-container img {
+                width: 100%;
+                height: 100%;
+                object-fit: contain;
+                display: block;
+            }
+            /* Maximized / Fullscreen Mode Styles */
+            .video-container:fullscreen,
+            .video-container:-webkit-full-screen {
+                width: 100vw;
+                height: 100vh;
+                border-radius: 0;
+                background-color: #000;
+            }
+            .video-container:fullscreen img,
+            .video-container:-webkit-full-screen img {
+                width: 100vw;
+                height: 100vh;
+                object-fit: contain;
+            }
+            .fs-overlay-btn {
+                position: absolute;
+                bottom: 12px;
+                right: 12px;
+                background: rgba(22, 27, 34, 0.75);
+                border: 1px solid rgba(255, 255, 255, 0.2);
+                color: #fff;
+                padding: 8px 10px;
+                border-radius: 6px;
+                cursor: pointer;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                backdrop-filter: blur(4px);
+                z-index: 10;
+            }
+            .meta {
+                margin-top: 10px;
+                font-size: 0.78rem;
+                color: #8b949e;
+                line-height: 1.4;
+            }
         </style>
     </head>
     <body>
         <div class="hud-card">
-            <h1>Bombardeer Diagnostic Suite</h1>
-            <img src="/video_feed" alt="Targeting Stream">
-            <div class="meta">Asynchronous 50Hz Servoing | 921600 Baud Dual-Mode Link</div>
+            <div class="header-bar">
+                <h1>Bombardeer HUD</h1>
+                <button class="btn-fullscreen" onclick="toggleMaximize()">⛶ Fullscreen</button>
+            </div>
+            <div class="video-container" id="videoBox" ondblclick="toggleMaximize()">
+                <img id="streamImg" src="/video_feed" alt="Live Targeting Feed">
+                <button class="fs-overlay-btn" onclick="toggleMaximize()" title="Toggle Fullscreen">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3"></path>
+                    </svg>
+                </button>
+            </div>
+            <div class="meta">
+                Deterministic 50Hz Motion | 921.6k Baud Closed-Loop<br>
+                <em>Tap the fullscreen icon or double-tap video to expand.</em>
+            </div>
         </div>
+
+        <script>
+            function toggleMaximize() {
+                const box = document.getElementById("videoBox");
+                if (!document.fullscreenElement && !document.webkitFullscreenElement) {
+                    if (box.requestFullscreen) {
+                        box.requestFullscreen().catch(err => {
+                            console.warn("Fullscreen request error:", err);
+                        });
+                    } else if (box.webkitRequestFullscreen) {
+                        box.webkitRequestFullscreen(); // Safari / iOS support
+                    }
+                } else {
+                    if (document.exitFullscreen) {
+                        document.exitFullscreen();
+                    } else if (document.webkitExitFullscreen) {
+                        document.webkitExitFullscreen();
+                    }
+                }
+            }
+        </script>
     </body>
     </html>
     """)
