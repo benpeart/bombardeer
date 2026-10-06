@@ -331,14 +331,50 @@ connectors   =
 //    n(f) = { <yappGlobalOrigin>, yappLeftOrigin } // Only affects Top(lid), Back and Right Faces
 //    n(g) = [yappPCBName, "XXX"] : {Specify a PCB defaults to "Main"
 //-------------------------------------------------------------------
+//===================================================================
+//  *** Cutouts ***
+//===================================================================
+
 cutoutsBase = 
 [
-  // Base Floor Honeycomb: Positioned directly under the Pi 5's active cooler intake
-  [pcbLength("Raspberry Pi")/2, pcbWidth("Raspberry Pi")/2, 50.0, 42.0, 5, yappPolygon, 0, 0, yappCenter, shapeHexagon, [maskHoneycomb, 0, 1.5, 0], [yappPCBName, "Raspberry Pi"]]
+  // 1. Raspberry Pi 5 Floor Intake: Full rectangular perimeter inside the 58x49mm mounting bosses
+  [
+    pcbLength("Raspberry Pi")/2 - 10, pcbWidth("Raspberry Pi")/2, 
+    50.0, 45.0, 8, 
+    yappRectangle, 0, 0, yappCenter, 
+    [maskHoneycomb, 0, 0, 0], 
+    [yappPCBName, "Raspberry Pi"]
+  ],
+
+  // 2. ESP32 & Stepper Bay Floor Intake: Full rectangular perimeter between standoffs
+  [
+    pcbLength("ESP32")/2, pcbWidth("ESP32")/2, 
+    110.0, 24.0, 8, 
+    yappRectangle, 0, 0, yappCenter, 
+    [maskHoneycomb, 0, 0, 0], 
+    [yappPCBName, "ESP32"]
+  ]
 ];
 
-cutoutsLid  = 
+cutoutsLid = 
 [
+  // 1. Raspberry Pi 5 Lid Exhaust: Direct rectangular vertical chimney over active cooler
+  [
+    pcbLength("Raspberry Pi")/2 - 10, pcbWidth("Raspberry Pi")/2, 
+    100.0, 45.0, 8, 
+    yappRectangle, 0, 0, yappCenter, 
+    [maskHoneycomb, 0, 0, 0], 
+    [yappPCBName, "Raspberry Pi"]
+  ],
+
+  // 2. ESP32 & Driver Lid Exhaust: Direct rectangular vertical chimney over MCU and drivers
+  [
+    pcbLength("ESP32")/2, pcbWidth("ESP32")/2, 
+    110.0, 24.0, 8, 
+    yappRectangle, 0, 0, yappCenter, 
+    [maskHoneycomb, 0, 0, 0], 
+    [yappPCBName, "ESP32"]
+  ]
 ];
 
 cutoutsFront =  
@@ -348,7 +384,7 @@ cutoutsFront =
 cutoutsBack = 
 [
   // HDMI Port: Centered on HDMI adapter board width
-  [pcbWidth("HDMI Adapter")/2, pcbThickness("HDMI Adapter") + 2.6, 21.0, 9.0, 1.5, yappRoundedRect, yappCenter, [yappPCBName, "HDMI Adapter"]]
+  [pcbWidth("HDMI Adapter")/2, pcbThickness("HDMI Adapter") + 3.0, 21.0, 9.0, 1.5, yappRoundedRect, yappCenter, [yappPCBName, "HDMI Adapter"]]
 
   // Stepper Motor Wires: Centered relative to the ESP32 board
  ,[pcbWidth("ESP32")/2, pcbThickness("ESP32") + 14.0, 30.0, 10.0, 3.0, yappRoundedRect, yappCenter, [yappPCBName, "ESP32"]]
