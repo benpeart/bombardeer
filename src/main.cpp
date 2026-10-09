@@ -471,9 +471,15 @@ void processXboxOverride(AxisControlState &panState, AxisControlState &tiltState
         updateAxisFromJoystick(panStepper, panState, rawPan, PAN_STEPPER_MAXSPEEDHZ, PAN_STEPPER_MINSPEEDHZ);
         updateAxisFromJoystick(tiltStepper, tiltState, rawTilt, TILT_STEPPER_MAXSPEEDHZ, TILT_STEPPER_MINSPEEDHZ);
 
+        // Manage continuous firing during manual override
         if (triggerActive)
         {
-            triggerSolenoid();
+            autoFireRequested = true;
+            autoFireStartTime = millis(); // Refresh timeout while trigger is physically held
+        }
+        else
+        {
+            autoFireRequested = false;
         }
     }
     else

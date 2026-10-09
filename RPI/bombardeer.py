@@ -12,7 +12,7 @@ Bombardeer Turret: Real-Time Dual-Mode Controller (Mission-Critical Edition)
         - telemetry_lock: High-speed motor angles, moving flags, and history deque.
         - target_lock: Perception target state, supervisory health, and storage metrics.
         - frame_lock: Flask JPEG streaming and client tracking.
-        - mode_lock: Tri-state engagement model (OFF -> ON -> ARMED).
+        - mode_lock: Tri-state engagement model (OFF -> ON -> ARMED / CALIBRATE).
     * Latency-Compensated Time-Sync Forward Projection:
         - Projects Kalman state to the exact actuation instant, eliminating
           hunting, overshoot, and FastAccelStepper trajectory replanning halts.
@@ -150,18 +150,34 @@ STREAM_PART_FOOTER = b"\r\n"
 # =========================================================================
 app = Flask(__name__)
 
-# Lock 0: Tri-State Operational Engagement (OFF, ON, ARMED)
+# Lock 0: Operational Engagement (OFF, ON, ARMED, CALIBRATE)
 mode_lock = threading.Lock()
-turret_mode = "OFF"  # Power-on state is always disarmed and inert
+turret_mode = "OFF"       # Power-on state is always disarmed and inert
+calibrate_primed = False  # Single-shot authorization token for calibration
 
 def get_turret_mode():
     with mode_lock:
-        return turret_mode
+        return turret_mode, calibrate_primed
 
-def set_turret_mode(new_mode):
-    global turret_mode
+def set_turret_mode(new_mode, primed=None):
+    global turret_mode, calibrate_primed
     with mode_lock:
         turret_mode = new_mode
+        if primed is not None:
+            calibrate_primed = primed
+        elif new_mode == "CALIBRATE":
+            calibrate_primed = True  # Auto-prime on entering calibration mode
+        elif new_mode in ("OFF", "ON"):
+            calibrate_primed = False
+
+def consume_calibration_prime():
+    """Atomically consumes the single-shot calibration authorization token."""
+    global calibrate_primed
+    with mode_lock:
+        if calibrate_primed:
+            calibrate_primed = False
+            return True
+        return False
 
 # Lock 1: Web Streaming Buffer and Client Counter
 frame_lock = threading.Lock()
@@ -452,6 +468,7 @@ def turret_serial_worker(cmd_queue):
 
     trigger_state = 0
     trigger_start_time = 0.0
+    active_pulse_limit = MAX_TRIGGER_DURATION_SEC
     cooldown_until = 0.0
 
     rx_buf = bytearray()
@@ -557,18 +574,22 @@ def turret_serial_worker(cmd_queue):
 
                     elif cmd == "TRIGGER":
                         req_state = item["state"]
+                        custom_pulse = item.get("pulse_len")
+
                         # Drop stale trigger commands older than 100ms
                         if req_state == 1 and (now - item.get("timestamp", now) > 0.100):
                             continue
+
                         if req_state == 1:
                             if trigger_state == 0 and now >= cooldown_until:
                                 trigger_state = 1
                                 trigger_start_time = now
+                                active_pulse_limit = custom_pulse if custom_pulse else MAX_TRIGGER_DURATION_SEC
                                 set_firing_state(True)
                                 ser.write(b"T 1\n")
                                 with target_lock:
                                     system_health["serial_tx_count"] += 1
-                                log.info("[SERIAL] Solenoid trigger pulse FIRED")
+                                log.info(f"[SERIAL] Solenoid trigger pulse FIRED (Limit: {active_pulse_limit*1000:.0f}ms)")
                         elif req_state == 0:
                             if trigger_state == 1:
                                 trigger_state = 0
@@ -580,13 +601,16 @@ def turret_serial_worker(cmd_queue):
         except Exception as e:
             log.warning(f"[SERIAL TX FAULT] {e}")
 
-        if trigger_state == 1 and (now - trigger_start_time >= MAX_TRIGGER_DURATION_SEC):
+        # Solenoid auto-cutoff watchdog
+        if trigger_state == 1 and (now - trigger_start_time >= active_pulse_limit):
             trigger_state = 0
             set_firing_state(False)
             cooldown_until = now + TRIGGER_COOLDOWN_SEC
             if ser and ser.is_open:
                 try:
                     ser.write(b"T 0\n")
+                    with target_lock:
+                        system_health["serial_tx_count"] += 1
                 except Exception:
                     pass
 
@@ -772,6 +796,9 @@ def video_recorder_worker(record_queue):
 # =========================================================================
 # Asynchronous Real-Time Motion Servoing Loop (50 Hz / 20ms Cadence)
 # =========================================================================
+# =========================================================================
+# Asynchronous Real-Time Motion Servoing Loop (50 Hz / 20ms Cadence)
+# =========================================================================
 def motion_servoing_worker(target_filter, turret_queue):
     """
     Decoupled 50 Hz real-time motion control loop.
@@ -787,6 +814,9 @@ def motion_servoing_worker(target_filter, turret_queue):
     last_sent_p_tilt = 99999
     last_mode_seen = "OFF"
     
+    # Release hysteresis timer to prevent 20ms optical frame jitter from aborting auto-fire
+    last_fire_gate_ok_time = 0.0
+    
     log.info("[MOTION] 50 Hz Real-Time Motion Controller started")
 
     while True:
@@ -794,7 +824,7 @@ def motion_servoing_worker(target_filter, turret_queue):
         now = time.time()
 
         # Atomic, flat snapshot retrieval (No nested locks)
-        mode = get_turret_mode()
+        mode, is_primed = get_turret_mode()
         target_data = get_primary_target_snapshot()
         current_pan, current_tilt, hw_moving, _ = get_instantaneous_telemetry()
         serial_ok = get_serial_connected()
@@ -809,6 +839,7 @@ def motion_servoing_worker(target_filter, turret_queue):
                 last_v_tilt = 0
                 last_sent_p_pan = 99999
                 last_sent_p_tilt = 99999
+                last_fire_gate_ok_time = 0.0
                 target_filter.reset()
                 log.info("[MODE] Turret disengaged and placed in OFF / STANDBY.")
             last_mode_seen = mode
@@ -821,7 +852,7 @@ def motion_servoing_worker(target_filter, turret_queue):
 
         last_mode_seen = mode
 
-        # Turret is ON (Tracking) or ARMED (Tracking + Firing)
+        # Turret is ON (Tracking), ARMED (Burst Fire), or CALIBRATE (Single-Shot Gated)
         if serial_ok and target_data is not None:
             time_since_seen = now - target_data["last_seen"]
 
@@ -838,19 +869,48 @@ def motion_servoing_worker(target_filter, turret_queue):
                     realtime_err_pan = world_pan - current_pan
                     realtime_err_tilt = world_tilt - current_tilt
                     radial_error_mrad = math.hypot(realtime_err_pan, realtime_err_tilt)
-
-                    # Dynamic Trigger Gate: Strictly inhibited unless mode == "ARMED"
-                    # Require target freshness (<150ms), radial error within deadband,
-                    # AND ensure turret is stabilized (speed < 180 mrad/s) so it doesn't
-                    # fire while slewing past at maximum velocity.
                     turret_speed_mag = math.hypot(last_v_pan, last_v_tilt)
-                    can_fire = (
-                        mode == "ARMED"
-                        and time_since_seen <= 0.150
+
+                    # ---------------------------------------------------------
+                    # UNIFIED PRODUCTION FIRE GATE
+                    # Identical error threshold (40 mrad), target freshness (<150ms),
+                    # and turret slew speed gate (<180 mrad/s) across both modes.
+                    # ---------------------------------------------------------
+                    production_fire_gate = (
+                        time_since_seen <= 0.150
                         and radial_error_mrad <= FIRE_DEADBAND_MRAD
                         and turret_speed_mag < MAX_FIRE_SLEW_SPEED_MRAD_S
                     )
-                    turret_queue.put({"cmd": "TRIGGER", "state": 1 if can_fire else 0, "timestamp": now})
+
+                    if production_fire_gate:
+                        last_fire_gate_ok_time = now
+
+                    can_fire = False
+                    shot_pulse_duration = None
+
+                    if mode == "ARMED":
+                        # 120ms release hysteresis: tolerates brief 20-40ms frame dips
+                        # without cutting the trigger line and incurring the 1.5s lockout
+                        can_fire = (now - last_fire_gate_ok_time <= 0.120)
+                        shot_pulse_duration = None  # Sustained fire (governed by MAX_TRIGGER_DURATION_SEC)
+                    elif mode == "CALIBRATE":
+                        if production_fire_gate and is_primed:
+                            if consume_calibration_prime():
+                                can_fire = True
+                                shot_pulse_duration = 0.080  # 80ms pulse: guarantees exactly 1 shot on ESP32
+                                log.info(
+                                    f"[CALIBRATE] Single shot discharged via ARMED gate! | "
+                                    f"Range: {target_data['range_m']:.2f}m | "
+                                    f"Err: {radial_error_mrad:.1f}mrad | "
+                                    f"Slew: {turret_speed_mag:.1f}mrad/s"
+                                )
+
+                    turret_queue.put({
+                        "cmd": "TRIGGER",
+                        "state": 1 if can_fire else 0,
+                        "pulse_len": shot_pulse_duration,
+                        "timestamp": now
+                    })
 
                     # MODE HYSTERESIS SELECTION
                     if not is_actively_tracking_velocity:
@@ -871,7 +931,6 @@ def motion_servoing_worker(target_filter, turret_queue):
                     # MODE 1: BALLISTIC SNAP-TO-TARGET ('P')
                     if use_ballistic:
                         goal_delta = math.hypot(world_pan - last_sent_p_pan, world_tilt - last_sent_p_tilt)
-                        # Require at least 400ms between P setpoints, or an extreme shift of >60mrad
                         if (time_since_tx >= 0.400 and goal_delta > 60.0) or last_v_pan != 0:
                             last_setpoint_time = now
                             last_sent_p_pan = world_pan
@@ -894,12 +953,10 @@ def motion_servoing_worker(target_filter, turret_queue):
                                 mag = abs(err)
                                 if mag < deadband:
                                     return 0
-                                # Near target: smooth settling
                                 if mag <= 25.0:
                                     kp = 1.4
                                     cmd = err * kp + 0.8 * tgt_v
                                 else:
-                                    # Fast sweep: full 1.0x feed-forward eliminates tracking lag
                                     kp = 2.8
                                     cmd = err * kp + 1.0 * tgt_v
                                 return int(round(cmd))
@@ -948,6 +1005,7 @@ def motion_servoing_worker(target_filter, turret_queue):
             # -------------------------------------------------------------
             else:
                 clear_primary_target()
+                last_fire_gate_ok_time = 0.0
                 turret_queue.put({"cmd": "TRIGGER", "state": 0})
                 if is_actively_tracking_velocity:
                     turret_queue.put({"cmd": "VELOCITY", "pan_s": 0, "tilt_s": 0})
@@ -976,7 +1034,6 @@ def vision_thread():
     target_filter = TargetKalmanFilter(process_noise=35.0, measurement_noise=10.0)
 
     try:
-        # Detect candidate IMX708 NoIR ISP tuning profiles
         noir_candidates = [
             "/usr/share/libcamera/ipa/rpi/pisp/imx708_noir.json",
             "/usr/share/libcamera/ipa/rpi/vc4/imx708_noir.json",
@@ -1002,18 +1059,11 @@ def vision_thread():
             buffer_count=6,
             controls={
                 "AeEnable": True,
-                # 1: Highlight Priority - prevents clipping brightly lit grass/sky
                 "AeConstraintMode": 1,
-                # 1: Spot Metering - meters strictly the center landscape aperture,
-                # ignoring dark blind fabric and barrel perimeter
                 "AeMeteringMode": 1,
-                # Dynamic Auto White Balance
                 "AwbMode": 0,
-                # Negative EV bias pulls down direct sun luminance
                 "ExposureValue": -0.8,
-                # Allows sub-millisecond daylight shutter, up to 33.3ms for dusk
                 "FrameDurationLimits": (100, 33333),
-                # Increase contrast to cut through atmospheric and NoIR haze
                 "Contrast": 1.25,
                 "Saturation": 0.80,
                 "Sharpness": 1.25,
@@ -1055,11 +1105,9 @@ def vision_thread():
     recording_start_time = 0.0
     last_standby_log_time = 0.0
 
-    # ISP Adaptive Day/Night State
     isp_eval_counter = 0
     is_monochrome_mode = False
 
-    # Pre-allocated fixed memory ring buffer for 720p pre-roll (Zero heap churn)
     PRE_ROLL_CAPACITY = int(RECORD_PRE_ROLL_SEC * TARGET_FPS)
     pre_roll_pool = np.empty((PRE_ROLL_CAPACITY, FRAME_HEIGHT, FRAME_WIDTH, 3), dtype=np.uint8)
     pre_roll_idx = 0
@@ -1084,26 +1132,22 @@ def vision_thread():
         frame_count += 1
         isp_eval_counter += 1
 
-        # Adaptive Dusk/Day Chroma & Gain Management
         if isp_eval_counter >= 30:
             isp_eval_counter = 0
             lux = metadata.get("Lux", 50.0)
             gain = metadata.get("AnalogueGain", 1.0)
 
-            # Priority 1: Deep Dusk / Low-Light (< 12 Lux or Gain > 5.0)
-            # Switch to pure monochrome to eliminate IR sensor noise and maximize tracking contrast
             if (gain > 5.0 or lux < 12.0) and not is_monochrome_mode:
                 try:
                     picam2.set_controls({
                         "Saturation": 0.0,
-                        "Sharpness": 1.3  # Extra sharpness on ArUco / target edges at dusk
+                        "Sharpness": 1.3
                     })
                     is_monochrome_mode = True
                     log.info(f"[ISP] Priority 1 (Dusk/Low-Light): B&W Enhanced (Lux:{lux:.1f}, Gain:{gain:.2f})")
                 except Exception:
                     pass
 
-            # Priority 2 & 3: Daylight & Indoor (> 18 Lux and Gain <= 4.0)
             elif (gain <= 4.0 and lux >= 18.0) and is_monochrome_mode:
                 try:
                     picam2.set_controls({
@@ -1130,7 +1174,6 @@ def vision_thread():
         # --- Stage 2: Target Detection ---
         detections = detector.detect(frame_main)
 
-        # ArUco has built-in CRC error checking; accept candidate on frame 1 without delay
         best_candidate = detections[0] if len(detections) > 0 else None
         verified_detection = best_candidate
         
@@ -1159,14 +1202,11 @@ def vision_thread():
                 last_valid_range_m = verified_detection["range_m"]
             current_range_m = last_valid_range_m
 
-            # Look up physical position matching the exact instant of sensor exposure (~40ms latency)
             pan_at_capture, tilt_at_capture = get_turret_pos_at_time(capture_arrival_mono - 0.040)
 
-            # Optical parallax corrections
             parallax_pan_mrad = (-CAMERA_OFFSET_X_MM / (current_range_m * 1000.0)) * 1000.0
             parallax_tilt_mrad = (CAMERA_OFFSET_Y_MM / (current_range_m * 1000.0)) * 1000.0
 
-            # True trigonometric mapping
             dx = -(raw_cx - OPTICAL_CENTER[0])
             dy = -(raw_cy - OPTICAL_CENTER[1])
             opt_err_pan_mrad = math.atan2(dx, FOCAL_LENGTH_PX) * 1000.0 + parallax_pan_mrad
@@ -1175,7 +1215,6 @@ def vision_thread():
             raw_world_pan = pan_at_capture + int(round(opt_err_pan_mrad))
             raw_world_tilt = tilt_at_capture + int(round(opt_err_tilt_mrad))
 
-            # Update Kalman measurement model
             target_filter.update_measurement(raw_world_pan, raw_world_tilt, now)
 
             set_primary_target({
@@ -1188,7 +1227,6 @@ def vision_thread():
                 "id": verified_detection.get("id", 0)
             })
         else:
-            # Standby heartbeats: Log when idling with no active targets in view
             if get_primary_target_snapshot() is None and (now - last_standby_log_time >= 2.0):
                 last_standby_log_time = now
                 p_cur, t_cur, _, _ = get_instantaneous_telemetry()
@@ -1204,18 +1242,15 @@ def vision_thread():
             lock_consecutive_frames = 0
 
         if not is_recording:
-            # 1. Update circular memory slot in-place (No new heap allocations)
             np.copyto(pre_roll_pool[pre_roll_idx], frame_main)
             pre_roll_idx = (pre_roll_idx + 1) % PRE_ROLL_CAPACITY
             if pre_roll_count < PRE_ROLL_CAPACITY:
                 pre_roll_count += 1
 
-            # 2. Trigger recording when lock threshold is met
             if target_locked and lock_consecutive_frames >= MIN_LOCK_FRAMES_TO_RECORD:
                 is_recording = True
                 recording_start_time = now
 
-                # Extract frames in strict chronological order from the ring buffer
                 if pre_roll_count < PRE_ROLL_CAPACITY:
                     saved_pre_roll = [pre_roll_pool[i].copy() for i in range(pre_roll_count)]
                 else:
@@ -1228,11 +1263,9 @@ def vision_thread():
                 except queue.Full:
                     pass
 
-                # Reset ring buffer metrics immediately for future clips
                 pre_roll_idx = 0
                 pre_roll_count = 0
         else:
-            # While actively recording: zero-copy pass directly to the recorder queue
             time_since_last_seen = now - last_detection_time
             clip_duration = now - recording_start_time
 
@@ -1246,18 +1279,16 @@ def vision_thread():
                     pass
             else:
                 try:
-                    # Direct reference handoff: No .copy() during recording
                     record_queue.put_nowait({"cmd": "frame", "frame": frame_main})
                 except queue.Full:
                     pass
-
 
         # --- Stage 5: Client-Aware HUD Render & Web Stream ---
         with frame_lock:
             clients_viewing = (active_web_clients > 0)
 
         if clients_viewing:
-            cur_mode = get_turret_mode()
+            cur_mode, is_primed_hud = get_turret_mode()
             current_range_m = local_target.get("range_m", 25.0) if local_target else 25.0
             oc_x = int(OPTICAL_CENTER[0] * SCALE_X)
             oc_y = int(OPTICAL_CENTER[1] * SCALE_Y)
@@ -1267,7 +1298,9 @@ def vision_thread():
             conv_px_y = OPTICAL_CENTER[1] + int((CAMERA_OFFSET_Y_MM / (current_range_m * 1000.0)) * FOCAL_LENGTH_PX)
             aim_x = int(conv_px_x * SCALE_X)
             aim_y = int(conv_px_y * SCALE_Y)
-            db_radius = int((FIRE_DEADBAND_MRAD / MRAD_PER_PIXEL_X) * SCALE_X)
+
+            active_deadband = 15.0 if cur_mode == "CALIBRATE" else FIRE_DEADBAND_MRAD
+            db_radius = int((active_deadband / MRAD_PER_PIXEL_X) * SCALE_X)
 
             p_mrad, t_mrad, _, firing = get_instantaneous_telemetry()
             with target_lock:
@@ -1275,7 +1308,15 @@ def vision_thread():
                 rec_ok = system_health["recorder_active"]
                 alert_msg = system_health["last_alert"] if now < system_health["alert_time"] else None
 
-            ring_color = (0, 0, 255) if cur_mode == "ARMED" else ((255, 200, 0) if cur_mode == "ON" else (0, 200, 50))
+            if cur_mode == "ARMED":
+                ring_color = (0, 0, 255)
+            elif cur_mode == "CALIBRATE":
+                ring_color = (0, 165, 255) if is_primed_hud else (100, 100, 100)
+            elif cur_mode == "ON":
+                ring_color = (255, 200, 0)
+            else:
+                ring_color = (0, 200, 50)
+
             if firing:
                 ring_color = (0, 255, 255)
 
@@ -1305,11 +1346,17 @@ def vision_thread():
                 cv2.putText(annotated, status_lbl, (tx1, max(ty1 - 8, 15)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.45, box_color, 1, cv2.LINE_AA)
 
-            # High-Contrast Mode Watermark with Native Geometry Dot
+            # High-Contrast Mode Watermark
             if cur_mode == "ARMED":
                 cv2.rectangle(annotated, (10, 10), (150, 34), (0, 0, 180), -1)
                 cv2.circle(annotated, (22, 22), 4, (255, 255, 255), -1)
                 cv2.putText(annotated, "ARMED / LIVE", (32, 27), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 255), 1, cv2.LINE_AA)
+            elif cur_mode == "CALIBRATE":
+                cal_text = "TEST / PRIMED" if is_primed_hud else "TEST / LOCKED"
+                bg_cal = (0, 100, 200) if is_primed_hud else (60, 60, 60)
+                cv2.rectangle(annotated, (10, 10), (165, 34), bg_cal, -1)
+                cv2.circle(annotated, (22, 22), 4, (255, 255, 255), -1)
+                cv2.putText(annotated, cal_text, (32, 27), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
             elif cur_mode == "ON":
                 cv2.rectangle(annotated, (10, 10), (165, 34), (180, 110, 0), -1)
                 cv2.circle(annotated, (22, 22), 4, (255, 255, 255), -1)
@@ -1319,7 +1366,7 @@ def vision_thread():
                 cv2.circle(annotated, (22, 22), 4, (255, 255, 255), -1)
                 cv2.putText(annotated, "OFF / SAFE", (32, 27), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
 
-            # Persistent Dedicated Target Range Card (Upper Right, Always Visible in Fullscreen)
+            # Persistent Dedicated Target Range Card
             if local_target and (now - local_target["last_seen"] < COAST_MAX_HORIZON_SEC):
                 tgt_rng_m = local_target.get("range_m", 0.0)
                 tgt_rng_ft = tgt_rng_m * 3.28084
@@ -1373,15 +1420,24 @@ def api_mode():
     if request.method == "POST":
         req = request.get_json(silent=True) or {}
         target_mode = req.get("mode", "").upper()
+        reprime_req = req.get("reprime", False)
 
-        if target_mode not in ("OFF", "ON", "ARMED"):
+        cur_mode, cur_primed = get_turret_mode()
+
+        if reprime_req:
+            if cur_mode == "CALIBRATE":
+                set_turret_mode("CALIBRATE", primed=True)
+                set_alert("TEST FIRE: RE-PRIMED (READY)", duration=2.5)
+                log.info("[CALIBRATE] Single-shot test fire manually RE-PRIMED.")
+            c_mode, c_primed = get_turret_mode()
+            return jsonify({"status": "ok", "mode": c_mode, "primed": c_primed})
+
+        if target_mode not in ("OFF", "ON", "ARMED", "CALIBRATE"):
             return jsonify({"status": "error", "message": "Invalid mode specified"}), 400
 
-        current_mode = get_turret_mode()
-
-        # Strict Progression Guard: Can only arm when already turned "ON"
-        if target_mode == "ARMED" and current_mode != "ON":
-            return jsonify({"status": "error", "message": "Turret must be turned ON before arming"}), 400
+        # Progression Guard: Must be ON before ARMED or CALIBRATE
+        if target_mode in ("ARMED", "CALIBRATE") and cur_mode != "ON":
+            return jsonify({"status": "error", "message": "Turret must be turned ON before arming or testing"}), 400
 
         set_turret_mode(target_mode)
 
@@ -1400,13 +1456,17 @@ def api_mode():
                 except Exception:
                     pass
             set_alert("TRACKING ACTIVE (SAFE)", duration=2.5)
+        elif target_mode == "CALIBRATE":
+            set_alert("CALIBRATION MODE: PRIMED (1-SHOT)", duration=3.0)
         elif target_mode == "ARMED":
             set_alert("WARNING: TURRET ARMED / LIVE FIRE", duration=4.0)
 
         log.warning(f"[MODE TRANSITION] Turret switched to {target_mode}")
-        return jsonify({"status": "ok", "mode": target_mode})
+        c_mode, c_primed = get_turret_mode()
+        return jsonify({"status": "ok", "mode": c_mode, "primed": c_primed})
 
-    return jsonify({"status": "ok", "mode": get_turret_mode()})
+    c_mode, c_primed = get_turret_mode()
+    return jsonify({"status": "ok", "mode": c_mode, "primed": c_primed})
 
 
 @app.route("/")
@@ -1490,6 +1550,11 @@ def index():
                 color: #58a6ff;
                 border: 1px solid #1f6feb;
             }
+            .pill-cal {
+                background: #d2992222;
+                color: #f0883e;
+                border: 1px solid #d29922;
+            }
             .pill-armed {
                 background: #da363333;
                 color: #f85149;
@@ -1539,23 +1604,24 @@ def index():
             .controls-panel {
                 width: 100%;
                 display: grid;
-                grid-template-columns: 1.5fr 1.2fr 2.3fr;
-                gap: 10px;
+                grid-template-columns: 1fr 1fr 1.3fr 1.5fr;
+                gap: 8px;
                 margin-top: 12px;
                 align-items: stretch;
             }
             .btn-base {
                 border-radius: 8px;
-                font-size: 0.88rem;
+                font-size: 0.82rem;
                 font-weight: 700;
                 cursor: pointer;
                 transition: transform 0.08s ease, background 0.15s ease, filter 0.15s ease;
                 display: flex;
                 align-items: center;
                 justify-content: center;
-                gap: 6px;
+                gap: 4px;
                 border: 1px solid transparent;
                 min-height: 48px;
+                padding: 4px 6px;
             }
             .btn-base:active {
                 transform: scale(0.98);
@@ -1582,7 +1648,24 @@ def index():
                 border-color: #388bfd;
             }
 
-            /* Option 3: Flip-Cover Two-Stage Guarded Switch Assembly */
+            .btn-cal {
+                background: #21262d;
+                color: #f0883e;
+                border-color: #d2992266;
+            }
+            .btn-cal.active {
+                background: #d29922;
+                color: #0d1117;
+                border-color: #f0883e;
+                font-weight: 800;
+            }
+            .btn-cal.locked {
+                background: #21262d;
+                color: #8b949e;
+                border-color: #30363d;
+            }
+
+            /* Flip-Cover Two-Stage Guarded Switch Assembly */
             .switch-bay {
                 position: relative;
                 perspective: 600px;
@@ -1601,7 +1684,7 @@ def index():
                 );
                 color: #000;
                 font-weight: 800;
-                font-size: 0.76rem;
+                font-size: 0.72rem;
                 letter-spacing: 0.04em;
                 display: flex;
                 align-items: center;
@@ -1616,7 +1699,7 @@ def index():
             .cover-text {
                 background: rgba(0, 0, 0, 0.85);
                 color: #f0883e;
-                padding: 4px 10px;
+                padding: 4px 8px;
                 border-radius: 4px;
                 display: flex;
                 align-items: center;
@@ -1642,8 +1725,8 @@ def index():
                 border: 2px dashed #f85149;
                 color: #ff7b72;
                 font-weight: 800;
-                font-size: 0.82rem;
-                letter-spacing: 0.05em;
+                font-size: 0.76rem;
+                letter-spacing: 0.04em;
                 display: flex;
                 flex-direction: column;
                 align-items: center;
@@ -1747,21 +1830,24 @@ def index():
 
             <div class="controls-panel">
                 <button id="btnOff" class="btn-base btn-off active" onclick="requestMode('OFF')">
-                    🛑 OFF / SAFE
+                    🛑 OFF
                 </button>
                 <button id="btnOn" class="btn-base btn-on" onclick="requestMode('ON')">
-                    🎯 TRACK (ON)
+                    🎯 TRACK
+                </button>
+                <button id="btnCal" class="btn-base btn-cal" onclick="handleCalibrateClick()">
+                    🧪 1-SHOT
                 </button>
 
                 <!-- Two-Stage Guarded Switch Assembly -->
                 <div class="switch-bay" id="switchBay">
                     <button id="armedTrigger" class="armed-trigger" onclick="confirmArmTrigger()">
-                        <span id="triggerLabel">⚠️ CONFIRM LIVE FIRE</span>
+                        <span id="triggerLabel">⚠️ ARM LIVE</span>
                         <div id="timeoutBar" class="timeout-bar" style="width: 0%;"></div>
                     </button>
                     <div id="safetyCover" class="safety-cover disabled" onclick="flipOpenCover()">
                         <div class="cover-text">
-                            <span>🔒</span> <span id="coverLabel">OFF / SAFE</span>
+                            <span>🔒</span> <span id="coverLabel">LOCKED</span>
                         </div>
                     </div>
                 </div>
@@ -1769,12 +1855,13 @@ def index():
 
             <div class="meta">
                 Deterministic 50Hz Motion | 921.6k Baud Closed-Loop<br>
-                <em>Guarded flip-cover arms the turret. Cover auto-closes after 4s without confirmation.</em>
+                <em>Use 1-SHOT for single-round aim verification (auto-discharges once on 500ms lock, then locks out).</em>
             </div>
         </div>
 
         <script>
             let currentMode = "OFF";
+            let isPrimed = false;
             let coverOpen = false;
             let coverTimer = null;
             let timerStart = 0;
@@ -1818,17 +1905,39 @@ def index():
                     document.getElementById("timeoutBar").style.width = "0%";
                     requestMode("ARMED");
                 } else if (currentMode === "ARMED") {
-                    // Clicking the active live-fire button safely toggles back to tracking
                     snapCoverClosed();
                     requestMode("ON");
                 }
             }
 
-            function updateUIState(mode) {
+            function handleCalibrateClick() {
+                if (currentMode === "CALIBRATE") {
+                    // Re-prime the single shot if already in CALIBRATE mode
+                    fetch("/api/mode", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ reprime: true })
+                    })
+                    .then(r => r.json())
+                    .then(data => {
+                        if (data.status === "ok") {
+                            updateUIState(data.mode, data.primed);
+                        }
+                    })
+                    .catch(err => console.error("Reprime failed:", err));
+                } else if (currentMode === "ON") {
+                    requestMode("CALIBRATE");
+                }
+            }
+
+            function updateUIState(mode, primedState) {
                 currentMode = mode;
+                isPrimed = !!primedState;
+
                 const badge = document.getElementById("modeBadge");
                 const btnOff = document.getElementById("btnOff");
                 const btnOn = document.getElementById("btnOn");
+                const btnCal = document.getElementById("btnCal");
                 const cover = document.getElementById("safetyCover");
                 const trigger = document.getElementById("armedTrigger");
                 const triggerLabel = document.getElementById("triggerLabel");
@@ -1836,6 +1945,7 @@ def index():
 
                 btnOff.classList.remove("active");
                 btnOn.classList.remove("active");
+                btnCal.classList.remove("active", "locked");
                 trigger.classList.remove("live-armed");
                 badge.className = "status-pill";
 
@@ -1844,30 +1954,47 @@ def index():
                     badge.classList.add("pill-off");
                     btnOff.classList.add("active");
 
+                    btnCal.textContent = "🧪 1-SHOT";
+                    btnCal.classList.add("locked");
+
                     cover.classList.add("disabled");
                     cover.classList.remove("flipped");
-                    coverLabel.textContent = "OFF / SAFE";
-                    triggerLabel.textContent = "⚠️ CONFIRM LIVE FIRE";
+                    coverLabel.textContent = "LOCKED";
+                    triggerLabel.textContent = "⚠️ ARM LIVE";
                     snapCoverClosed();
                 } else if (mode === "ON") {
                     badge.textContent = "TRACKING (SAFE)";
                     badge.classList.add("pill-on");
                     btnOn.classList.add("active");
 
+                    btnCal.textContent = "🧪 1-SHOT";
+
                     cover.classList.remove("disabled");
                     coverLabel.textContent = "LIFT TO ARM";
-                    triggerLabel.textContent = "⚠️ CONFIRM LIVE FIRE";
-                    // If coming out of ARMED, close the cover and restore the yellow hatched safety latch
+                    triggerLabel.textContent = "⚠️ ARM LIVE";
                     if (coverOpen || cover.classList.contains("flipped")) {
                         snapCoverClosed();
                     }
+                } else if (mode === "CALIBRATE") {
+                    badge.textContent = isPrimed ? "CAL: PRIMED" : "CAL: LOCKED";
+                    badge.classList.add("pill-cal");
+
+                    btnCal.classList.add("active");
+                    btnCal.textContent = isPrimed ? "🎯 PRIMED" : "🔄 RE-PRIME";
+
+                    cover.classList.add("disabled");
+                    coverLabel.textContent = "TESTING";
+                    snapCoverClosed();
                 } else if (mode === "ARMED") {
                     badge.textContent = "ARMED / LIVE";
                     badge.classList.add("pill-armed");
 
+                    btnCal.textContent = "🧪 1-SHOT";
+                    btnCal.classList.add("locked");
+
                     cover.classList.add("flipped");
                     trigger.classList.add("live-armed");
-                    triggerLabel.textContent = "🔥 LIVE FIRE (CLICK TO SAFE)";
+                    triggerLabel.textContent = "🔥 DISARM";
                 }
             }
 
@@ -1880,7 +2007,7 @@ def index():
                 .then(r => r.json())
                 .then(data => {
                     if (data.status === "ok") {
-                        updateUIState(data.mode);
+                        updateUIState(data.mode, data.primed);
                     }
                 })
                 .catch(err => {
@@ -1892,8 +2019,10 @@ def index():
                 fetch("/api/mode")
                 .then(r => r.json())
                 .then(data => {
-                    if (data.status === "ok" && data.mode !== currentMode) {
-                        updateUIState(data.mode);
+                    if (data.status === "ok") {
+                        if (data.mode !== currentMode || data.primed !== isPrimed) {
+                            updateUIState(data.mode, data.primed);
+                        }
                     }
                 })
                 .catch(() => {});
