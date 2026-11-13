@@ -42,6 +42,7 @@ from collections import deque
 import numpy as np
 import cv2
 import serial
+import subprocess
 from flask import Flask, Response, render_template_string, jsonify, request, send_from_directory
 
 from picamera2 import Picamera2
@@ -97,6 +98,9 @@ OPTICAL_CENTER = (FRAME_WIDTH // 2, FRAME_HEIGHT // 2)
 CAMERA_OFFSET_X_MM = -170.0  # Camera 170mm Left of Bore
 CAMERA_OFFSET_Y_MM = -60.0   # Camera 60mm Below Bore
 
+# Ballistic and Mechanical Bore Trim
+TILT_CALIBRATION_TRIM_MRAD = -8.3  # -8.3 mrad lowers impact point by 4" at 40 ft
+
 # Camera Optical Intrinsics
 FOCAL_LENGTH_PX = 540.4
 MRAD_PER_PIXEL_X = 1000.0 / FOCAL_LENGTH_PX
@@ -118,6 +122,8 @@ SETPOINT_MIN_INTERVAL_SEC = 0.040  # 25 Hz maximum UART transmission rate
 # Software Travel Limits (Physical Axis Protection)
 TILT_MIN_MRAD = -420
 TILT_MAX_MRAD = 400
+PAN_MIN_MRAD = -3141
+PAN_MAX_MRAD = 3141
 
 MAX_TRIGGER_DURATION_SEC = 2.0
 TRIGGER_COOLDOWN_SEC = 1.5
@@ -330,12 +336,11 @@ class TargetKalmanFilter:
         """Asynchronous measurement correction step invoked by perception thread."""
         with self.lock:
             if not self.is_initialized:
-                self.kf.statePost = np.array([
-                    [float(measured_pan)],
-                    [float(measured_tilt)],
-                    [0.0],
-                    [0.0]
-                ], dtype=np.float32)
+                # Explicitly wipe all states and covariances
+                self.kf.statePre = np.array([[float(measured_pan)], [float(measured_tilt)], [0.0], [0.0]], dtype=np.float32)
+                self.kf.statePost = np.array([[float(measured_pan)], [float(measured_tilt)], [0.0], [0.0]], dtype=np.float32)
+                self.kf.errorCovPre = np.eye(4, dtype=np.float32) * 50.0
+                self.kf.errorCovPost = np.eye(4, dtype=np.float32) * 50.0
                 self.last_update_time = current_time
                 self.is_initialized = True
                 return int(measured_pan), int(measured_tilt), 0.0, 0.0
@@ -377,6 +382,17 @@ class TargetKalmanFilter:
                 float(predicted[3, 0])
             )
 
+import ctypes
+
+def set_os_thread_name(name: str):
+    """Sets the Linux OS-level task/thread name visible in ps, top, and htop."""
+    try:
+        libc = ctypes.CDLL("libc.so.6")
+        # PR_SET_NAME = 15; name is truncated to 16 bytes by the Linux kernel
+        libc.prctl(15, name[:15].encode("utf-8"), 0, 0, 0)
+    except Exception:
+        pass
+
 # =========================================================================
 # Perception Layer (ArUco / Drop-in Interface for Future ML Models)
 # =========================================================================
@@ -390,17 +406,31 @@ class ArucoTargetDetector:
         # Sub-pixel corner refinement & adaptive windowing for small, distant markers
         self.parameters.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
         self.parameters.adaptiveThreshWinSizeMin = 3
-        self.parameters.adaptiveThreshWinSizeMax = 23
+        # Reduced max window size slightly to speed up ArUco's internal thresholding
+        self.parameters.adaptiveThreshWinSizeMax = 19 
         self.parameters.adaptiveThreshWinSizeStep = 4
 
         self.detector = cv2.aruco.ArucoDetector(self.dictionary, self.parameters)
-        self.clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        
+        # Pre-compute Gamma LUT (Gamma < 1.0 brightens shadows)
+        gamma = 0.6 
+        inv_gamma = 1.0 / gamma
+        self.gamma_lut = np.array([((i / 255.0) ** inv_gamma) * 255 
+                                  for i in np.arange(0, 256)]).astype("uint8")
+
+        # NOTE: CLAHE has been completely removed to unlock 30 FPS processing.
+        # Hardware HDR and the Gamma LUT handle dynamic range natively.
 
     def detect(self, frame_bgr):
         try:
+            # 1. Lift shadows globally via LUT (Zero CPU penalty)
+            frame_bgr = cv2.LUT(frame_bgr, self.gamma_lut)
+            
+            # 2. Convert to grayscale (Fastest format for ArUco)
             gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-            enhanced_gray = self.clahe.apply(gray)
-            corners, ids, _ = self.detector.detectMarkers(enhanced_gray)
+            
+            # 3. Detect directly on the LUT-adjusted grayscale frame
+            corners, ids, _ = self.detector.detectMarkers(gray)
             detections = []
 
             if ids is not None and len(ids) > 0:
@@ -412,7 +442,7 @@ class ArucoTargetDetector:
                     d01 = math.hypot(pts[0][0] - pts[1][0], pts[0][1] - pts[1][1])
                     d12 = math.hypot(pts[1][0] - pts[2][0], pts[1][1] - pts[2][1])
 
-                    # Reject markers smaller than 8 pixels (allows tracking out to 30+ yards)
+                    # Reject markers smaller than 8 pixels
                     if d01 < 8 or d12 < 8:
                         continue
 
@@ -474,6 +504,8 @@ def turret_serial_worker(cmd_queue):
     rx_buf = bytearray()
     last_telemetry_rx_time = 0.0
 
+    set_os_thread_name("TurretSerial")
+    
     while True:
         now = time.time()
         mono_now = time.monotonic()
@@ -680,7 +712,9 @@ def ensure_storage_headroom():
         if calc_free_gb < MIN_FREE_SPACE_GB:
             set_alert(f"LOW STORAGE: {calc_free_gb:.1f} GB Free", duration=4.0)
 
-        files = glob.glob(os.path.join(RECORDINGS_DIR, "wildlife_*.mp4"))
+        # Search for video files
+        files = glob.glob(os.path.join(RECORDINGS_DIR, "wildlife_*.*"))
+        
         if not files:
             return
 
@@ -711,11 +745,13 @@ def video_recorder_worker(record_queue):
     frames_written = 0
 
     CODECS = [
-        ("mp4v", cv2.VideoWriter_fourcc(*"mp4v")),
-        ("avc1", cv2.VideoWriter_fourcc(*"avc1")),
-        ("MJPG", cv2.VideoWriter_fourcc(*"MJPG")),
-        ("XVID", cv2.VideoWriter_fourcc(*"XVID"))
+        ("mp4v", cv2.VideoWriter_fourcc(*"mp4v"), ".mp4"),
+        ("avc1", cv2.VideoWriter_fourcc(*"avc1"), ".mp4"),
+        ("MJPG", cv2.VideoWriter_fourcc(*"MJPG"), ".avi"),
+        ("XVID", cv2.VideoWriter_fourcc(*"XVID"), ".avi")
     ]
+
+    set_os_thread_name("VidRecorder")
 
     while True:
         try:
@@ -728,15 +764,17 @@ def video_recorder_worker(record_queue):
         if cmd == "start":
             if not recording_active:
                 ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-                current_filepath = os.path.join(RECORDINGS_DIR, f"wildlife_{ts}.mp4")
                 writer = None
                 frames_written = 0
+                current_filepath = None
 
-                for tag, fourcc in CODECS:
+                for tag, fourcc, ext in CODECS:
+                    test_filepath = os.path.join(RECORDINGS_DIR, f"wildlife_{ts}{ext}")
                     try:
-                        cand = cv2.VideoWriter(current_filepath, fourcc, TARGET_FPS, (FRAME_WIDTH, FRAME_HEIGHT))
+                        cand = cv2.VideoWriter(test_filepath, fourcc, TARGET_FPS, (FRAME_WIDTH, FRAME_HEIGHT))
                         if cand is not None and cand.isOpened():
                             writer = cand
+                            current_filepath = test_filepath
                             log.info(f"[RECORDER] VideoWriter opened with codec '{tag}' -> {current_filepath}")
                             break
                         elif cand is not None:
@@ -796,9 +834,6 @@ def video_recorder_worker(record_queue):
 # =========================================================================
 # Asynchronous Real-Time Motion Servoing Loop (50 Hz / 20ms Cadence)
 # =========================================================================
-# =========================================================================
-# Asynchronous Real-Time Motion Servoing Loop (50 Hz / 20ms Cadence)
-# =========================================================================
 def motion_servoing_worker(target_filter, turret_queue):
     """
     Decoupled 50 Hz real-time motion control loop.
@@ -816,8 +851,23 @@ def motion_servoing_worker(target_filter, turret_queue):
     
     # Release hysteresis timer to prevent 20ms optical frame jitter from aborting auto-fire
     last_fire_gate_ok_time = 0.0
+
+    last_target_time = time.time()
+    HOME_TIMEOUT_SEC = 300.0  
+    is_homing = False
+
+    # --- BALLISTICS CONSTANTS ---
+    MUZZLE_VELOCITY_M_S = 85.0  
+    GRAVITY_M_S2 = 9.81
     
-    log.info("[MOTION] 50 Hz Real-Time Motion Controller started")
+    # Drag Constants for .68 Caliber Paintball at ~1,400 ft elevation
+    # Air Density (rho) = 1.17 kg/m^3, Mass = 0.0032 kg, Cd = 0.3, Area = 0.000234 m^2
+    # k = (rho * Cd * Area) / (2 * Mass) 
+    DRAG_K = 0.0128
+    
+    log.info("[MOTION] 50 Hz Real-Time Motion Controller (Drag Ballistics & Auto-Home) started")
+
+    set_os_thread_name("MotionServo")
 
     while True:
         loop_start = time.monotonic()
@@ -842,6 +892,9 @@ def motion_servoing_worker(target_filter, turret_queue):
                 last_fire_gate_ok_time = 0.0
                 target_filter.reset()
                 log.info("[MODE] Turret disengaged and placed in OFF / STANDBY.")
+            
+            last_target_time = now
+            is_homing = False
             last_mode_seen = mode
 
             elapsed = time.monotonic() - loop_start
@@ -853,17 +906,72 @@ def motion_servoing_worker(target_filter, turret_queue):
         last_mode_seen = mode
 
         # Turret is ON (Tracking), ARMED (Burst Fire), or CALIBRATE (Single-Shot Gated)
-        if serial_ok and target_data is not None:
-            time_since_seen = now - target_data["last_seen"]
+        if serial_ok:
+            target_active = False
+            if target_data is not None:
+                time_since_seen = now - target_data["last_seen"]
 
             # -------------------------------------------------------------
             # CASE A: TARGET ACTIVE OR WITHIN 1.5s BALLISTIC COAST HORIZON
             # -------------------------------------------------------------
-            if time_since_seen <= COAST_MAX_HORIZON_SEC:
-                # Continuous Kalman projection to the exact actuation instant
+                if time_since_seen <= COAST_MAX_HORIZON_SEC:
+                    target_active = True
+
+            if target_active:
+                last_target_time = now
+                is_homing = False
+
                 predicted_state = target_filter.predict_state(now)
                 if predicted_state is not None:
-                    world_pan, world_tilt, tgt_v_pan, tgt_v_tilt = predicted_state
+                    base_pan, base_tilt, tgt_v_pan, tgt_v_tilt = predicted_state
+
+                    current_range_m = target_data.get("range_m", 15.0)
+                    
+                    # 1. Time of Flight (ToF) with Quadratic Drag Approximation
+                    # t = (e^(k*x) - 1) / (k * V0)
+                    if current_range_m > 0:
+                        tof_sec = (math.exp(DRAG_K * current_range_m) - 1.0) / (DRAG_K * MUZZLE_VELOCITY_M_S)
+                    else:
+                        tof_sec = 0.0
+                    
+                    # 2. Gravity Drop Compensation with Slant Angle (Cosine)
+                    current_tilt_radians = current_tilt / 1000.0
+                    drop_m = 0.5 * (GRAVITY_M_S2 * math.cos(current_tilt_radians)) * (tof_sec ** 2)
+                    drop_mrad = (drop_m / current_range_m) * 1000.0 if current_range_m > 0 else 0.0
+                    
+                    # 3. Target Lead 
+                    lead_pan_mrad = tgt_v_pan * tof_sec
+                    lead_tilt_mrad = tgt_v_tilt * tof_sec
+
+                    # Final Firing Solution (Impact Point)
+                    world_pan = int(round(base_pan + lead_pan_mrad))
+                    world_tilt = int(round(base_tilt + lead_tilt_mrad + drop_mrad + TILT_CALIBRATION_TRIM_MRAD))
+                    
+                    # =========================================================
+                    # RIGID BOUNDARY CLAMPING & KALMAN MOMENTUM RESET
+                    # =========================================================
+                    pan_clamped = False
+                    tilt_clamped = False
+
+                    if world_pan < PAN_MIN_MRAD or world_pan > PAN_MAX_MRAD:
+                        pan_clamped = True
+                        world_pan = max(PAN_MIN_MRAD, min(PAN_MAX_MRAD, world_pan))
+
+                    if world_tilt < TILT_MIN_MRAD or world_tilt > TILT_MAX_MRAD:
+                        tilt_clamped = True
+                        world_tilt = max(TILT_MIN_MRAD, min(TILT_MAX_MRAD, world_tilt))
+
+                    # If an axis is pinned against a physical wall, clamp the Kalman state 
+                    # and zero its velocity component to prevent phantom tracking momentum.
+                    with target_filter.lock:
+                        if target_filter.is_initialized:
+                            if pan_clamped:
+                                target_filter.kf.statePost[0, 0] = float(world_pan)
+                                target_filter.kf.statePost[2, 0] = 0.0 # Zero vPan momentum
+                            if tilt_clamped:
+                                target_filter.kf.statePost[1, 0] = float(world_tilt)
+                                target_filter.kf.statePost[3, 0] = 0.0 # Zero vTilt momentum
+                    # =========================================================
 
                     # LATENCY-FREE INSTANTANEOUS REAL-TIME ERROR
                     realtime_err_pan = world_pan - current_pan
@@ -899,10 +1007,11 @@ def motion_servoing_worker(target_filter, turret_queue):
                                 can_fire = True
                                 shot_pulse_duration = 0.080  # 80ms pulse: guarantees exactly 1 shot on ESP32
                                 log.info(
-                                    f"[CALIBRATE] Single shot discharged via ARMED gate! | "
-                                    f"Range: {target_data['range_m']:.2f}m | "
-                                    f"Err: {radial_error_mrad:.1f}mrad | "
-                                    f"Slew: {turret_speed_mag:.1f}mrad/s"
+                                    f"[CALIBRATE] Shot discharged! | "
+                                    f"Range: {current_range_m:.2f}m | "
+                                    f"ToF: {tof_sec:.3f}s | "
+                                    f"Lead: ({lead_pan_mrad:.1f}, {lead_tilt_mrad:.1f})mrad | "
+                                    f"Drop: {drop_mrad:.1f}mrad"
                                 )
 
                     turret_queue.put({
@@ -1004,20 +1113,38 @@ def motion_servoing_worker(target_filter, turret_queue):
             # CASE B: TARGET EXPIRED BEYOND 1.5s COAST HORIZON
             # -------------------------------------------------------------
             else:
-                clear_primary_target()
-                last_fire_gate_ok_time = 0.0
-                turret_queue.put({"cmd": "TRIGGER", "state": 0})
-                if is_actively_tracking_velocity:
-                    turret_queue.put({"cmd": "VELOCITY", "pan_s": 0, "tilt_s": 0})
-                    is_actively_tracking_velocity = False
-                last_v_pan = 0
-                last_v_tilt = 0
-                last_sent_p_pan = 99999
-                last_sent_p_tilt = 99999
-                target_filter.reset()
-                log.info(f"[{mode}] Target horizon expired (>1.5s). Standing by.")
+                if target_data is not None:
+                    clear_primary_target()
+                    last_fire_gate_ok_time = 0.0
+                    turret_queue.put({"cmd": "TRIGGER", "state": 0})
+                    if is_actively_tracking_velocity:
+                        turret_queue.put({"cmd": "VELOCITY", "pan_s": 0, "tilt_s": 0})
+                        is_actively_tracking_velocity = False
+                    last_v_pan = 0
+                    last_v_tilt = 0
+                    last_sent_p_pan = 99999
+                    last_sent_p_tilt = 99999
+                    target_filter.reset()
+                    log.info(f"[{mode}] Target horizon expired (>1.5s). Standing by.")
 
-        # Precise 50 Hz cycle regulation
+                idle_duration = now - last_target_time
+                if idle_duration >= HOME_TIMEOUT_SEC:
+                    
+                    if not is_homing and (abs(current_pan) > 2 or abs(current_tilt) > 2):
+                        log.info(f"[{mode}] Idle for {HOME_TIMEOUT_SEC}s. Returning turret to scan home (0,0).")
+                        is_homing = True
+                    
+                    if is_homing:
+                        if abs(current_pan) <= 2 and abs(current_tilt) <= 2:
+                            is_homing = False
+                        elif (now - last_setpoint_time >= 2.0):
+                            turret_queue.put({
+                                "cmd": "SETPOINT",
+                                "pan": 0,
+                                "tilt": 0
+                            })
+                            last_setpoint_time = now
+
         elapsed = time.monotonic() - loop_start
         sleep_time = MOTION_LOOP_INTERVAL_SEC - elapsed
         if sleep_time > 0.001:
@@ -1028,6 +1155,8 @@ def motion_servoing_worker(target_filter, turret_queue):
 # =========================================================================
 def vision_thread():
     global latest_jpeg, global_turret_queue
+
+    set_os_thread_name("VisionMain")
 
     ensure_storage_headroom()
     detector = ArucoTargetDetector()
@@ -1052,6 +1181,7 @@ def vision_thread():
         else:
             log.warning("[CAMERA] Specific NoIR tuning JSON not found in standard paths; proceeding with default ISP.")
 
+        # UPDATED: Enabled HdrMode, matrix metering, and reset exposure/contrast
         cam_config = picam2.create_video_configuration(
             sensor={"output_size": (2304, 1296)},
             main={"size": (FRAME_WIDTH, FRAME_HEIGHT), "format": "RGB888"},
@@ -1059,12 +1189,12 @@ def vision_thread():
             buffer_count=6,
             controls={
                 "AeEnable": True,
-                "AeConstraintMode": 1,
-                "AeMeteringMode": 1,
+                "HdrMode": 2,          # 2 = Sensor HDR
+                "AeMeteringMode": 0,   # 0 = Matrix
                 "AwbMode": 0,
-                "ExposureValue": -0.8,
+                "ExposureValue": 0.0,  
                 "FrameDurationLimits": (100, 33333),
-                "Contrast": 1.25,
+                "Contrast": 1.0,       
                 "Saturation": 0.80,
                 "Sharpness": 1.25,
                 "AfMode": 0,
@@ -1107,6 +1237,7 @@ def vision_thread():
 
     isp_eval_counter = 0
     is_monochrome_mode = False
+    last_ev = 0.0
 
     PRE_ROLL_CAPACITY = int(RECORD_PRE_ROLL_SEC * TARGET_FPS)
     pre_roll_pool = np.empty((PRE_ROLL_CAPACITY, FRAME_HEIGHT, FRAME_WIDTH, 3), dtype=np.uint8)
@@ -1129,6 +1260,22 @@ def vision_thread():
             time.sleep(0.01)
             continue
 
+        # UPDATED: Dynamic tilt-aware exposure control
+        _, current_tilt_mrad, _, _ = get_instantaneous_telemetry()
+        
+        dynamic_ev = 0.0
+        if current_tilt_mrad > 50: 
+            dynamic_ev = 1.5  # Pointing up, force overexposure of sky to see ground
+        elif current_tilt_mrad < -100:
+            dynamic_ev = -0.5 # Pointing down, slightly darken to prevent blow-out
+            
+        if last_ev != dynamic_ev:
+            try:
+                picam2.set_controls({"ExposureValue": dynamic_ev})
+                last_ev = dynamic_ev
+            except Exception:
+                pass
+
         frame_count += 1
         isp_eval_counter += 1
 
@@ -1137,7 +1284,8 @@ def vision_thread():
             lux = metadata.get("Lux", 50.0)
             gain = metadata.get("AnalogueGain", 1.0)
 
-            if (gain > 5.0 or lux < 12.0) and not is_monochrome_mode:
+            # Widened hysteresis: Enter B&W only when genuinely dark (Lux < 10 or Gain > 12)
+            if (lux < 10.0 or gain > 12.0) and not is_monochrome_mode:
                 try:
                     picam2.set_controls({
                         "Saturation": 0.0,
@@ -1148,7 +1296,8 @@ def vision_thread():
                 except Exception:
                     pass
 
-            elif (gain <= 4.0 and lux >= 18.0) and is_monochrome_mode:
+            # Exit B&W only when clearly bright (Lux > 35) and gain has settled
+            elif (lux >= 35.0 and gain <= 4.0) and is_monochrome_mode:
                 try:
                     picam2.set_controls({
                         "Saturation": 0.85,
@@ -1294,8 +1443,12 @@ def vision_thread():
             oc_y = int(OPTICAL_CENTER[1] * SCALE_Y)
             cv2.drawMarker(annotated, (oc_x, oc_y), (0, 255, 255), cv2.MARKER_CROSS, 16, 1)
 
+            tof_hud = (math.exp(0.0128 * current_range_m) - 1.0) / (0.0128 * 85.0) if current_range_m > 0 else 0.0
+            drop_mrad_hud = (0.5 * 9.81 * (tof_hud ** 2) / current_range_m * 1000.0) if current_range_m > 0 else 0.0
+            total_tilt_adj_mrad = drop_mrad_hud + TILT_CALIBRATION_TRIM_MRAD
+
             conv_px_x = OPTICAL_CENTER[0] + int((-CAMERA_OFFSET_X_MM / (current_range_m * 1000.0)) * FOCAL_LENGTH_PX)
-            conv_px_y = OPTICAL_CENTER[1] + int((CAMERA_OFFSET_Y_MM / (current_range_m * 1000.0)) * FOCAL_LENGTH_PX)
+            conv_px_y = OPTICAL_CENTER[1] + int(((CAMERA_OFFSET_Y_MM / (current_range_m * 1000.0)) * 1000.0 - total_tilt_adj_mrad) * (FOCAL_LENGTH_PX / 1000.0))
             aim_x = int(conv_px_x * SCALE_X)
             aim_y = int(conv_px_y * SCALE_Y)
 
@@ -2080,7 +2233,19 @@ def favicon():
         return send_from_directory(STATIC_DIR, "bombardeer.ico", mimetype="image/vnd.microsoft.icon")
     return ("", 204)
 
-if __name__ == "__main__":
+# =========================================================================
+# Execution Entry Points
+# =========================================================================
+
+# 1. Global Thread Initialization (Executes under Gunicorn OR Command Line)
+# Checks if the thread is already running to prevent duplication on module reload
+if not any(t.name == "VisionThread" for t in threading.enumerate()):
     t = threading.Thread(target=vision_thread, daemon=True, name="VisionThread")
     t.start()
-    app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)
+
+# 2. Command-Line Execution Hook
+if __name__ == "__main__":
+    log.info("Starting local Flask development server. For production, use Gunicorn/systemd.")
+    # use_reloader=False is mandatory. Otherwise, Flask forks a second process 
+    # that attempts to bind to the same camera and serial port, causing a crash.
+    app.run(host="0.0.0.0", port=5000, debug=False, threaded=True, use_reloader=False)

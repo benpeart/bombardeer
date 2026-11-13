@@ -468,7 +468,7 @@ void processXboxOverride(AxisControlState &panState, AxisControlState &tiltState
 
     if (manualOverrideActive)
     {
-        updateAxisFromJoystick(panStepper, panState, rawPan, PAN_STEPPER_MAXSPEEDHZ, PAN_STEPPER_MINSPEEDHZ);
+        updateAxisFromJoystick(panStepper, panState, -rawPan, PAN_STEPPER_MAXSPEEDHZ, PAN_STEPPER_MINSPEEDHZ);
         updateAxisFromJoystick(tiltStepper, tiltState, rawTilt, TILT_STEPPER_MAXSPEEDHZ, TILT_STEPPER_MINSPEEDHZ);
 
         // Manage continuous firing during manual override
