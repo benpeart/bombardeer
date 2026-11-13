@@ -32,6 +32,7 @@ import datetime
 import threading
 import multiprocessing as mp
 from multiprocessing import shared_memory
+from multiprocessing import resource_tracker
 import signal
 import atexit
 import queue
@@ -134,6 +135,9 @@ MRAD_PER_PIXEL_Y = 1000.0 / FOCAL_LENGTH_PX
 MIN_VALID_RANGE_M = 3.0
 MAX_VALID_RANGE_M = 75.0
 DEFAULT_FALLBACK_RANGE_M = 20.0
+
+CAMERA_MOUNT_HEIGHT_M = 1.15   # Physical height of camera lens above ground (meters)
+GROUND_SLOPE_MRAD = 0.0        # Terrain slope in mrad (+ if uphill away from turret, - if downhill)
 
 # Dynamic Targeting, Hysteresis & Deadbands
 BALLISTIC_ACQUIRE_MRAD = 120.0
@@ -805,6 +809,7 @@ def _hailo_subprocess_entry(model_path, shm_name, cap_mono_val, active_flag, ava
     shm = None
     try:
         shm = shared_memory.SharedMemory(name=shm_name)
+        resource_tracker.unregister(shm._name, "shared_memory")
         shared_frame = np.ndarray((FRAME_HEIGHT, FRAME_WIDTH, 3), dtype=np.uint8, buffer=shm.buf)
 
         hef = HEF(model_path)
@@ -1320,15 +1325,16 @@ def video_recorder_worker(record_queue):
                 writer = None
                 frames_written = 0
                 current_filepath = None
+                clip_fps = float(item.get("fps", TARGET_FPS))
 
                 for tag, fourcc, ext in CODECS:
                     test_filepath = os.path.join(RECORDINGS_DIR, f"wildlife_{ts}{ext}")
                     try:
-                        cand = cv2.VideoWriter(test_filepath, fourcc, TARGET_FPS, (FRAME_WIDTH, FRAME_HEIGHT))
+                        cand = cv2.VideoWriter(test_filepath, fourcc, clip_fps, (FRAME_WIDTH, FRAME_HEIGHT))
                         if cand is not None and cand.isOpened():
                             writer = cand
                             current_filepath = test_filepath
-                            log.info(f"[RECORDER] VideoWriter opened with codec '{tag}' -> {current_filepath}")
+                            log.info(f"[RECORDER] VideoWriter opened ({clip_fps:.1f} FPS, codec '{tag}') -> {current_filepath}")
                             break
                         elif cand is not None:
                             cand.release()
@@ -1715,14 +1721,15 @@ def vision_thread():
             buffer_count=6,
             controls={
                 "AeEnable": True,
-                "HdrMode": 2,
-                "AeMeteringMode": 0,
+                "HdrMode": 2,                      # Start with HDR active for daytime dynamic range
+                "AeMeteringMode": 0,               # Centre-weighted metering
                 "AwbMode": 0,
+                "NoiseReductionMode": 2,           # High-Quality PiSP hardware denoise
                 "ExposureValue": 0.0,
-                "FrameDurationLimits": (33333, 66666),
-                "Contrast": 1.0,
-                "Saturation": 0.80,
-                "Sharpness": 1.25,
+                "FrameDurationLimits": (33333, 83333),  # 30 FPS day ceiling -> 12 FPS deep-dusk floor
+                "Contrast": 1.05,
+                "Saturation": 0.85,
+                "Sharpness": 1.15,
                 "AfMode": 0,
                 "LensPosition": 0.0
             },
@@ -1790,11 +1797,13 @@ def vision_thread():
 
         _, current_tilt_mrad, _, _ = get_instantaneous_telemetry()
 
-        dynamic_ev = 0.0
-        if current_tilt_mrad > 50:
-            dynamic_ev = 1.5
-        elif current_tilt_mrad < -100:
-            dynamic_ev = -0.5
+        # Never apply negative EV when tilted down at dark ground; boost slightly in B&W twilight
+        if current_tilt_mrad > 60:
+            dynamic_ev = 1.0
+        elif is_monochrome_mode:
+            dynamic_ev = 0.25
+        else:
+            dynamic_ev = 0.0
 
         if last_ev != dynamic_ev:
             try:
@@ -1810,21 +1819,46 @@ def vision_thread():
             isp_eval_counter = 0
             lux = metadata.get("Lux", 50.0)
             gain = metadata.get("AnalogueGain", 1.0)
+            exp_us = metadata.get("ExposureTime", 33333)
+            has_active_tgt = (get_primary_target_snapshot() is not None)
 
-            if (lux < 10.0 or gain > 12.0) and not is_monochrome_mode:
+            # Transition to # Transition to Dawn/Dusk B&W Low-Light Profile when light drops
+            if (lux < 25.0 or gain > 6.0) and not is_monochrome_mode and not has_active_tgt:
                 try:
-                    picam2.set_controls({"Saturation": 0.0, "Sharpness": 1.3})
+                    picam2.set_controls({
+                        "HdrMode": 0,          # Disable multi-exposure HDR split in low light
+                        "Saturation": 0.0,     # Collapse muddy NoIR color cast into clean monochrome
+                        "Contrast": 1.15,      # Pop deer silhouettes against twilight grass
+                        "Sharpness": 0.90,     # Soften high-gain sensor grain
+                        "ExposureValue": 0.25
+                    })
                     is_monochrome_mode = True
-                    log.info(f"[ISP] Priority 1 (Dusk/Low-Light): B&W Enhanced (Lux:{lux:.1f}, Gain:{gain:.2f})")
-                except Exception:
-                    pass
-            elif (lux >= 35.0 and gain <= 4.0) and is_monochrome_mode:
+                    last_ev = 0.25
+                    log.info(
+                        f"[ISP] Dawn/Dusk Low-Light Mode ACTIVE (HDR:OFF, B&W:ON | "
+                        f"Lux:{lux:.1f}, Gain:{gain:.1f}x, Shutter:{exp_us/1000.0:.1f}ms)"
+                    )
+                except Exception as e:
+                    log.warning(f"[ISP] Low-light control update warning: {e}")
+
+            # Hysteresis return to Daylight HDR Color Mode (Relaxed gain ceiling from 3.5x to 6.5x)
+            elif (lux >= 40.0 and gain <= 6.5) and is_monochrome_mode and not has_active_tgt:
                 try:
-                    picam2.set_controls({"Saturation": 0.85, "Sharpness": 1.15})
+                    picam2.set_controls({
+                        "HdrMode": 2,          # Re-enable SingleExposure HDR for bright daylight
+                        "Saturation": 0.85,
+                        "Contrast": 1.05,
+                        "Sharpness": 1.15,
+                        "ExposureValue": 0.0
+                    })
                     is_monochrome_mode = False
-                    log.info(f"[ISP] Priority 2/3 (Day/Indoor): Color Restored (Lux:{lux:.1f}, Gain:{gain:.2f})")
-                except Exception:
-                    pass
+                    last_ev = 0.0
+                    log.info(
+                        f"[ISP] Daylight HDR Mode RESTORED (HDR:ON, Color:ON | "
+                        f"Lux:{lux:.1f}, Gain:{gain:.1f}x, Shutter:{exp_us/1000.0:.1f}ms)"
+                    )
+                except Exception as e:
+                    log.warning(f"[ISP] Daylight control update warning: {e}")
 
         if now - fps_time >= 1.0:
             sensor_fps = frame_count / (now - fps_time)
@@ -1882,9 +1916,25 @@ def vision_thread():
         # --- Stage 3: Kalman Measurement Correction ---
         if verified_detection is not None:
             raw_cx, raw_cy = verified_detection["center"]
+            pan_at_capture, tilt_at_capture = get_turret_pos_at_time(effective_capture_mono - 0.040)
 
             if "range_m" in verified_detection:
-                last_valid_range_m = verified_detection["range_m"]
+                r_stadia = verified_detection["range_m"]
+                # Apply Ground-Plane Trigonometric Fusion when in WILDLIFE mode
+                if active_detector.name == "WILDLIFE":
+                    y_bottom = float(verified_detection["box"][3])
+                    opt_dep_mrad = math.atan2(y_bottom - OPTICAL_CENTER[1], FOCAL_LENGTH_PX) * 1000.0
+                    net_dep_mrad = opt_dep_mrad - float(tilt_at_capture) - GROUND_SLOPE_MRAD
+                    # Fuse when depression angle >= 25 mrad (~1.4 deg) and hooves aren't clipped at bottom of frame
+                    if net_dep_mrad >= 25.0 and y_bottom < (FRAME_HEIGHT - 8):
+                        r_ground = CAMERA_MOUNT_HEIGHT_M / math.sin(net_dep_mrad / 1000.0)
+                        r_fused = (0.70 * r_ground) + (0.30 * r_stadia)
+                        last_valid_range_m = float(np.clip(r_fused, MIN_VALID_RANGE_M, MAX_VALID_RANGE_M))
+                    else:
+                        last_valid_range_m = r_stadia
+                else:
+                    last_valid_range_m = r_stadia
+
             current_range_m = last_valid_range_m
 
             pan_at_capture, tilt_at_capture = get_turret_pos_at_time(effective_capture_mono - 0.040)
@@ -1916,14 +1966,22 @@ def vision_thread():
             if get_primary_target_snapshot() is None and (now - last_standby_log_time >= 2.0):
                 last_standby_log_time = now
                 p_cur, t_cur, _, _ = get_instantaneous_telemetry()
+                cur_lux = metadata.get("Lux", 0.0)
+                cur_gain = metadata.get("AnalogueGain", 1.0)
+                cur_shutter_ms = metadata.get("ExposureTime", 0) / 1000.0
+                isp_tag = "BW" if is_monochrome_mode else "HDR"
+
                 if active_detector.name == "WILDLIFE":
                     tel = active_detector.get_telemetry()
-                    npu_info = f" | NPU:{tel.get('npu_fps', 0.0):4.1f}Hz ({tel.get('npu_latency_ms', 0.0):4.0f}ms)"
+                    npu_info = f" | NPU:{tel.get('npu_fps', 0.0):4.1f}Hz({tel.get('npu_latency_ms', 0.0):3.0f}ms)"
                 else:
                     npu_info = ""
+
                 log.info(
-                    f"[STANDBY:{active_detector.name}] Scanning... | "
-                    f"CamFPS:{sensor_fps:4.1f}{npu_info} | Turret:({p_cur:+5d},{t_cur:+4d})"
+                    f"[STANDBY:{active_detector.name}] "
+                    f"Cam:{sensor_fps:4.1f}FPS({isp_tag}) | "
+                    f"Lux:{cur_lux:5.1f} Gain:{cur_gain:4.1f}x Exp:{cur_shutter_ms:4.1f}ms"
+                    f"{npu_info} | Turret:({p_cur:+5d},{t_cur:+4d})"
                 )
 
         # --- Stage 4: Video Archiving ---
@@ -1945,15 +2003,25 @@ def vision_thread():
                 is_recording = True
                 recording_start_time = now
 
+                # Match recording header FPS and pre-roll frame count to live sensor cadence
+                live_fps = float(np.clip(sensor_fps if sensor_fps >= 5.0 else TARGET_FPS, 10.0, 30.0))
+                wanted_pre_frames = min(pre_roll_count, int(round(RECORD_PRE_ROLL_SEC * live_fps)))
+
                 if pre_roll_count < PRE_ROLL_CAPACITY:
-                    saved_pre_roll = [pre_roll_pool[i].copy() for i in range(pre_roll_count)]
+                    start_i = max(0, pre_roll_count - wanted_pre_frames)
+                    saved_pre_roll = [pre_roll_pool[i].copy() for i in range(start_i, pre_roll_count)]
                 else:
+                    start_offset = PRE_ROLL_CAPACITY - wanted_pre_frames
                     saved_pre_roll = [
-                        pre_roll_pool[(pre_roll_idx + i) % PRE_ROLL_CAPACITY].copy()
-                        for i in range(PRE_ROLL_CAPACITY)
+                        pre_roll_pool[(pre_roll_idx + start_offset + i) % PRE_ROLL_CAPACITY].copy()
+                        for i in range(wanted_pre_frames)
                     ]
                 try:
-                    record_queue.put_nowait({"cmd": "start", "pre_roll": saved_pre_roll})
+                    record_queue.put_nowait({
+                        "cmd": "start",
+                        "fps": round(live_fps, 1),
+                        "pre_roll": saved_pre_roll
+                    })
                 except queue.Full:
                     pass
 
