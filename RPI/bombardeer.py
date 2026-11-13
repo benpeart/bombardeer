@@ -3,6 +3,10 @@
 Bombardeer Turret: Real-Time Dual-Mode Controller (Mission-Critical Edition)
 ----------------------------------------------------------------------------
 - Architecture:
+    * Polymorphic Perception Engine (Runtime Switchable via Web UI):
+        - ArucoTargetDetector: OpenCV sub-pixel fiducial tracker for calibration/testing.
+        - HailoWildlifeDetector: Hardware-accelerated Hailo-8 (26 TOPS) NPU running
+          MegaDetector v6 (MDV6-yolov9-c-1280.hef) with zero-copy 16:9 letterboxing.
     * Asynchronous Perception & Motion Decoupling:
         - Vision Worker: Processes frames at sensor/inference rate (15-30 Hz).
         - Motion Servoing Loop: Runs deterministically at 50 Hz (20ms ticks),
@@ -12,29 +16,24 @@ Bombardeer Turret: Real-Time Dual-Mode Controller (Mission-Critical Edition)
         - telemetry_lock: High-speed motor angles, moving flags, and history deque.
         - target_lock: Perception target state, supervisory health, and storage metrics.
         - frame_lock: Flask JPEG streaming and client tracking.
-        - mode_lock: Tri-state engagement model (OFF -> ON -> ARMED / CALIBRATE).
-    * Latency-Compensated Time-Sync Forward Projection:
-        - Projects Kalman state to the exact actuation instant, eliminating
-          hunting, overshoot, and FastAccelStepper trajectory replanning halts.
-    * 1.5-Second Continuous Dead-Reckoning Coasting:
-        - Exponential velocity decay through optical dropouts, foliage
-          occlusions, and motion blur without resetting filter momentum.
-    * Software Travel Clamping & Angular Velocity Fire Gating:
-        - Prevents driving into mechanical stops and suppresses firing during
-          high-speed slewing.
-    * Clamped Multithreading & Zero-Copy Communications:
-        - Binary UART protocol at 921,600 baud with non-blocking supervisor.
+        - mode_lock: Engagement model (OFF -> ON -> ARMED / CALIBRATE) & active detector.
 """
 
 import os
 os.environ["LIBCAMERA_LOG_LEVELS"] = "IPARPI:FATAL"
 
+import abc
 import glob
 import time
 import math
+import ctypes
 import shutil
 import datetime
 import threading
+import multiprocessing as mp
+from multiprocessing import shared_memory
+import signal
+import atexit
 import queue
 import logging
 import traceback
@@ -42,22 +41,35 @@ from collections import deque
 import numpy as np
 import cv2
 import serial
-import subprocess
 from flask import Flask, Response, render_template_string, jsonify, request, send_from_directory
 
 from picamera2 import Picamera2
 from libcamera import Transform
 
+# Optional Hardware NPU Import (Graceful Fallback if HailoRT is absent)
+try:
+    from hailo_platform import (
+        HEF,
+        VDevice,
+        ConfigureParams,
+        InferVStreams,
+        InputVStreamParams,
+        OutputVStreamParams,
+        FormatType,
+        HailoStreamInterface,
+    )
+    HAILO_AVAILABLE = True
+except ImportError:
+    HAILO_AVAILABLE = False
+
 # -------------------------------------------------------------------------
 # OpenCV Deterministic Core Clamping
 # -------------------------------------------------------------------------
-# Clamp OpenCV to 2 worker threads on physical cores 0 & 1, leaving cores
-# 2 & 3 dedicated to the 50 Hz motion servo, UART I/O, and PiSP DMA interrupts.
 cv2.setNumThreads(2)
 cv2.ocl.setUseOpenCL(False)
 
 # =========================================================================
-# Structured Logging Setup
+# Structured Logging & OS Helpers
 # =========================================================================
 
 logging.basicConfig(
@@ -66,6 +78,19 @@ logging.basicConfig(
     datefmt="%H:%M:%S"
 )
 log = logging.getLogger("Bombardeer")
+
+def set_os_thread_name(name: str, cpu_cores: list = None):
+    """Sets the Linux OS-level thread name visible in ps, top, and htop and pins CPU core affinity on the Raspberry Pi 5."""
+    try:
+        libc = ctypes.CDLL("libc.so.6")
+        libc.prctl(15, name[:15].encode("utf-8"), 0, 0, 0)
+    except Exception:
+        pass
+    if cpu_cores is not None:
+        try:
+            os.sched_setaffinity(0, set(cpu_cores))
+        except Exception:
+            pass
 
 # =========================================================================
 # Configuration & Hardware Calibration
@@ -106,18 +131,18 @@ FOCAL_LENGTH_PX = 540.4
 MRAD_PER_PIXEL_X = 1000.0 / FOCAL_LENGTH_PX
 MRAD_PER_PIXEL_Y = 1000.0 / FOCAL_LENGTH_PX
 
-ARUCO_REAL_WIDTH_MM = 365.0
 MIN_VALID_RANGE_M = 3.0
 MAX_VALID_RANGE_M = 75.0
+DEFAULT_FALLBACK_RANGE_M = 20.0
 
 # Dynamic Targeting, Hysteresis & Deadbands
-BALLISTIC_ACQUIRE_MRAD = 120.0     # Snap-to-target threshold from rest
-BALLISTIC_ABORT_MRAD = 260.0       # Only abort velocity mode if target exceeds 260mrad
-VELOCITY_DEADBAND_MRAD = 4.0       # Coast to standstill inside this error radius
-FIRE_DEADBAND_MRAD = 40.0          # Permissive firing engagement radius
-MAX_FIRE_SLEW_SPEED_MRAD_S = 180.0 # Suppress firing if turret is slewing faster than this
-MOTION_LOOP_INTERVAL_SEC = 0.020   # 50 Hz deterministic motion servo loop
-SETPOINT_MIN_INTERVAL_SEC = 0.040  # 25 Hz maximum UART transmission rate
+BALLISTIC_ACQUIRE_MRAD = 120.0
+BALLISTIC_ABORT_MRAD = 260.0
+VELOCITY_DEADBAND_MRAD = 4.0
+FIRE_DEADBAND_MRAD = 40.0
+MAX_FIRE_SLEW_SPEED_MRAD_S = 180.0
+MOTION_LOOP_INTERVAL_SEC = 0.020
+SETPOINT_MIN_INTERVAL_SEC = 0.040
 
 # Software Travel Limits (Physical Axis Protection)
 TILT_MIN_MRAD = -420
@@ -128,12 +153,11 @@ PAN_MAX_MRAD = 3141
 MAX_TRIGGER_DURATION_SEC = 2.0
 TRIGGER_COOLDOWN_SEC = 1.5
 
-TARGET_MARKER_ID = 0
 CONFIRMATION_FRAMES = 2
 
 # Persistence & Coasting Horizons
-COAST_MAX_HORIZON_SEC = 1.500      # Track through occlusions up to 1.5s
-COAST_EXP_DECAY_RATE = 2.5         # Exponential velocity decay factor after 350ms
+COAST_MAX_HORIZON_SEC = 1.500
+COAST_EXP_DECAY_RATE = 2.5
 
 DEFAULT_SERIAL_PORTS = ["/dev/ttyUSB0", "/dev/ttyACM0", "/dev/ttyUSB1"]
 BAUD_RATE = 921600
@@ -156,10 +180,11 @@ STREAM_PART_FOOTER = b"\r\n"
 # =========================================================================
 app = Flask(__name__)
 
-# Lock 0: Operational Engagement (OFF, ON, ARMED, CALIBRATE)
+# Lock 0: Operational Engagement & Active Perception Strategy
 mode_lock = threading.Lock()
-turret_mode = "OFF"       # Power-on state is always disarmed and inert
-calibrate_primed = False  # Single-shot authorization token for calibration
+turret_mode = "OFF"             # OFF, ON, ARMED, CALIBRATE
+calibrate_primed = False        # Single-shot authorization token
+active_detector_type = "ARUCO"  # "ARUCO" or "WILDLIFE"
 
 def get_turret_mode():
     with mode_lock:
@@ -172,12 +197,11 @@ def set_turret_mode(new_mode, primed=None):
         if primed is not None:
             calibrate_primed = primed
         elif new_mode == "CALIBRATE":
-            calibrate_primed = True  # Auto-prime on entering calibration mode
+            calibrate_primed = True
         elif new_mode in ("OFF", "ON"):
             calibrate_primed = False
 
 def consume_calibration_prime():
-    """Atomically consumes the single-shot calibration authorization token."""
     global calibrate_primed
     with mode_lock:
         if calibrate_primed:
@@ -185,10 +209,20 @@ def consume_calibration_prime():
             return True
         return False
 
+def get_active_detector_type():
+    with mode_lock:
+        return active_detector_type
+
+def set_active_detector_type(det_type: str):
+    global active_detector_type
+    with mode_lock:
+        active_detector_type = det_type
+
 # Lock 1: Web Streaming Buffer and Client Counter
 frame_lock = threading.Lock()
 latest_jpeg = None
 active_web_clients = 0
+app_shutting_down = threading.Event()
 
 # Lock 2: Real-Time High-Speed Hardware Telemetry Plane
 telemetry_lock = threading.Lock()
@@ -212,9 +246,22 @@ system_health = {
     "last_alert": None,
     "alert_time": 0.0,
     "free_disk_gb": 0.0,
+    "hailo_available": False,
+    "npu_fps": 0.0,
+    "npu_latency_ms": 0.0,
 }
 
 global_turret_queue = None
+global_target_filter = None
+global_wildlife_detector = None
+
+def is_hailo_npu_ready() -> bool:
+    """Reads the live cross-process shared-memory availability flag from the NPU subprocess."""
+    global global_wildlife_detector
+    if global_wildlife_detector is not None:
+        return global_wildlife_detector.is_available
+    with target_lock:
+        return system_health["hailo_available"]
 
 def set_alert(message, duration=3.0):
     with target_lock:
@@ -229,11 +276,9 @@ def clear_queue(q):
     except Exception:
         pass
 
-
-# --- Atomic Telemetry Accessors (telemetry_lock) ---
+# --- Atomic Telemetry Accessors ---
 
 def update_turret_telemetry(pan, tilt, moving, rx_mono_time):
-    """Atomic update called exclusively by turret_serial_worker."""
     with telemetry_lock:
         turret_telemetry["pan_mrad"] = pan
         turret_telemetry["tilt_mrad"] = tilt
@@ -245,7 +290,6 @@ def set_firing_state(firing):
         turret_telemetry["is_firing"] = firing
 
 def get_instantaneous_telemetry():
-    """Ultra-fast lock acquisition for the 50 Hz motion servo."""
     with telemetry_lock:
         return (
             turret_telemetry["pan_mrad"],
@@ -255,7 +299,6 @@ def get_instantaneous_telemetry():
         )
 
 def get_turret_pos_at_time(target_mono_sec):
-    """Interpolates historical position under telemetry_lock without blocking target updates."""
     with telemetry_lock:
         hist_len = len(telemetry_history)
         if hist_len == 0:
@@ -281,8 +324,7 @@ def get_turret_pos_at_time(target_mono_sec):
 
         return turret_telemetry["pan_mrad"], turret_telemetry["tilt_mrad"]
 
-
-# --- Atomic Target Accessors (target_lock) ---
+# --- Atomic Target Accessors ---
 
 def get_primary_target_snapshot():
     with target_lock:
@@ -310,7 +352,6 @@ def set_serial_connected(status):
 # Thread-Safe World-Space Kalman Filter (State: Pan, Tilt, vPan, vTilt)
 # =========================================================================
 class TargetKalmanFilter:
-    """Thread-safe Kalman Filter supporting continuous multi-rate predict and correct."""
     def __init__(self, process_noise=35.0, measurement_noise=10.0):
         self.lock = threading.Lock()
         self.kf = cv2.KalmanFilter(4, 2)
@@ -333,10 +374,8 @@ class TargetKalmanFilter:
             self.last_update_time = None
 
     def update_measurement(self, measured_pan, measured_tilt, current_time):
-        """Asynchronous measurement correction step invoked by perception thread."""
         with self.lock:
             if not self.is_initialized:
-                # Explicitly wipe all states and covariances
                 self.kf.statePre = np.array([[float(measured_pan)], [float(measured_tilt)], [0.0], [0.0]], dtype=np.float32)
                 self.kf.statePost = np.array([[float(measured_pan)], [float(measured_tilt)], [0.0], [0.0]], dtype=np.float32)
                 self.kf.errorCovPre = np.eye(4, dtype=np.float32) * 50.0
@@ -363,7 +402,6 @@ class TargetKalmanFilter:
             )
 
     def predict_state(self, current_time):
-        """Continuous state projection step invoked by 50 Hz motion servo thread."""
         with self.lock:
             if not self.is_initialized or self.last_update_time is None:
                 return None
@@ -382,54 +420,89 @@ class TargetKalmanFilter:
                 float(predicted[3, 0])
             )
 
-import ctypes
+# =========================================================================
+# Polymorphic Perception Architecture (Strategy Pattern)
+# =========================================================================
 
-def set_os_thread_name(name: str):
-    """Sets the Linux OS-level task/thread name visible in ps, top, and htop."""
-    try:
-        libc = ctypes.CDLL("libc.so.6")
-        # PR_SET_NAME = 15; name is truncated to 16 bytes by the Linux kernel
-        libc.prctl(15, name[:15].encode("utf-8"), 0, 0, 0)
-    except Exception:
+class BaseTargetDetector(abc.ABC):
+    """
+    Abstract Base Interface for all Bombardeer target perception engines.
+    Guarantees a uniform return schema and lifecycle across optical and NPU models.
+    """
+    @property
+    @abc.abstractmethod
+    def name(self) -> str:
         pass
 
-# =========================================================================
-# Perception Layer (ArUco / Drop-in Interface for Future ML Models)
-# =========================================================================
-class ArucoTargetDetector:
-    def __init__(self, target_id=TARGET_MARKER_ID):
-        self.target_id = target_id
+    @property
+    @abc.abstractmethod
+    def is_available(self) -> bool:
+        pass
+
+    @abc.abstractmethod
+    def detect(self, frame_bgr: np.ndarray, capture_mono_time: float):
+        """
+        Processes a 1280x720 BGR/RGB frame and returns:
+            (detections_list, effective_capture_mono_time)
+        Each item in detections_list follows:
+            {
+                "box": [x1, y1, x2, y2],   # 1280x720 coordinate space
+                "center": (cx, cy),        # 1280x720 coordinate space
+                "score": float,
+                "area": float,
+                "range_m": float,
+                "id": int,
+                "label": str
+            }
+        """
+        pass
+
+    def get_telemetry(self) -> dict:
+        return {}
+
+
+class ArucoTargetDetector(BaseTargetDetector):
+    """
+    Encapsulated ArUco Fiducial Detector for precision calibration and range testing.
+    All ArUco-specific physical dimensions and thresholds are isolated inside this class.
+    """
+    ARUCO_REAL_WIDTH_MM = 365.0
+    TARGET_MARKER_ID = 0
+    MIN_EDGE_PX = 8.0
+
+    def __init__(self, target_id=None, marker_width_mm=None):
+        self.target_id = self.TARGET_MARKER_ID if target_id is None else target_id
+        self.marker_width_mm = self.ARUCO_REAL_WIDTH_MM if marker_width_mm is None else marker_width_mm
+
         self.dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
         self.parameters = cv2.aruco.DetectorParameters()
         self.parameters.errorCorrectionRate = 0.55
-
-        # Sub-pixel corner refinement & adaptive windowing for small, distant markers
         self.parameters.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
         self.parameters.adaptiveThreshWinSizeMin = 3
-        # Reduced max window size slightly to speed up ArUco's internal thresholding
-        self.parameters.adaptiveThreshWinSizeMax = 19 
+        self.parameters.adaptiveThreshWinSizeMax = 19
         self.parameters.adaptiveThreshWinSizeStep = 4
 
         self.detector = cv2.aruco.ArucoDetector(self.dictionary, self.parameters)
-        
-        # Pre-compute Gamma LUT (Gamma < 1.0 brightens shadows)
-        gamma = 0.6 
+
+        # Pre-compute Gamma LUT (Gamma < 1.0 lifts shadows with zero CPU penalty)
+        gamma = 0.6
         inv_gamma = 1.0 / gamma
-        self.gamma_lut = np.array([((i / 255.0) ** inv_gamma) * 255 
-                                  for i in np.arange(0, 256)]).astype("uint8")
+        self.gamma_lut = np.array([
+            ((i / 255.0) ** inv_gamma) * 255 for i in np.arange(0, 256)
+        ]).astype("uint8")
 
-        # NOTE: CLAHE has been completely removed to unlock 30 FPS processing.
-        # Hardware HDR and the Gamma LUT handle dynamic range natively.
+    @property
+    def name(self) -> str:
+        return "ARUCO"
 
-    def detect(self, frame_bgr):
+    @property
+    def is_available(self) -> bool:
+        return True
+
+    def detect(self, frame_bgr: np.ndarray, capture_mono_time: float):
         try:
-            # 1. Lift shadows globally via LUT (Zero CPU penalty)
-            frame_bgr = cv2.LUT(frame_bgr, self.gamma_lut)
-            
-            # 2. Convert to grayscale (Fastest format for ArUco)
-            gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-            
-            # 3. Detect directly on the LUT-adjusted grayscale frame
+            lifted = cv2.LUT(frame_bgr, self.gamma_lut)
+            gray = cv2.cvtColor(lifted, cv2.COLOR_BGR2GRAY)
             corners, ids, _ = self.detector.detectMarkers(gray)
             detections = []
 
@@ -442,8 +515,7 @@ class ArucoTargetDetector:
                     d01 = math.hypot(pts[0][0] - pts[1][0], pts[0][1] - pts[1][1])
                     d12 = math.hypot(pts[1][0] - pts[2][0], pts[1][1] - pts[2][1])
 
-                    # Reject markers smaller than 8 pixels
-                    if d01 < 8 or d12 < 8:
+                    if d01 < self.MIN_EDGE_PX or d12 < self.MIN_EDGE_PX:
                         continue
 
                     ratio = d01 / max(1.0, d12)
@@ -459,21 +531,510 @@ class ArucoTargetDetector:
                     area = float(cv2.contourArea(pts.astype(np.float32)))
 
                     marker_px = max(1.0, (d01 + d12) / 2.0)
-                    estimated_range_m = (ARUCO_REAL_WIDTH_MM * FOCAL_LENGTH_PX) / (marker_px * 1000.0)
+                    estimated_range_m = (self.marker_width_mm * FOCAL_LENGTH_PX) / (marker_px * 1000.0)
+                    clamped_range_m = float(np.clip(estimated_range_m, MIN_VALID_RANGE_M, MAX_VALID_RANGE_M))
 
                     detections.append({
                         "box": [x1, y1, x2, y2],
                         "center": (cx, cy),
                         "score": 0.99,
                         "area": area,
-                        "range_m": float(np.clip(estimated_range_m, MIN_VALID_RANGE_M, MAX_VALID_RANGE_M)),
-                        "id": int(marker_id)
+                        "range_m": clamped_range_m,
+                        "id": int(marker_id),
+                        "label": f"ID:{int(marker_id)}"
                     })
 
-            return detections
+                # Sort largest/closest marker first
+                detections.sort(key=lambda d: d["area"], reverse=True)
+
+            return detections, capture_mono_time
         except Exception as e:
-            log.error(f"[DETECTOR ERROR] Vision parsing failed: {e}")
+            log.error(f"[ARUCO DETECTOR ERROR] Vision parsing failed: {e}")
+            return [], capture_mono_time
+
+class MDV6Decoder1280:
+    """
+    Zero-Allocation Quantized MegaDetector v6 (YOLOv9-c 1280x1280) Post-Processor.
+     Classes in MDV6:
+        0: animal
+        1: person
+        2: vehicle
+    Enforces strict class dominance (animal > person & vehicle) AND a spatial
+    human-exclusion veto so the turret never tracks or fires at a person.
+    """
+    CLASS_LAYERS = ("MDV6-yolov9-c/conv100", "MDV6-yolov9-c/conv122", "MDV6-yolov9-c/conv144")
+    BOX_LAYERS = ("MDV6-yolov9-c/conv98", "MDV6-yolov9-c/conv121", "MDV6-yolov9-c/conv143")
+
+    def __init__(self, hef, input_size=1280, y_pad_offset=280, conf_thresh=0.38, iou_thresh=0.45, person_veto_thresh=0.25):
+        self.input_size = input_size
+        self.y_pad_offset = y_pad_offset
+        self.conf_thresh = conf_thresh
+        self.iou_thresh = iou_thresh
+        self.person_veto_thresh = person_veto_thresh
+        self.strides = (8, 16, 32)
+        self.reg_max = 16
+        self.project = np.arange(self.reg_max, dtype=np.float32)
+
+        # Logit thresholds: sigmoid(x) > p  <=>  x > -ln(1/p - 1)
+        self.logit_thresh = -math.log((1.0 / self.conf_thresh) - 1.0)
+        self.person_logit_thresh = -math.log((1.0 / self.person_veto_thresh) - 1.0)
+
+        # Pre-compute per-stride anchor grids
+        self.head_anchors = []
+        for stride in self.strides:
+            grid_size = self.input_size // stride
+            grid_y, grid_x = np.meshgrid(
+                np.arange(grid_size, dtype=np.float32),
+                np.arange(grid_size, dtype=np.float32),
+                indexing="ij",
+            )
+            anchor = np.stack((grid_x + 0.5, grid_y + 0.5), axis=-1) * stride
+            self.head_anchors.append(anchor.reshape(-1, 2))
+
+        # Extract hardware quantization parameters (qp_scale, qp_zp) from HEF vstream infos
+        self.quant_params = {}
+        self.u8_animal_thresholds = {}
+        self.u8_person_thresholds = {}
+        try:
+            for vinfo in hef.get_output_vstream_infos():
+                qp = vinfo.quant_info
+                scale = float(qp.qp_scale)
+                zp = float(qp.qp_zp)
+                self.quant_params[vinfo.name] = (scale, zp)
+                if vinfo.name in self.CLASS_LAYERS:
+                    raw_anim_u8 = math.ceil((self.logit_thresh / scale) + zp)
+                    raw_pers_u8 = math.ceil((self.person_logit_thresh / scale) + zp)
+                    self.u8_animal_thresholds[vinfo.name] = int(max(0, min(255, raw_anim_u8)))
+                    self.u8_person_thresholds[vinfo.name] = int(max(0, min(255, raw_pers_u8)))
+            self.use_uint8_fastpath = (len(self.u8_animal_thresholds) == 3)
+        except Exception as e:
+            log.warning(f"[HAILO] Quantization metadata unavailable ({e}); using float32 fallback.")
+            self.use_uint8_fastpath = False
+
+    @staticmethod
+    def _softmax(x, axis=-1):
+        e_x = np.exp(x - np.max(x, axis=axis, keepdims=True))
+        return e_x / np.sum(e_x, axis=axis, keepdims=True)
+
+    @staticmethod
+    def _overlaps_person(anim_box, person_boxes, iou_limit=0.10):
+        """Returns True if anim_box [x1, y1, x2, y2] overlaps or sits inside any person_box."""
+        ax1, ay1, ax2, ay2 = anim_box
+        a_area = max(1.0, float((ax2 - ax1) * (ay2 - ay1)))
+        for px1, py1, px2, py2 in person_boxes:
+            ix1 = max(ax1, px1)
+            iy1 = max(ay1, py1)
+            ix2 = min(ax2, px2)
+            iy2 = min(ay2, py2)
+            if ix2 > ix1 and iy2 > iy1:
+                inter = float((ix2 - ix1) * (iy2 - iy1))
+                p_area = max(1.0, float((px2 - px1) * (py2 - py1)))
+                # Veto if IoU > 10% OR if >= 25% of the animal box is inside the person box
+                if (inter / (a_area + p_area - inter)) > iou_limit or (inter / a_area) > 0.25:
+                    return True
+        return False
+
+    def decode(self, raw_outputs, assumed_height_mm):
+        cand_scores_list = []
+        cand_boxes_list = []
+        cand_anchors_list = []
+        cand_scales_list = []
+        cand_classes_list = []  # 0 = animal, 1 = person
+
+        for idx, stride in enumerate(self.strides):
+            cls_name = self.CLASS_LAYERS[idx]
+            box_name = self.BOX_LAYERS[idx]
+
+            cls_tensor = raw_outputs[cls_name].reshape(-1, 3)
+            animal_col = cls_tensor[:, 0]
+            person_col = cls_tensor[:, 1]
+            vehicle_col = cls_tensor[:, 2]
+
+            if self.use_uint8_fastpath and cls_tensor.dtype == np.uint8:
+                u8_anim_t = self.u8_animal_thresholds[cls_name]
+                u8_pers_t = self.u8_person_thresholds[cls_name]
+
+                # Fast C-level filter: keep anchors that are EITHER a candidate animal OR a person
+                # Since scale/zp are shared across all 3 channels of the same conv head,
+                # direct uint8 comparison (animal_col > person_col) is mathematically exact!
+                anim_mask = (animal_col >= u8_anim_t) & (animal_col > person_col) & (animal_col > vehicle_col)
+                pers_mask = (person_col >= u8_pers_t) & (person_col >= animal_col)
+                combined_mask = anim_mask | pers_mask
+                if not np.any(combined_mask):
+                    continue
+
+                valid_indices = np.flatnonzero(combined_mask)
+                c_scale, c_zp = self.quant_params[cls_name]
+                sub_cls_f32 = (cls_tensor[valid_indices].astype(np.float32) - c_zp) * c_scale
+
+                b_scale, b_zp = self.quant_params[box_name]
+                raw_box_u8 = raw_outputs[box_name].reshape(-1, 4, self.reg_max)[valid_indices]
+                raw_boxes = (raw_box_u8.astype(np.float32) - b_zp) * b_scale
+            else:
+                anim_mask = (animal_col > self.logit_thresh) & (animal_col > person_col) & (animal_col > vehicle_col)
+                pers_mask = (person_col > self.person_logit_thresh) & (person_col >= animal_col)
+                combined_mask = anim_mask | pers_mask
+                if not np.any(combined_mask):
+                    continue
+
+                valid_indices = np.flatnonzero(combined_mask)
+                sub_cls_f32 = cls_tensor[valid_indices]
+                raw_boxes = raw_outputs[box_name].reshape(-1, 4, self.reg_max)[valid_indices]
+
+            # Compute exact sigmoid probabilities on surviving candidates
+            probs = 1.0 / (1.0 + np.exp(-sub_cls_f32))
+            p_anim = probs[:, 0]
+            p_pers = probs[:, 1]
+            p_veh = probs[:, 2]
+
+            # Class 1 (Person) candidates for spatial safety veto
+            is_person = (p_pers >= self.person_veto_thresh) & (p_pers >= p_anim)
+            # Class 0 (Animal) candidates: must exceed conf_thresh AND beat person/vehicle by at least 0.15 margin
+            is_animal = (
+                (p_anim >= self.conf_thresh)
+                & (p_anim > (p_pers + 0.15))
+                & (p_anim > (p_veh + 0.15))
+            )
+
+            keep = is_animal | is_person
+            if not np.any(keep):
+                continue
+
+            keep_idx = np.flatnonzero(keep)
+            final_indices = valid_indices[keep_idx]
+            cls_ids = np.where(is_person[keep_idx], 1, 0)
+            scores = np.where(cls_ids == 1, p_pers[keep_idx], p_anim[keep_idx])
+
+            cand_scores_list.append(scores)
+            cand_boxes_list.append(raw_boxes[keep_idx])
+            cand_anchors_list.append(self.head_anchors[idx][final_indices])
+            cand_scales_list.append(np.full(len(final_indices), stride, dtype=np.float32))
+            cand_classes_list.append(cls_ids)
+
+        if not cand_scores_list:
             return []
+
+        cand_scores = np.concatenate(cand_scores_list)
+        cand_boxes = np.vstack(cand_boxes_list)
+        cand_anchors = np.vstack(cand_anchors_list)
+        cand_scales = np.concatenate(cand_scales_list)
+        cand_classes = np.concatenate(cand_classes_list)
+
+        dist = self._softmax(cand_boxes, axis=-1)
+        ltrb = np.dot(dist, self.project) * cand_scales[:, None]
+
+        x1 = np.clip(cand_anchors[:, 0] - ltrb[:, 0], 0, FRAME_WIDTH)
+        y1 = np.clip(cand_anchors[:, 1] - ltrb[:, 1] - self.y_pad_offset, 0, FRAME_HEIGHT)
+        x2 = np.clip(cand_anchors[:, 0] + ltrb[:, 2], 0, FRAME_WIDTH)
+        y2 = np.clip(cand_anchors[:, 1] + ltrb[:, 3] - self.y_pad_offset, 0, FRAME_HEIGHT)
+
+        w = x2 - x1
+        h = y2 - y1
+
+        # Separate decoded boxes into Person Veto Zones vs. Animal Candidates
+        person_boxes = []
+        anim_cv_boxes = []
+        anim_scores = []
+
+        for i in range(len(cand_scores)):
+            bw_i = int(w[i])
+            bh_i = int(h[i])
+            if bw_i < 8 or bh_i < 8:
+                continue
+            bx_i = int(x1[i])
+            by_i = int(y1[i])
+            if cand_classes[i] == 1:
+                person_boxes.append((bx_i, by_i, bx_i + bw_i, by_i + bh_i))
+            else:
+                anim_cv_boxes.append([bx_i, by_i, bw_i, bh_i])
+                anim_scores.append(float(cand_scores[i]))
+
+        if not anim_cv_boxes:
+            return []
+
+        indices = cv2.dnn.NMSBoxes(anim_cv_boxes, anim_scores, self.conf_thresh, self.iou_thresh)
+
+        detections = []
+        if len(indices) > 0:
+            for idx in indices.flatten():
+                bx, by, bw, bh = anim_cv_boxes[idx]
+                box_xyxy = [bx, by, bx + bw, by + bh]
+
+                # Spatial Veto: Discard any "animal" box that overlaps a detected human
+                if person_boxes and self._overlaps_person(box_xyxy, person_boxes):
+                    continue
+
+                score = anim_scores[idx]
+                cx = bx + (bw / 2.0)
+                cy = by + (bh * 0.60)
+                area = float(bw * bh)
+
+                est_range_m = (assumed_height_mm * FOCAL_LENGTH_PX) / (max(12.0, float(bh)) * 1000.0)
+                clamped_range_m = float(np.clip(est_range_m, MIN_VALID_RANGE_M, MAX_VALID_RANGE_M))
+
+                detections.append({
+                    "box": box_xyxy,
+                    "center": (cx, cy),
+                    "score": score,
+                    "area": area,
+                    "range_m": clamped_range_m,
+                    "id": 1,
+                    "label": f"ANIMAL {score*100:.0f}%"
+                })
+
+            detections.sort(key=lambda d: (d["score"], d["area"]), reverse=True)
+
+        return detections
+
+def _hailo_subprocess_entry(model_path, shm_name, cap_mono_val, active_flag, avail_flag, stop_flag, conn_tx):
+    """
+    Isolated OS Process for Hailo-8 PCIe DMA Inference.
+    Runs in its own Python interpreter with its own GIL so InferVStreams.infer()
+    never pauses the 30 FPS camera thread or 50 Hz motion servo loop.
+    Handles SIGTERM/SIGINT cleanly so systemd stops in < 0.5 seconds.
+    """
+    set_os_thread_name("HailoNPUProc", cpu_cores=[2])
+
+    # Catch SIGTERM/SIGINT from systemd and flip stop_flag to exit context managers cleanly
+    def _sig_handler(signum, frame):
+        stop_flag.value = 1
+
+    signal.signal(signal.SIGTERM, _sig_handler)
+    signal.signal(signal.SIGINT, _sig_handler)
+
+    shm = None
+    try:
+        shm = shared_memory.SharedMemory(name=shm_name)
+        shared_frame = np.ndarray((FRAME_HEIGHT, FRAME_WIDTH, 3), dtype=np.uint8, buffer=shm.buf)
+
+        hef = HEF(model_path)
+        decoder = MDV6Decoder1280(
+            hef=hef,
+            input_size=HailoWildlifeDetector.INFER_SIZE,
+            y_pad_offset=HailoWildlifeDetector.Y_PAD_OFFSET,
+            conf_thresh=HailoWildlifeDetector.CONF_THRESH,
+            iou_thresh=HailoWildlifeDetector.IOU_THRESH
+        )
+
+        params = VDevice.create_params()
+        with VDevice(params) as target:
+            configure_params = ConfigureParams.create_from_hef(
+                hef, interface=HailoStreamInterface.PCIe
+            )
+            network_group = target.configure(hef, configure_params)[0]
+            network_group_params = network_group.create_params()
+
+            input_vparams = InputVStreamParams.make(
+                network_group, quantized=True, format_type=FormatType.UINT8
+            )
+            out_fmt = FormatType.UINT8 if decoder.use_uint8_fastpath else FormatType.FLOAT32
+            output_vparams = OutputVStreamParams.make(
+                network_group, quantized=decoder.use_uint8_fastpath, format_type=out_fmt
+            )
+            input_name = hef.get_input_vstream_infos()[0].name
+
+            letterbox_tensor = np.zeros(
+                (1, HailoWildlifeDetector.INFER_SIZE, HailoWildlifeDetector.INFER_SIZE, 3),
+                dtype=np.uint8
+            )
+            y_off = HailoWildlifeDetector.Y_PAD_OFFSET
+            letterbox_roi = letterbox_tensor[0, y_off:y_off + FRAME_HEIGHT, :, :]
+
+            with network_group.activate(network_group_params):
+                with InferVStreams(network_group, input_vparams, output_vparams) as pipeline:
+                    avail_flag.value = 1
+                    log.info(
+                        f"[HAILO NPU PROCESS] Isolated PID:{os.getpid()} active "
+                        f"({'UINT8 FastPath' if decoder.use_uint8_fastpath else 'FLOAT32'}): {model_path}"
+                    )
+
+                    last_cap_seen = 0.0
+                    last_fps_time = time.time()
+                    frames_processed = 0
+                    cur_fps = 0.0
+
+                    # Exit immediately when stop_flag is set or parent process dies (ppid == 1)
+                    while stop_flag.value == 0 and os.getppid() != 1:
+                        if active_flag.value == 0:
+                            time.sleep(0.05)
+                            continue
+
+                        cap_mono = cap_mono_val.value
+                        if cap_mono <= last_cap_seen:
+                            time.sleep(0.002)
+                            continue
+
+                        last_cap_seen = cap_mono
+                        t0 = time.perf_counter()
+
+                        cv2.cvtColor(shared_frame, cv2.COLOR_BGR2RGB, dst=letterbox_roi)
+
+                        raw_outputs = pipeline.infer({input_name: letterbox_tensor})
+                        dets = decoder.decode(raw_outputs, HailoWildlifeDetector.ASSUMED_TARGET_HEIGHT_MM)
+                        dt_ms = (time.perf_counter() - t0) * 1000.0
+
+                        frames_processed += 1
+                        now = time.time()
+                        elapsed = now - last_fps_time
+                        if elapsed >= 1.0:
+                            cur_fps = frames_processed / elapsed
+                            frames_processed = 0
+                            last_fps_time = now
+
+                        try:
+                            conn_tx.send((dets, cap_mono, dt_ms, cur_fps))
+                        except (BrokenPipeError, EOFError, OSError):
+                            break
+
+    except Exception as e:
+        if stop_flag.value == 0:
+            log.error(f"[HAILO SUBPROCESS FATAL] {e}\n{traceback.format_exc()}")
+    finally:
+        avail_flag.value = 0
+        if shm is not None:
+            try:
+                shm.close()
+            except Exception:
+                pass
+        log.info(f"[HAILO NPU PROCESS] PID:{os.getpid()} shut down cleanly.")
+
+class HailoWildlifeDetector(BaseTargetDetector):
+    """
+    Process-Isolated Hailo-8 (26 TOPS) Wildlife Detector.
+    Uses POSIX SharedMemory so the NPU runs in a separate OS process with zero
+    GIL contention against VisionMain (30 FPS) and MotionServo (50 Hz).
+    """
+    INFER_SIZE = 1280
+    Y_PAD_OFFSET = (INFER_SIZE - FRAME_HEIGHT) // 2
+    CONF_THRESH = 0.38
+    IOU_THRESH = 0.45
+    ASSUMED_TARGET_HEIGHT_MM = 950.0
+
+    CANDIDATE_PATHS = [
+        os.path.join(BASE_DIR, "MDV6-yolov9-c-1280.hef"),
+        os.path.join(BASE_DIR, "models", "MDV6-yolov9-c-1280.hef"),
+        "/home/ben/Bombardeer/MDV6-yolov9-c-1280.hef",
+        "/home/ben/Bombardeer/models/MDV6-yolov9-c-1280.hef",
+        "/home/ben/bombardeer/MDV6-yolov9-c-1280.hef",
+        "/home/ben/bombardeer/models/MDV6-yolov9-c-1280.hef",
+    ]
+    
+    def shutdown(self):
+        """Signals the NPU subprocess to exit cleanly and unlinks POSIX shared memory."""
+        try:
+            if hasattr(self, "_stop_flag") and self._stop_flag is not None:
+                self._stop_flag.value = 1
+            if hasattr(self, "_proc") and self._proc is not None and self._proc.is_alive():
+                self._proc.join(timeout=1.0)
+                if self._proc.is_alive():
+                    self._proc.terminate()
+            if hasattr(self, "_shm") and self._shm is not None:
+                self._shm.close()
+                self._shm.unlink()
+        except Exception:
+            pass
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._latest_detections = []
+        self._latest_capture_mono = 0.0
+        self._npu_latency_ms = 0.0
+        self._npu_fps = 0.0
+
+        self.model_path = next((p for p in self.CANDIDATE_PATHS if os.path.exists(p)), None)
+        if not HAILO_AVAILABLE or not self.model_path:
+            log.warning("[HAILO] HailoRT or HEF model unavailable.")
+            self._avail_flag = None
+            return
+
+        ctx = mp.get_context("fork")
+        frame_bytes = FRAME_HEIGHT * FRAME_WIDTH * 3
+        self._shm = shared_memory.SharedMemory(create=True, size=frame_bytes)
+        self._shm_array = np.ndarray((FRAME_HEIGHT, FRAME_WIDTH, 3), dtype=np.uint8, buffer=self._shm.buf)
+
+        self._cap_mono_val = ctx.Value("d", 0.0, lock=False)
+        self._active_flag = ctx.Value("i", 0, lock=False)
+        self._avail_flag = ctx.Value("i", 0, lock=False)
+        self._stop_flag = ctx.Value("i", 0, lock=False)
+        self._conn_rx, conn_tx = ctx.Pipe(duplex=False)
+
+        self._proc = ctx.Process(
+            target=_hailo_subprocess_entry,
+            args=(
+                self.model_path,
+                self._shm.name,
+                self._cap_mono_val,
+                self._active_flag,
+                self._avail_flag,
+                self._stop_flag,
+                conn_tx
+            ),
+            daemon=True,
+            name="HailoNPUProcess"
+        )
+        self._proc.start()
+        atexit.register(self.shutdown)
+
+    @property
+    def name(self) -> str:
+        return "WILDLIFE"
+
+    @property
+    def is_available(self) -> bool:
+        if self._avail_flag is None:
+            return False
+        is_ok = (self._avail_flag.value == 1)
+        with target_lock:
+            system_health["hailo_available"] = is_ok
+        return is_ok
+
+    def set_active(self, active: bool):
+        if self._avail_flag is None:
+            return
+        self._active_flag.value = 1 if active else 0
+        if not active:
+            with self._lock:
+                self._latest_detections = []
+                self._npu_fps = 0.0
+
+    def get_telemetry(self) -> dict:
+        with self._lock:
+            return {
+                "npu_fps": self._npu_fps,
+                "npu_latency_ms": self._npu_latency_ms,
+                "available": self.is_available
+            }
+
+    def detect(self, frame_bgr: np.ndarray, capture_mono_time: float):
+        if not self.is_available:
+            return [], capture_mono_time
+
+        self._active_flag.value = 1
+
+        # 1. Drain any completed inference results from the NPU subprocess pipe (non-blocking)
+        while self._conn_rx.poll():
+            try:
+                dets, eff_mono, dt_ms, cur_fps = self._conn_rx.recv()
+                with self._lock:
+                    self._latest_detections = dets
+                    self._latest_capture_mono = eff_mono
+                    self._npu_latency_ms = dt_ms
+                    self._npu_fps = cur_fps
+                with target_lock:
+                    system_health["npu_fps"] = cur_fps
+                    system_health["npu_latency_ms"] = dt_ms
+            except Exception:
+                break
+
+        # 2. Zero-copy write latest camera frame into POSIX shared memory (~0.3ms)
+        np.copyto(self._shm_array, frame_bgr)
+        self._cap_mono_val.value = capture_mono_time
+
+        with self._lock:
+            dets = list(self._latest_detections)
+            eff_mono = self._latest_capture_mono if self._latest_capture_mono > 0 else capture_mono_time
+
+        return dets, eff_mono
 
 # =========================================================================
 # Robust Serial Worker Thread
@@ -504,8 +1065,8 @@ def turret_serial_worker(cmd_queue):
     rx_buf = bytearray()
     last_telemetry_rx_time = 0.0
 
-    set_os_thread_name("TurretSerial")
-    
+    set_os_thread_name("TurretSerial", cpu_cores=[3])
+
     while True:
         now = time.time()
         mono_now = time.monotonic()
@@ -565,17 +1126,14 @@ def turret_serial_worker(cmd_queue):
             set_serial_connected(is_active)
 
         try:
-            # Drain the entire queue into discrete action slots
             pending_commands = []
             latest_velocity = None
 
             while not cmd_queue.empty():
                 item = cmd_queue.get_nowait()
                 if item.get("cmd") == "VELOCITY":
-                    # Coalesce: keep only the newest velocity vector
                     latest_velocity = item
                 else:
-                    # Preserve chronological order for discrete commands (SETPOINT, TRIGGER, HALT)
                     pending_commands.append(item)
 
             if latest_velocity is not None:
@@ -608,7 +1166,6 @@ def turret_serial_worker(cmd_queue):
                         req_state = item["state"]
                         custom_pulse = item.get("pulse_len")
 
-                        # Drop stale trigger commands older than 100ms
                         if req_state == 1 and (now - item.get("timestamp", now) > 0.100):
                             continue
 
@@ -633,7 +1190,6 @@ def turret_serial_worker(cmd_queue):
         except Exception as e:
             log.warning(f"[SERIAL TX FAULT] {e}")
 
-        # Solenoid auto-cutoff watchdog
         if trigger_state == 1 and (now - trigger_start_time >= active_pulse_limit):
             trigger_state = 0
             set_firing_state(False)
@@ -646,7 +1202,6 @@ def turret_serial_worker(cmd_queue):
                 except Exception:
                     pass
 
-        # Ingest Telemetry Stream
         if ser and ser.is_open:
             try:
                 bytes_avail = ser.in_waiting
@@ -712,9 +1267,7 @@ def ensure_storage_headroom():
         if calc_free_gb < MIN_FREE_SPACE_GB:
             set_alert(f"LOW STORAGE: {calc_free_gb:.1f} GB Free", duration=4.0)
 
-        # Search for video files
         files = glob.glob(os.path.join(RECORDINGS_DIR, "wildlife_*.*"))
-        
         if not files:
             return
 
@@ -751,7 +1304,7 @@ def video_recorder_worker(record_queue):
         ("XVID", cv2.VideoWriter_fourcc(*"XVID"), ".avi")
     ]
 
-    set_os_thread_name("VidRecorder")
+    set_os_thread_name("VidRecorder", cpu_cores=[2])
 
     while True:
         try:
@@ -831,15 +1384,24 @@ def video_recorder_worker(record_queue):
                     log.error(f"[RECORDER ERROR] Failed releasing writer: {e}")
             ensure_storage_headroom()
 
+def get_measured_turret_speed_mrad_s():
+    """Computes actual physical turret slew speed (mrad/s) over the last ~100ms of ESP32 telemetry."""
+    with telemetry_lock:
+        if len(telemetry_history) < 2:
+            return 0.0
+        t1, p1, tilt1 = telemetry_history[-1]
+        # Look back up to 3 samples (~150ms at 20Hz telemetry)
+        idx = max(0, len(telemetry_history) - 3)
+        t0, p0, tilt0 = telemetry_history[idx]
+        dt = t1 - t0
+        if dt <= 0.005:
+            return 0.0
+        return math.hypot(p1 - p0, tilt1 - tilt0) / dt
+
 # =========================================================================
 # Asynchronous Real-Time Motion Servoing Loop (50 Hz / 20ms Cadence)
 # =========================================================================
 def motion_servoing_worker(target_filter, turret_queue):
-    """
-    Decoupled 50 Hz real-time motion control loop.
-    Executes Kalman forward projection against current physical position,
-    streaming continuous velocity vectors regardless of camera or ML inference cadence.
-    """
     last_setpoint_time = 0.0
     last_debug_log_time = 0.0
     is_actively_tracking_velocity = False
@@ -848,38 +1410,28 @@ def motion_servoing_worker(target_filter, turret_queue):
     last_sent_p_pan = 99999
     last_sent_p_tilt = 99999
     last_mode_seen = "OFF"
-    
-    # Release hysteresis timer to prevent 20ms optical frame jitter from aborting auto-fire
     last_fire_gate_ok_time = 0.0
 
     last_target_time = time.time()
-    HOME_TIMEOUT_SEC = 300.0  
+    HOME_TIMEOUT_SEC = 300.0
     is_homing = False
 
-    # --- BALLISTICS CONSTANTS ---
-    MUZZLE_VELOCITY_M_S = 85.0  
+    MUZZLE_VELOCITY_M_S = 85.0
     GRAVITY_M_S2 = 9.81
-    
-    # Drag Constants for .68 Caliber Paintball at ~1,400 ft elevation
-    # Air Density (rho) = 1.17 kg/m^3, Mass = 0.0032 kg, Cd = 0.3, Area = 0.000234 m^2
-    # k = (rho * Cd * Area) / (2 * Mass) 
     DRAG_K = 0.0128
-    
-    log.info("[MOTION] 50 Hz Real-Time Motion Controller (Drag Ballistics & Auto-Home) started")
 
-    set_os_thread_name("MotionServo")
+    log.info("[MOTION] 50 Hz Real-Time Motion Controller (Drag Ballistics & Auto-Home) started")
+    set_os_thread_name("MotionServo", cpu_cores=[3])
 
     while True:
         loop_start = time.monotonic()
         now = time.time()
 
-        # Atomic, flat snapshot retrieval (No nested locks)
         mode, is_primed = get_turret_mode()
         target_data = get_primary_target_snapshot()
         current_pan, current_tilt, hw_moving, _ = get_instantaneous_telemetry()
         serial_ok = get_serial_connected()
 
-        # Handle Transition to OFF / Inactive Mode
         if mode == "OFF":
             if last_mode_seen != "OFF":
                 turret_queue.put({"cmd": "HALT"})
@@ -892,7 +1444,7 @@ def motion_servoing_worker(target_filter, turret_queue):
                 last_fire_gate_ok_time = 0.0
                 target_filter.reset()
                 log.info("[MODE] Turret disengaged and placed in OFF / STANDBY.")
-            
+
             last_target_time = now
             is_homing = False
             last_mode_seen = mode
@@ -905,15 +1457,10 @@ def motion_servoing_worker(target_filter, turret_queue):
 
         last_mode_seen = mode
 
-        # Turret is ON (Tracking), ARMED (Burst Fire), or CALIBRATE (Single-Shot Gated)
         if serial_ok:
             target_active = False
             if target_data is not None:
                 time_since_seen = now - target_data["last_seen"]
-
-            # -------------------------------------------------------------
-            # CASE A: TARGET ACTIVE OR WITHIN 1.5s BALLISTIC COAST HORIZON
-            # -------------------------------------------------------------
                 if time_since_seen <= COAST_MAX_HORIZON_SEC:
                     target_active = True
 
@@ -925,31 +1472,23 @@ def motion_servoing_worker(target_filter, turret_queue):
                 if predicted_state is not None:
                     base_pan, base_tilt, tgt_v_pan, tgt_v_tilt = predicted_state
 
-                    current_range_m = target_data.get("range_m", 15.0)
-                    
-                    # 1. Time of Flight (ToF) with Quadratic Drag Approximation
-                    # t = (e^(k*x) - 1) / (k * V0)
+                    current_range_m = target_data.get("range_m", DEFAULT_FALLBACK_RANGE_M)
+
                     if current_range_m > 0:
                         tof_sec = (math.exp(DRAG_K * current_range_m) - 1.0) / (DRAG_K * MUZZLE_VELOCITY_M_S)
                     else:
                         tof_sec = 0.0
-                    
-                    # 2. Gravity Drop Compensation with Slant Angle (Cosine)
+
                     current_tilt_radians = current_tilt / 1000.0
                     drop_m = 0.5 * (GRAVITY_M_S2 * math.cos(current_tilt_radians)) * (tof_sec ** 2)
                     drop_mrad = (drop_m / current_range_m) * 1000.0 if current_range_m > 0 else 0.0
-                    
-                    # 3. Target Lead 
+
                     lead_pan_mrad = tgt_v_pan * tof_sec
                     lead_tilt_mrad = tgt_v_tilt * tof_sec
 
-                    # Final Firing Solution (Impact Point)
                     world_pan = int(round(base_pan + lead_pan_mrad))
                     world_tilt = int(round(base_tilt + lead_tilt_mrad + drop_mrad + TILT_CALIBRATION_TRIM_MRAD))
-                    
-                    # =========================================================
-                    # RIGID BOUNDARY CLAMPING & KALMAN MOMENTUM RESET
-                    # =========================================================
+
                     pan_clamped = False
                     tilt_clamped = False
 
@@ -961,29 +1500,22 @@ def motion_servoing_worker(target_filter, turret_queue):
                         tilt_clamped = True
                         world_tilt = max(TILT_MIN_MRAD, min(TILT_MAX_MRAD, world_tilt))
 
-                    # If an axis is pinned against a physical wall, clamp the Kalman state 
-                    # and zero its velocity component to prevent phantom tracking momentum.
                     with target_filter.lock:
                         if target_filter.is_initialized:
                             if pan_clamped:
                                 target_filter.kf.statePost[0, 0] = float(world_pan)
-                                target_filter.kf.statePost[2, 0] = 0.0 # Zero vPan momentum
+                                target_filter.kf.statePost[2, 0] = 0.0
                             if tilt_clamped:
                                 target_filter.kf.statePost[1, 0] = float(world_tilt)
-                                target_filter.kf.statePost[3, 0] = 0.0 # Zero vTilt momentum
-                    # =========================================================
+                                target_filter.kf.statePost[3, 0] = 0.0
 
-                    # LATENCY-FREE INSTANTANEOUS REAL-TIME ERROR
                     realtime_err_pan = world_pan - current_pan
                     realtime_err_tilt = world_tilt - current_tilt
                     radial_error_mrad = math.hypot(realtime_err_pan, realtime_err_tilt)
-                    turret_speed_mag = math.hypot(last_v_pan, last_v_tilt)
+                    measured_speed_mag = get_measured_turret_speed_mrad_s()
+                    cmd_speed_mag = math.hypot(last_v_pan, last_v_tilt)
+                    turret_speed_mag = max(cmd_speed_mag, measured_speed_mag)
 
-                    # ---------------------------------------------------------
-                    # UNIFIED PRODUCTION FIRE GATE
-                    # Identical error threshold (40 mrad), target freshness (<150ms),
-                    # and turret slew speed gate (<180 mrad/s) across both modes.
-                    # ---------------------------------------------------------
                     production_fire_gate = (
                         time_since_seen <= 0.150
                         and radial_error_mrad <= FIRE_DEADBAND_MRAD
@@ -997,15 +1529,13 @@ def motion_servoing_worker(target_filter, turret_queue):
                     shot_pulse_duration = None
 
                     if mode == "ARMED":
-                        # 120ms release hysteresis: tolerates brief 20-40ms frame dips
-                        # without cutting the trigger line and incurring the 1.5s lockout
                         can_fire = (now - last_fire_gate_ok_time <= 0.120)
-                        shot_pulse_duration = None  # Sustained fire (governed by MAX_TRIGGER_DURATION_SEC)
+                        shot_pulse_duration = None
                     elif mode == "CALIBRATE":
                         if production_fire_gate and is_primed:
                             if consume_calibration_prime():
                                 can_fire = True
-                                shot_pulse_duration = 0.080  # 80ms pulse: guarantees exactly 1 shot on ESP32
+                                shot_pulse_duration = 0.080
                                 log.info(
                                     f"[CALIBRATE] Shot discharged! | "
                                     f"Range: {current_range_m:.2f}m | "
@@ -1021,7 +1551,6 @@ def motion_servoing_worker(target_filter, turret_queue):
                         "timestamp": now
                     })
 
-                    # MODE HYSTERESIS SELECTION
                     if not is_actively_tracking_velocity:
                         if radial_error_mrad > BALLISTIC_ACQUIRE_MRAD:
                             use_ballistic = True
@@ -1037,7 +1566,6 @@ def motion_servoing_worker(target_filter, turret_queue):
 
                     time_since_tx = now - last_setpoint_time
 
-                    # MODE 1: BALLISTIC SNAP-TO-TARGET ('P')
                     if use_ballistic:
                         goal_delta = math.hypot(world_pan - last_sent_p_pan, world_tilt - last_sent_p_tilt)
                         if (time_since_tx >= 0.400 and goal_delta > 60.0) or last_v_pan != 0:
@@ -1052,8 +1580,6 @@ def motion_servoing_worker(target_filter, turret_queue):
                             last_v_pan = 0
                             last_v_tilt = 0
                         cmd_type = f"P({world_pan:+4d},{world_tilt:+4d})"
-                        
-                    # MODE 2: CONTINUOUS FLUID PURSUIT ('V')
                     else:
                         if time_since_tx >= SETPOINT_MIN_INTERVAL_SEC:
                             last_setpoint_time = now
@@ -1069,21 +1595,18 @@ def motion_servoing_worker(target_filter, turret_queue):
                                     kp = 2.8
                                     cmd = err * kp + 1.0 * tgt_v
                                 return int(round(cmd))
-                            
+
                             raw_v_pan = compute_velocity(realtime_err_pan, tgt_v_pan, VELOCITY_DEADBAND_MRAD)
                             raw_v_tilt = compute_velocity(realtime_err_tilt, tgt_v_tilt, VELOCITY_DEADBAND_MRAD)
 
-                            # COAST DECAY DAMPING: after 350ms of occlusion, smoothly decay velocity
                             if time_since_seen > 0.350:
                                 decay_factor = math.exp(-COAST_EXP_DECAY_RATE * (time_since_seen - 0.350))
                                 raw_v_pan = int(round(raw_v_pan * decay_factor))
                                 raw_v_tilt = int(round(raw_v_tilt * decay_factor))
 
-                            # Slew bounds: up to 850 mrad/s pan, 450 mrad/s tilt
                             v_pan_cmd = max(-850, min(850, raw_v_pan))
                             v_tilt_cmd = max(-450, min(450, raw_v_tilt))
 
-                            # Software Travel Limits: prevent driving into mechanical endstops
                             if current_tilt >= TILT_MAX_MRAD and v_tilt_cmd > 0:
                                 v_tilt_cmd = 0
                             elif current_tilt <= TILT_MIN_MRAD and v_tilt_cmd < 0:
@@ -1100,7 +1623,6 @@ def motion_servoing_worker(target_filter, turret_queue):
 
                         cmd_type = f"V({last_v_pan:+4d},{last_v_tilt:+4d})"
 
-                    # Diagnostic Telemetry
                     if now - last_debug_log_time >= 0.150:
                         last_debug_log_time = now
                         log.info(
@@ -1108,10 +1630,6 @@ def motion_servoing_worker(target_filter, turret_queue):
                             f"Err:({realtime_err_pan:+5.1f},{realtime_err_tilt:+4.1f}) | "
                             f"Cmd:{cmd_type} | Mv:{int(hw_moving)}"
                         )
-
-            # -------------------------------------------------------------
-            # CASE B: TARGET EXPIRED BEYOND 1.5s COAST HORIZON
-            # -------------------------------------------------------------
             else:
                 if target_data is not None:
                     clear_primary_target()
@@ -1129,11 +1647,10 @@ def motion_servoing_worker(target_filter, turret_queue):
 
                 idle_duration = now - last_target_time
                 if idle_duration >= HOME_TIMEOUT_SEC:
-                    
                     if not is_homing and (abs(current_pan) > 2 or abs(current_tilt) > 2):
                         log.info(f"[{mode}] Idle for {HOME_TIMEOUT_SEC}s. Returning turret to scan home (0,0).")
                         is_homing = True
-                    
+
                     if is_homing:
                         if abs(current_pan) <= 2 and abs(current_tilt) <= 2:
                             is_homing = False
@@ -1151,23 +1668,33 @@ def motion_servoing_worker(target_filter, turret_queue):
             time.sleep(sleep_time)
 
 # =========================================================================
-# Vision Perception Thread (Asynchronous Ingestion & Kalman Correction)
+# Vision Perception Thread (Asynchronous Ingestion & Polymorphic Dispatch)
 # =========================================================================
 def vision_thread():
-    global latest_jpeg, global_turret_queue
+    global latest_jpeg, global_turret_queue, global_target_filter, global_wildlife_detector
 
-    set_os_thread_name("VisionMain")
+    # Pin VisionMain and OpenCV's 2 worker threads strictly to Cores 0 & 1
+    set_os_thread_name("VisionMain", cpu_cores=[0, 1])
 
     ensure_storage_headroom()
-    detector = ArucoTargetDetector()
+
+    detectors = {
+        "ARUCO": ArucoTargetDetector(),
+        "WILDLIFE": HailoWildlifeDetector(),
+    }
+    global_wildlife_detector = detectors["WILDLIFE"]
+    detectors["WILDLIFE"].set_active(get_active_detector_type() == "WILDLIFE")
+
     target_filter = TargetKalmanFilter(process_noise=35.0, measurement_noise=10.0)
+    global_target_filter = target_filter
 
     try:
+        # Prioritize wide_noir tuning profile first to match physical IMX708 wide lens
         noir_candidates = [
-            "/usr/share/libcamera/ipa/rpi/pisp/imx708_noir.json",
-            "/usr/share/libcamera/ipa/rpi/vc4/imx708_noir.json",
             "/usr/share/libcamera/ipa/rpi/pisp/imx708_wide_noir.json",
-            "/usr/share/libcamera/ipa/rpi/vc4/imx708_wide_noir.json"
+            "/usr/share/libcamera/ipa/rpi/vc4/imx708_wide_noir.json",
+            "/usr/share/libcamera/ipa/rpi/pisp/imx708_noir.json",
+            "/usr/share/libcamera/ipa/rpi/vc4/imx708_noir.json"
         ]
         active_tuning = next((f for f in noir_candidates if os.path.exists(f)), None)
 
@@ -1181,7 +1708,6 @@ def vision_thread():
         else:
             log.warning("[CAMERA] Specific NoIR tuning JSON not found in standard paths; proceeding with default ISP.")
 
-        # UPDATED: Enabled HdrMode, matrix metering, and reset exposure/contrast
         cam_config = picam2.create_video_configuration(
             sensor={"output_size": (2304, 1296)},
             main={"size": (FRAME_WIDTH, FRAME_HEIGHT), "format": "RGB888"},
@@ -1189,12 +1715,12 @@ def vision_thread():
             buffer_count=6,
             controls={
                 "AeEnable": True,
-                "HdrMode": 2,          # 2 = Sensor HDR
-                "AeMeteringMode": 0,   # 0 = Matrix
+                "HdrMode": 2,
+                "AeMeteringMode": 0,
                 "AwbMode": 0,
-                "ExposureValue": 0.0,  
-                "FrameDurationLimits": (100, 33333),
-                "Contrast": 1.0,       
+                "ExposureValue": 0.0,
+                "FrameDurationLimits": (33333, 66666),
+                "Contrast": 1.0,
                 "Saturation": 0.80,
                 "Sharpness": 1.25,
                 "AfMode": 0,
@@ -1223,11 +1749,13 @@ def vision_thread():
     frame_count = 0
     sensor_fps = 0.0
 
-    last_valid_range_m = 25.0
+    last_valid_range_m = DEFAULT_FALLBACK_RANGE_M
     last_seen_connected = False
+    last_detector_type = get_active_detector_type()
 
     tentative_target = None
     tentative_streak = 0
+    last_processed_capture_mono = 0.0
 
     is_recording = False
     lock_consecutive_frames = 0
@@ -1243,7 +1771,7 @@ def vision_thread():
     pre_roll_pool = np.empty((PRE_ROLL_CAPACITY, FRAME_HEIGHT, FRAME_WIDTH, 3), dtype=np.uint8)
     pre_roll_idx = 0
     pre_roll_count = 0
-    
+
     while True:
         now = time.time()
         capture_arrival_mono = time.monotonic()
@@ -1260,15 +1788,14 @@ def vision_thread():
             time.sleep(0.01)
             continue
 
-        # UPDATED: Dynamic tilt-aware exposure control
         _, current_tilt_mrad, _, _ = get_instantaneous_telemetry()
-        
+
         dynamic_ev = 0.0
-        if current_tilt_mrad > 50: 
-            dynamic_ev = 1.5  # Pointing up, force overexposure of sky to see ground
+        if current_tilt_mrad > 50:
+            dynamic_ev = 1.5
         elif current_tilt_mrad < -100:
-            dynamic_ev = -0.5 # Pointing down, slightly darken to prevent blow-out
-            
+            dynamic_ev = -0.5
+
         if last_ev != dynamic_ev:
             try:
                 picam2.set_controls({"ExposureValue": dynamic_ev})
@@ -1284,25 +1811,16 @@ def vision_thread():
             lux = metadata.get("Lux", 50.0)
             gain = metadata.get("AnalogueGain", 1.0)
 
-            # Widened hysteresis: Enter B&W only when genuinely dark (Lux < 10 or Gain > 12)
             if (lux < 10.0 or gain > 12.0) and not is_monochrome_mode:
                 try:
-                    picam2.set_controls({
-                        "Saturation": 0.0,
-                        "Sharpness": 1.3
-                    })
+                    picam2.set_controls({"Saturation": 0.0, "Sharpness": 1.3})
                     is_monochrome_mode = True
                     log.info(f"[ISP] Priority 1 (Dusk/Low-Light): B&W Enhanced (Lux:{lux:.1f}, Gain:{gain:.2f})")
                 except Exception:
                     pass
-
-            # Exit B&W only when clearly bright (Lux > 35) and gain has settled
             elif (lux >= 35.0 and gain <= 4.0) and is_monochrome_mode:
                 try:
-                    picam2.set_controls({
-                        "Saturation": 0.85,
-                        "Sharpness": 1.15
-                    })
+                    picam2.set_controls({"Saturation": 0.85, "Sharpness": 1.15})
                     is_monochrome_mode = False
                     log.info(f"[ISP] Priority 2/3 (Day/Indoor): Color Restored (Lux:{lux:.1f}, Gain:{gain:.2f})")
                 except Exception:
@@ -1320,28 +1838,46 @@ def vision_thread():
             if not currently_connected:
                 clear_primary_target()
 
-        # --- Stage 2: Target Detection ---
-        detections = detector.detect(frame_main)
+        # --- Stage 2: Polymorphic Target Detection ---
+        requested_det_type = get_active_detector_type()
+        active_detector = detectors.get(requested_det_type, detectors["ARUCO"])
+        if not active_detector.is_available:
+            active_detector = detectors["ARUCO"]
+            set_active_detector_type("ARUCO")
 
-        best_candidate = detections[0] if len(detections) > 0 else None
-        verified_detection = best_candidate
-        
-        if best_candidate is not None:
-            has_active = (get_primary_target_snapshot() is not None)
-            if has_active:
-                verified_detection = best_candidate
-            else:
-                if tentative_target is not None:
-                    tentative_streak += 1
-                    tentative_target = best_candidate
-                    if tentative_streak >= CONFIRMATION_FRAMES:
-                        verified_detection = best_candidate
-                else:
-                    tentative_target = best_candidate
-                    tentative_streak = 1
-        else:
+        if active_detector.name != last_detector_type:
+            log.info(f"[PERCEPTION] Switching active detector: {last_detector_type} -> {active_detector.name}")
+            detectors["WILDLIFE"].set_active(active_detector.name == "WILDLIFE")
+            last_detector_type = active_detector.name
             tentative_target = None
             tentative_streak = 0
+            target_filter.reset()
+            clear_primary_target()
+
+        detections, effective_capture_mono = active_detector.detect(frame_main, capture_arrival_mono)
+        is_new_inference_batch = (effective_capture_mono != last_processed_capture_mono)
+
+        best_candidate = detections[0] if len(detections) > 0 else None
+        verified_detection = None
+
+        if is_new_inference_batch:
+            last_processed_capture_mono = effective_capture_mono
+            if best_candidate is not None:
+                has_active = (get_primary_target_snapshot() is not None)
+                if has_active:
+                    verified_detection = best_candidate
+                else:
+                    if tentative_target is not None:
+                        tentative_streak += 1
+                        tentative_target = best_candidate
+                        if tentative_streak >= CONFIRMATION_FRAMES:
+                            verified_detection = best_candidate
+                    else:
+                        tentative_target = best_candidate
+                        tentative_streak = 1
+            else:
+                tentative_target = None
+                tentative_streak = 0
 
         # --- Stage 3: Kalman Measurement Correction ---
         if verified_detection is not None:
@@ -1351,7 +1887,7 @@ def vision_thread():
                 last_valid_range_m = verified_detection["range_m"]
             current_range_m = last_valid_range_m
 
-            pan_at_capture, tilt_at_capture = get_turret_pos_at_time(capture_arrival_mono - 0.040)
+            pan_at_capture, tilt_at_capture = get_turret_pos_at_time(effective_capture_mono - 0.040)
 
             parallax_pan_mrad = (-CAMERA_OFFSET_X_MM / (current_range_m * 1000.0)) * 1000.0
             parallax_tilt_mrad = (CAMERA_OFFSET_Y_MM / (current_range_m * 1000.0)) * 1000.0
@@ -1373,13 +1909,22 @@ def vision_thread():
                 "area": verified_detection["area"],
                 "range_m": current_range_m,
                 "last_seen": now,
-                "id": verified_detection.get("id", 0)
+                "id": verified_detection.get("id", 0),
+                "label": verified_detection.get("label", "TGT")
             })
         else:
             if get_primary_target_snapshot() is None and (now - last_standby_log_time >= 2.0):
                 last_standby_log_time = now
                 p_cur, t_cur, _, _ = get_instantaneous_telemetry()
-                log.info(f"[STANDBY] Scanning... | FPS:{sensor_fps:4.1f} | Turret:({p_cur:+5d},{t_cur:+4d})")
+                if active_detector.name == "WILDLIFE":
+                    tel = active_detector.get_telemetry()
+                    npu_info = f" | NPU:{tel.get('npu_fps', 0.0):4.1f}Hz ({tel.get('npu_latency_ms', 0.0):4.0f}ms)"
+                else:
+                    npu_info = ""
+                log.info(
+                    f"[STANDBY:{active_detector.name}] Scanning... | "
+                    f"CamFPS:{sensor_fps:4.1f}{npu_info} | Turret:({p_cur:+5d},{t_cur:+4d})"
+                )
 
         # --- Stage 4: Video Archiving ---
         local_target = get_primary_target_snapshot()
@@ -1438,7 +1983,7 @@ def vision_thread():
 
         if clients_viewing:
             cur_mode, is_primed_hud = get_turret_mode()
-            current_range_m = local_target.get("range_m", 25.0) if local_target else 25.0
+            current_range_m = local_target.get("range_m", DEFAULT_FALLBACK_RANGE_M) if local_target else DEFAULT_FALLBACK_RANGE_M
             oc_x = int(OPTICAL_CENTER[0] * SCALE_X)
             oc_y = int(OPTICAL_CENTER[1] * SCALE_Y)
             cv2.drawMarker(annotated, (oc_x, oc_y), (0, 255, 255), cv2.MARKER_CROSS, 16, 1)
@@ -1459,6 +2004,8 @@ def vision_thread():
             with target_lock:
                 ser_ok = system_health["serial_connected"]
                 rec_ok = system_health["recorder_active"]
+                npu_fps_hud = system_health["npu_fps"]
+                npu_lat_hud = system_health["npu_latency_ms"]
                 alert_msg = system_health["last_alert"] if now < system_health["alert_time"] else None
 
             if cur_mode == "ARMED":
@@ -1495,7 +2042,8 @@ def vision_thread():
                 cv2.rectangle(annotated, (tx1, ty1), (tx2, ty2), box_color, 2)
                 cv2.circle(annotated, (tcx_d, tcy_d), 4, box_color, -1)
 
-                status_lbl = f"ID:{local_target.get('id', 0)} | {current_range_m:.1f}m"
+                tgt_lbl = local_target.get("label", f"ID:{local_target.get('id', 0)}")
+                status_lbl = f"{tgt_lbl} | {current_range_m:.1f}m"
                 cv2.putText(annotated, status_lbl, (tx1, max(ty1 - 8, 15)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.45, box_color, 1, cv2.LINE_AA)
 
@@ -1543,15 +2091,20 @@ def vision_thread():
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2, cv2.LINE_AA)
 
             if rec_ok:
-                cv2.circle(annotated, (DISPLAY_WIDTH - 25, 25), 8, (0, 0, 255), -1)
-                cv2.putText(annotated, "REC", (DISPLAY_WIDTH - 70, 30),
+                cv2.circle(annotated, (DISPLAY_WIDTH - 25, 60), 8, (0, 0, 255), -1)
+                cv2.putText(annotated, "REC", (DISPLAY_WIDTH - 70, 65),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 1, cv2.LINE_AA)
 
             badge_color = (0, 255, 0) if ser_ok else (0, 0, 255)
             ser_badge = "SERIAL: OK" if ser_ok else "SERIAL: DISCONNECTED"
-            status_text = f"FPS:{sensor_fps:.1f} | Pan:{p_mrad}mrad Tilt:{t_mrad}mrad | {ser_badge}"
+            det_telemetry = (
+                f"NPU:{npu_fps_hud:.1f}Hz({npu_lat_hud:.0f}ms)"
+                if active_detector.name == "WILDLIFE"
+                else "DET:ARUCO"
+            )
+            status_text = f"FPS:{sensor_fps:.1f} | {det_telemetry} | Pan:{p_mrad} Tilt:{t_mrad} | {ser_badge}"
             cv2.putText(annotated, status_text, (10, DISPLAY_HEIGHT - 12),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.38, badge_color, 1, cv2.LINE_AA)
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.36, badge_color, 1, cv2.LINE_AA)
 
             if alert_msg:
                 cv2.rectangle(annotated, (0, DISPLAY_HEIGHT - 45), (DISPLAY_WIDTH, DISPLAY_HEIGHT - 20), (0, 0, 180), -1)
@@ -1569,13 +2122,44 @@ def vision_thread():
 
 @app.route("/api/mode", methods=["GET", "POST"])
 def api_mode():
-    global global_turret_queue
+    global global_turret_queue, global_target_filter
+    hailo_ok = is_hailo_npu_ready()
+
     if request.method == "POST":
         req = request.get_json(silent=True) or {}
         target_mode = req.get("mode", "").upper()
+        target_detector = req.get("detector", "").upper()
         reprime_req = req.get("reprime", False)
 
         cur_mode, cur_primed = get_turret_mode()
+
+        # Handle Runtime Perception Model Selection
+        if target_detector:
+            if target_detector not in ("ARUCO", "WILDLIFE"):
+                return jsonify({"status": "error", "message": "Invalid detector specified"}), 400
+
+            if target_detector == "WILDLIFE" and not hailo_ok:
+                set_alert("HAILO NPU UNAVAILABLE", duration=3.0)
+                return jsonify({
+                    "status": "error",
+                    "message": "Hailo-8 NPU or MDV6 HEF model is unavailable"
+                }), 400
+
+            set_active_detector_type(target_detector)
+            clear_primary_target()
+            if global_target_filter is not None:
+                global_target_filter.reset()
+            set_alert(f"DETECTOR: {target_detector} ACTIVE", duration=2.5)
+            log.info(f"[API] Runtime detector switched to {target_detector}")
+
+            c_mode, c_primed = get_turret_mode()
+            return jsonify({
+                "status": "ok",
+                "mode": c_mode,
+                "primed": c_primed,
+                "detector": get_active_detector_type(),
+                "hailo_available": hailo_ok
+            })
 
         if reprime_req:
             if cur_mode == "CALIBRATE":
@@ -1583,12 +2167,17 @@ def api_mode():
                 set_alert("TEST FIRE: RE-PRIMED (READY)", duration=2.5)
                 log.info("[CALIBRATE] Single-shot test fire manually RE-PRIMED.")
             c_mode, c_primed = get_turret_mode()
-            return jsonify({"status": "ok", "mode": c_mode, "primed": c_primed})
+            return jsonify({
+                "status": "ok",
+                "mode": c_mode,
+                "primed": c_primed,
+                "detector": get_active_detector_type(),
+                "hailo_available": hailo_ok
+            })
 
         if target_mode not in ("OFF", "ON", "ARMED", "CALIBRATE"):
             return jsonify({"status": "error", "message": "Invalid mode specified"}), 400
 
-        # Progression Guard: Must be ON before ARMED or CALIBRATE
         if target_mode in ("ARMED", "CALIBRATE") and cur_mode != "ON":
             return jsonify({"status": "error", "message": "Turret must be turned ON before arming or testing"}), 400
 
@@ -1616,11 +2205,22 @@ def api_mode():
 
         log.warning(f"[MODE TRANSITION] Turret switched to {target_mode}")
         c_mode, c_primed = get_turret_mode()
-        return jsonify({"status": "ok", "mode": c_mode, "primed": c_primed})
+        return jsonify({
+            "status": "ok",
+            "mode": c_mode,
+            "primed": c_primed,
+            "detector": get_active_detector_type(),
+            "hailo_available": hailo_ok
+        })
 
     c_mode, c_primed = get_turret_mode()
-    return jsonify({"status": "ok", "mode": c_mode, "primed": c_primed})
-
+    return jsonify({
+        "status": "ok",
+        "mode": c_mode,
+        "primed": c_primed,
+        "detector": get_active_detector_type(),
+        "hailo_available": hailo_ok
+    })
 
 @app.route("/")
 def index():
@@ -1670,22 +2270,24 @@ def index():
                 justify-content: space-between;
                 align-items: center;
                 width: 100%;
-                margin-bottom: 12px;
+                margin-bottom: 10px;
+                flex-wrap: wrap;
+                gap: 8px;
             }
             .brand-wrap {
                 display: flex;
                 align-items: center;
-                gap: 10px;
+                gap: 8px;
             }
             h1 {
-                font-size: 1.1rem;
+                font-size: 1.05rem;
                 letter-spacing: 0.05em;
                 text-transform: uppercase;
                 color: #39d353;
                 text-align: left;
             }
             .status-pill {
-                font-size: 0.72rem;
+                font-size: 0.70rem;
                 font-weight: 800;
                 letter-spacing: 0.08em;
                 padding: 3px 8px;
@@ -1720,6 +2322,53 @@ def index():
                 50% { opacity: 1; }
                 100% { opacity: 0.85; }
             }
+
+            /* Runtime Perception Model Selector Bar */
+            .detector-bar {
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                width: 100%;
+                background: #0d1117;
+                border: 1px solid #30363d;
+                border-radius: 8px;
+                padding: 6px 10px;
+                margin-bottom: 10px;
+                gap: 8px;
+            }
+            .detector-label {
+                font-size: 0.75rem;
+                font-weight: 700;
+                text-transform: uppercase;
+                letter-spacing: 0.05em;
+                color: #8b949e;
+            }
+            .detector-toggle-group {
+                display: flex;
+                gap: 6px;
+            }
+            .btn-det {
+                background: #21262d;
+                color: #c9d1d9;
+                border: 1px solid #30363d;
+                border-radius: 6px;
+                padding: 5px 12px;
+                font-size: 0.76rem;
+                font-weight: 700;
+                cursor: pointer;
+                transition: all 0.15s ease;
+            }
+            .btn-det.active {
+                background: #8957e5;
+                color: #ffffff;
+                border-color: #a371f7;
+                box-shadow: 0 0 10px rgba(137, 87, 229, 0.4);
+            }
+            .btn-det.disabled {
+                opacity: 0.4;
+                cursor: not-allowed;
+            }
+
             .video-container {
                 position: relative;
                 width: 100%;
@@ -1800,7 +2449,6 @@ def index():
                 color: #fff;
                 border-color: #388bfd;
             }
-
             .btn-cal {
                 background: #21262d;
                 color: #f0883e;
@@ -1869,7 +2517,6 @@ def index():
                 pointer-events: none;
             }
 
-            /* Exposed Arm Trigger & Timeout Meter */
             .armed-trigger {
                 width: 100%;
                 height: 100%;
@@ -1971,6 +2618,19 @@ def index():
                 <button class="btn-fullscreen" onclick="toggleMaximize()">⛶ Fullscreen</button>
             </div>
 
+            <!-- Runtime Perception Engine Selector -->
+            <div class="detector-bar">
+                <span class="detector-label">Perception Engine:</span>
+                <div class="detector-toggle-group">
+                    <button id="btnDetAruco" class="btn-det active" onclick="requestDetector('ARUCO')">
+                        🏁 ArUco Target (Test)
+                    </button>
+                    <button id="btnDetWildlife" class="btn-det" onclick="requestDetector('WILDLIFE')">
+                        🦌 Wildlife NPU (Hailo-8)
+                    </button>
+                </div>
+            </div>
+
             <div class="video-container" id="videoBox" ondblclick="toggleMaximize()">
                 <button class="fs-kill-btn" onclick="requestMode('OFF')">🛑 SAFE / DISARM</button>
                 <img id="streamImg" src="/video_feed" alt="Live Targeting Feed">
@@ -1992,7 +2652,6 @@ def index():
                     🧪 1-SHOT
                 </button>
 
-                <!-- Two-Stage Guarded Switch Assembly -->
                 <div class="switch-bay" id="switchBay">
                     <button id="armedTrigger" class="armed-trigger" onclick="confirmArmTrigger()">
                         <span id="triggerLabel">⚠️ ARM LIVE</span>
@@ -2007,14 +2666,16 @@ def index():
             </div>
 
             <div class="meta">
-                Deterministic 50Hz Motion | 921.6k Baud Closed-Loop<br>
-                <em>Use 1-SHOT for single-round aim verification (auto-discharges once on 500ms lock, then locks out).</em>
+                Deterministic 50Hz Motion | 921.6k Baud Closed-Loop | Hailo-8 26 TOPS PCIe NPU<br>
+                <em>Switch between ArUco Fiducial and MegaDetector v6 Wildlife AI at runtime.</em>
             </div>
         </div>
 
         <script>
             let currentMode = "OFF";
             let isPrimed = false;
+            let currentDetector = "ARUCO";
+            let hailoAvailable = true;
             let coverOpen = false;
             let coverTimer = null;
             let timerStart = 0;
@@ -2065,7 +2726,6 @@ def index():
 
             function handleCalibrateClick() {
                 if (currentMode === "CALIBRATE") {
-                    // Re-prime the single shot if already in CALIBRATE mode
                     fetch("/api/mode", {
                         method: "POST",
                         headers: { "Content-Type": "application/json" },
@@ -2074,7 +2734,7 @@ def index():
                     .then(r => r.json())
                     .then(data => {
                         if (data.status === "ok") {
-                            updateUIState(data.mode, data.primed);
+                            updateUIState(data.mode, data.primed, data.detector, data.hailo_available);
                         }
                     })
                     .catch(err => console.error("Reprime failed:", err));
@@ -2083,9 +2743,26 @@ def index():
                 }
             }
 
-            function updateUIState(mode, primedState) {
+            function requestDetector(detType) {
+                fetch("/api/mode", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ detector: detType })
+                })
+                .then(r => r.json())
+                .then(data => {
+                    if (data.status === "ok") {
+                        updateUIState(data.mode, data.primed, data.detector, data.hailo_available);
+                    }
+                })
+                .catch(err => console.error("Detector switch failed:", err));
+            }
+
+            function updateUIState(mode, primedState, detectorType, isHailoOk) {
                 currentMode = mode;
                 isPrimed = !!primedState;
+                if (detectorType) currentDetector = detectorType;
+                if (typeof isHailoOk === "boolean") hailoAvailable = isHailoOk;
 
                 const badge = document.getElementById("modeBadge");
                 const btnOff = document.getElementById("btnOff");
@@ -2095,6 +2772,13 @@ def index():
                 const trigger = document.getElementById("armedTrigger");
                 const triggerLabel = document.getElementById("triggerLabel");
                 const coverLabel = document.getElementById("coverLabel");
+
+                const btnDetAruco = document.getElementById("btnDetAruco");
+                const btnDetWildlife = document.getElementById("btnDetWildlife");
+
+                btnDetAruco.classList.toggle("active", currentDetector === "ARUCO");
+                btnDetWildlife.classList.toggle("active", currentDetector === "WILDLIFE");
+                btnDetWildlife.classList.toggle("disabled", !hailoAvailable);
 
                 btnOff.classList.remove("active");
                 btnOn.classList.remove("active");
@@ -2160,7 +2844,7 @@ def index():
                 .then(r => r.json())
                 .then(data => {
                     if (data.status === "ok") {
-                        updateUIState(data.mode, data.primed);
+                        updateUIState(data.mode, data.primed, data.detector, data.hailo_available);
                     }
                 })
                 .catch(err => {
@@ -2173,8 +2857,13 @@ def index():
                 .then(r => r.json())
                 .then(data => {
                     if (data.status === "ok") {
-                        if (data.mode !== currentMode || data.primed !== isPrimed) {
-                            updateUIState(data.mode, data.primed);
+                        if (
+                            data.mode !== currentMode ||
+                            data.primed !== isPrimed ||
+                            data.detector !== currentDetector ||
+                            data.hailo_available !== hailoAvailable
+                        ) {
+                            updateUIState(data.mode, data.primed, data.detector, data.hailo_available);
                         }
                     }
                 })
@@ -2182,6 +2871,7 @@ def index():
             }
 
             setInterval(syncMode, 1000);
+            syncMode();
 
             function toggleMaximize() {
                 const box = document.getElementById("videoBox");
@@ -2209,7 +2899,7 @@ def generate_frames():
     with frame_lock:
         active_web_clients += 1
     try:
-        while True:
+        while not app_shutting_down.is_set():
             with frame_lock:
                 frame = latest_jpeg
 
@@ -2218,7 +2908,8 @@ def generate_frames():
                 yield frame
                 yield STREAM_PART_FOOTER
 
-            time.sleep(0.033)
+            if app_shutting_down.wait(timeout=0.033):
+                break
     finally:
         with frame_lock:
             active_web_clients = max(0, active_web_clients - 1)
@@ -2234,18 +2925,34 @@ def favicon():
     return ("", 204)
 
 # =========================================================================
-# Execution Entry Points
+# Execution Entry Points & Fast Shutdown Signal Hook
 # =========================================================================
 
-# 1. Global Thread Initialization (Executes under Gunicorn OR Command Line)
-# Checks if the thread is already running to prevent duplication on module reload
-if not any(t.name == "VisionThread" for t in threading.enumerate()):
-    t = threading.Thread(target=vision_thread, daemon=True, name="VisionThread")
-    t.start()
+if mp.current_process().name == "MainProcess":
+    _orig_sigterm = signal.getsignal(signal.SIGTERM)
+    _orig_sigint = signal.getsignal(signal.SIGINT)
 
-# 2. Command-Line Execution Hook
+    def _fast_worker_shutdown(signum, frame):
+        app_shutting_down.set()
+        if global_wildlife_detector is not None:
+            global_wildlife_detector.shutdown()
+        if callable(_orig_sigterm) and signum == signal.SIGTERM:
+            _orig_sigterm(signum, frame)
+        elif callable(_orig_sigint) and signum == signal.SIGINT:
+            _orig_sigint(signum, frame)
+        else:
+            os._exit(0)
+
+    try:
+        signal.signal(signal.SIGTERM, _fast_worker_shutdown)
+        signal.signal(signal.SIGINT, _fast_worker_shutdown)
+    except ValueError:
+        pass
+
+    if not any(t.name == "VisionThread" for t in threading.enumerate()):
+        t = threading.Thread(target=vision_thread, daemon=True, name="VisionThread")
+        t.start()
+
 if __name__ == "__main__":
     log.info("Starting local Flask development server. For production, use Gunicorn/systemd.")
-    # use_reloader=False is mandatory. Otherwise, Flask forks a second process 
-    # that attempts to bind to the same camera and serial port, causing a crash.
     app.run(host="0.0.0.0", port=5000, debug=False, threaded=True, use_reloader=False)
