@@ -188,7 +188,7 @@ STREAM_PART_FOOTER = b"\r\n"
 
 # Web UI HTTP Basic Authentication (override via systemd Environment=BOMBARDEER_USER / BOMBARDEER_PASS)
 WEB_AUTH_USER = os.environ.get("BOMBARDEER_USER", "admin")
-WEB_AUTH_PASS = os.environ.get("BOMBARDEER_PASS", "your-strong-password")
+WEB_AUTH_PASS = os.environ.get("BOMBARDEER_PASS", "bombardeer")
 
 # =========================================================================
 # Concurrency Architecture: Isolated Lock Planes
@@ -455,7 +455,7 @@ class BaseTargetDetector(abc.ABC):
         pass
 
     @abc.abstractmethod
-    def detect(self, frame_bgr: np.ndarray, capture_mono_time: float):
+    def detect(self, frame_bgr: np.ndarray, capture_mono_time: float, is_monochrome: bool = False):
         """
         Processes a 1280x720 BGR/RGB frame and returns:
             (detections_list, effective_capture_mono_time)
@@ -517,7 +517,7 @@ class ArucoTargetDetector(BaseTargetDetector):
     def is_available(self) -> bool:
         return True
 
-    def detect(self, frame_bgr: np.ndarray, capture_mono_time: float):
+    def detect(self, frame_bgr: np.ndarray, capture_mono_time: float, is_monochrome: bool = False):
         try:
             lifted = cv2.LUT(frame_bgr, self.gamma_lut)
             gray = cv2.cvtColor(lifted, cv2.COLOR_BGR2GRAY)
@@ -648,6 +648,8 @@ class MDV6Decoder1280:
     CLASS_MARGIN = 0.25           # p_anim must beat both p_pers and p_veh by >= 0.25
     MAX_ANIMAL_WIDTH_FRAC = 0.55  # Reject vehicle-sized boxes (> 55% frame width)
     MAX_ANIMAL_AREA_FRAC = 0.40   # Reject boxes covering > 40% of total frame
+    MAX_ANIMAL_ASPECT_RATIO = 1.65  # Reject tall/narrow standing-human silhouettes (h/w > 1.65)
+    MAX_NON_ANIMAL_PROB = 0.02      # Reject animal candidates if person or vehicle prob >= 0.02
 
     def __init__(
         self,
@@ -879,6 +881,25 @@ class MDV6Decoder1280:
                     })
                     continue
 
+                # Non-animal probability ceiling (reject if person or vehicle prob >= 0.02)
+                if p_pers >= self.MAX_NON_ANIMAL_PROB or p_veh >= self.MAX_NON_ANIMAL_PROB:
+                    debug_info["rejected_animals"].append({
+                        "reason": f"NON_ANIMAL_PROB(P:{p_pers:.2f},V:{p_veh:.2f})",
+                        "box": box_xyxy,
+                        "probs": (p_anim, p_pers, p_veh),
+                    })
+                    continue
+
+                # Standing-human aspect ratio filter (height / width > 1.65)
+                aspect_ratio = float(bh) / max(1.0, float(bw))
+                if aspect_ratio > self.MAX_ANIMAL_ASPECT_RATIO:
+                    debug_info["rejected_animals"].append({
+                        "reason": f"ASPECT_RATIO({aspect_ratio:.2f})",
+                        "box": box_xyxy,
+                        "probs": (p_anim, p_pers, p_veh),
+                    })
+                    continue
+
                 # Zero-overlap spatial veto against any PERSON or VEHICLE
                 is_vetoed, veto_hit = self._check_veto_overlap(box_xyxy, veto_boxes)
                 if is_vetoed:
@@ -1033,6 +1054,8 @@ class HailoWildlifeDetector(BaseTargetDetector):
     INFER_SIZE = 1280
     Y_PAD_OFFSET = (INFER_SIZE - FRAME_HEIGHT) // 2
     CONF_THRESH = 0.55
+    MONOCHROME_CONF_THRESH = 0.55
+    MAX_ANIMAL_HEIGHT_M = 1.50
     IOU_THRESH = 0.45
     PERSON_VETO_THRESH = 0.20
     VEHICLE_VETO_THRESH = 0.20
@@ -1142,7 +1165,7 @@ class HailoWildlifeDetector(BaseTargetDetector):
                 "rejected_animals": list(self._latest_debug_info.get("rejected_animals", [])),
             }
 
-    def detect(self, frame_bgr: np.ndarray, capture_mono_time: float):
+    def detect(self, frame_bgr: np.ndarray, capture_mono_time: float, is_monochrome: bool = False):
         if not self.is_available:
             return [], capture_mono_time
 
@@ -1152,6 +1175,45 @@ class HailoWildlifeDetector(BaseTargetDetector):
         while self._conn_rx.poll():
             try:
                 dets, debug_info, eff_mono, dt_ms, cur_fps = self._conn_rx.recv()
+                if dets:
+                    _, tilt_at_cap = get_turret_pos_at_time(eff_mono - 0.040)
+                    rejected_animals = debug_info.setdefault("rejected_animals", [])
+                    filtered_dets = []
+                    for d in dets:
+                        pa, pp, pv = d.get("probs", (d["score"], 0.0, 0.0))
+
+                        # Monochrome / low-light confidence gate
+                        if is_monochrome and d["score"] < self.MONOCHROME_CONF_THRESH:
+                            rejected_animals.append({
+                                "reason": f"MONO_CONF({d['score']:.2f})",
+                                "box": d["box"],
+                                "probs": (pa, pp, pv),
+                            })
+                            continue
+
+                        # Ground-plane physical height veto & trigonometric range fusion
+                        bx1, by1, bx2, by2 = d["box"]
+                        bh_px = float(max(1, by2 - by1))
+                        y_bottom = float(by2)
+                        opt_dep_mrad = math.atan2(y_bottom - OPTICAL_CENTER[1], FOCAL_LENGTH_PX) * 1000.0
+                        net_dep_mrad = opt_dep_mrad - float(tilt_at_cap) - GROUND_SLOPE_MRAD
+                        if net_dep_mrad >= 25.0 and y_bottom < (FRAME_HEIGHT - 8):
+                            r_ground = CAMERA_MOUNT_HEIGHT_M / math.sin(net_dep_mrad / 1000.0)
+                            est_height_m = (bh_px * r_ground) / FOCAL_LENGTH_PX
+                            if est_height_m > self.MAX_ANIMAL_HEIGHT_M:
+                                rejected_animals.append({
+                                    "reason": f"HEIGHT({est_height_m:.2f}m)",
+                                    "box": d["box"],
+                                    "probs": (pa, pp, pv),
+                                })
+                                continue
+                            r_stadia = d.get("range_m", DEFAULT_FALLBACK_RANGE_M)
+                            r_fused = (0.70 * r_ground) + (0.30 * r_stadia)
+                            d["range_m"] = float(np.clip(r_fused, MIN_VALID_RANGE_M, MAX_VALID_RANGE_M))
+
+                        filtered_dets.append(d)
+                    dets = filtered_dets
+
                 with self._lock:
                     self._latest_detections = dets
                     self._latest_debug_info = debug_info
@@ -2035,7 +2097,7 @@ def vision_thread():
             target_filter.reset()
             clear_primary_target()
 
-        detections, effective_capture_mono = active_detector.detect(frame_main, capture_arrival_mono)
+        detections, effective_capture_mono = active_detector.detect(frame_main, capture_arrival_mono, is_monochrome=is_monochrome_mode)
         debug_info = active_detector.get_last_debug_info()
         is_new_inference_batch = (effective_capture_mono != last_processed_capture_mono)
 
@@ -2118,25 +2180,9 @@ def vision_thread():
             pan_at_capture, tilt_at_capture = get_turret_pos_at_time(effective_capture_mono - 0.040)
 
             if "range_m" in verified_detection:
-                r_stadia = verified_detection["range_m"]
-                # Apply Ground-Plane Trigonometric Fusion when in WILDLIFE mode
-                if active_detector.name == "WILDLIFE":
-                    y_bottom = float(verified_detection["box"][3])
-                    opt_dep_mrad = math.atan2(y_bottom - OPTICAL_CENTER[1], FOCAL_LENGTH_PX) * 1000.0
-                    net_dep_mrad = opt_dep_mrad - float(tilt_at_capture) - GROUND_SLOPE_MRAD
-                    # Fuse when depression angle >= 25 mrad (~1.4 deg) and hooves aren't clipped at bottom of frame
-                    if net_dep_mrad >= 25.0 and y_bottom < (FRAME_HEIGHT - 8):
-                        r_ground = CAMERA_MOUNT_HEIGHT_M / math.sin(net_dep_mrad / 1000.0)
-                        r_fused = (0.70 * r_ground) + (0.30 * r_stadia)
-                        last_valid_range_m = float(np.clip(r_fused, MIN_VALID_RANGE_M, MAX_VALID_RANGE_M))
-                    else:
-                        last_valid_range_m = r_stadia
-                else:
-                    last_valid_range_m = r_stadia
+                last_valid_range_m = verified_detection["range_m"]
 
             current_range_m = last_valid_range_m
-
-            pan_at_capture, tilt_at_capture = get_turret_pos_at_time(effective_capture_mono - 0.040)
 
             parallax_pan_mrad = (-CAMERA_OFFSET_X_MM / (current_range_m * 1000.0)) * 1000.0
             parallax_tilt_mrad = (CAMERA_OFFSET_Y_MM / (current_range_m * 1000.0)) * 1000.0
