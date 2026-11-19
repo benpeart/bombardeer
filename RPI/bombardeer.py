@@ -26,6 +26,7 @@ import abc
 import glob
 import time
 import math
+import hmac
 import ctypes
 import shutil
 import datetime
@@ -100,9 +101,13 @@ def set_os_thread_name(name: str, cpu_cores: list = None):
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
 RECORDINGS_DIR = os.path.join(BASE_DIR, "recordings")
+DEBUG_SNAPSHOT_DIR = os.path.join(RECORDINGS_DIR, "debug_snapshots")
+MAX_DEBUG_SNAPSHOTS = 200
+AUDIT_VETO_COOLDOWN_SEC = 2.0
 
 try:
     os.makedirs(RECORDINGS_DIR, exist_ok=True)
+    os.makedirs(DEBUG_SNAPSHOT_DIR, exist_ok=True)
     test_touch = os.path.join(RECORDINGS_DIR, ".write_test")
     with open(test_touch, "w") as f:
         f.write("ok")
@@ -157,7 +162,9 @@ PAN_MAX_MRAD = 3141
 MAX_TRIGGER_DURATION_SEC = 2.0
 TRIGGER_COOLDOWN_SEC = 1.5
 
-CONFIRMATION_FRAMES = 2
+CONFIRMATION_FRAMES = 4
+CONFIRMATION_MAX_JUMP_PX = 120.0
+HOME_TIMEOUT_SEC = 60.0
 
 # Persistence & Coasting Horizons
 COAST_MAX_HORIZON_SEC = 1.500
@@ -178,6 +185,10 @@ MAX_RECORDINGS_STORAGE_GB = 10.0
 
 STREAM_PART_HEADER = b"--frame\r\nContent-Type: image/jpeg\r\n\r\n"
 STREAM_PART_FOOTER = b"\r\n"
+
+# Web UI HTTP Basic Authentication (override via systemd Environment=BOMBARDEER_USER / BOMBARDEER_PASS)
+WEB_AUTH_USER = os.environ.get("BOMBARDEER_USER", "admin")
+WEB_AUTH_PASS = os.environ.get("BOMBARDEER_PASS", "your-strong-password")
 
 # =========================================================================
 # Concurrency Architecture: Isolated Lock Planes
@@ -464,6 +475,9 @@ class BaseTargetDetector(abc.ABC):
     def get_telemetry(self) -> dict:
         return {}
 
+    def get_last_debug_info(self) -> dict:
+        return {"veto_boxes": [], "rejected_animals": []}
+
 
 class ArucoTargetDetector(BaseTargetDetector):
     """
@@ -556,25 +570,101 @@ class ArucoTargetDetector(BaseTargetDetector):
             log.error(f"[ARUCO DETECTOR ERROR] Vision parsing failed: {e}")
             return [], capture_mono_time
 
+def save_audit_snapshot(frame_bgr, tag, dets, debug_info):
+    """Saves an annotated JPEG with Animal (green), Vetoed (orange), and Person/Vehicle (red) boxes."""
+    try:
+        vis = frame_bgr.copy()
+        for v in debug_info.get("veto_boxes", []):
+            x1, y1, x2, y2 = v["box"]
+            cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 0, 255), 2)
+            cv2.putText(
+                vis,
+                f"VETO:{v['class']} {v['score']:.2f}",
+                (x1, max(y1 - 6, 15)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (0, 0, 255),
+                2,
+            )
+        for r in debug_info.get("rejected_animals", []):
+            x1, y1, x2, y2 = r["box"]
+            pa, pp, pv = r["probs"]
+            cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 165, 255), 2)
+            cv2.putText(
+                vis,
+                f"REJ:{r['reason']} A:{pa:.2f} P:{pp:.2f} V:{pv:.2f}",
+                (x1, max(y1 - 6, 15)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (0, 165, 255),
+                2,
+            )
+        for d in dets:
+            x1, y1, x2, y2 = d["box"]
+            pa, pp, pv = d.get("probs", (d["score"], 0.0, 0.0))
+            cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            cv2.putText(
+                vis,
+                f"ACQ A:{pa:.2f} P:{pp:.2f} V:{pv:.2f}",
+                (x1, max(y1 - 6, 15)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (0, 255, 0),
+                2,
+            )
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+        out_path = os.path.join(DEBUG_SNAPSHOT_DIR, f"{tag}_{ts}.jpg")
+        cv2.imwrite(out_path, vis, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+        log.info(f"[AUDIT] Saved {tag} snapshot -> {out_path}")
+
+        # Keep debug_snapshots bounded so storage never fills up
+        snaps = glob.glob(os.path.join(DEBUG_SNAPSHOT_DIR, "*.jpg"))
+        if len(snaps) > MAX_DEBUG_SNAPSHOTS:
+            snaps.sort(key=os.path.getmtime)
+            for old_snap in snaps[:-MAX_DEBUG_SNAPSHOTS]:
+                try:
+                    os.remove(old_snap)
+                except OSError:
+                    pass
+    except Exception as e:
+        log.warning(f"[AUDIT] Failed to save snapshot: {e}")
+
+
 class MDV6Decoder1280:
     """
     Zero-Allocation Quantized MegaDetector v6 (YOLOv9-c 1280x1280) Post-Processor.
-     Classes in MDV6:
+    Classes in MDV6:
         0: animal
         1: person
         2: vehicle
-    Enforces strict class dominance (animal > person & vehicle) AND a spatial
-    human-exclusion veto so the turret never tracks or fires at a person.
+    Enforces strict class dominance, dual-class (person + vehicle) zero-overlap
+    spatial veto with safety padding, maximum size sanity checks, and full audit
+    metadata for post-mortem false-positive debugging.
     """
     CLASS_LAYERS = ("MDV6-yolov9-c/conv100", "MDV6-yolov9-c/conv122", "MDV6-yolov9-c/conv144")
     BOX_LAYERS = ("MDV6-yolov9-c/conv98", "MDV6-yolov9-c/conv121", "MDV6-yolov9-c/conv143")
 
-    def __init__(self, hef, input_size=1280, y_pad_offset=280, conf_thresh=0.38, iou_thresh=0.45, person_veto_thresh=0.25):
+    VETO_PADDING_PX = 24          # Expand person/vehicle boxes by 24px in all directions
+    CLASS_MARGIN = 0.25           # p_anim must beat both p_pers and p_veh by >= 0.25
+    MAX_ANIMAL_WIDTH_FRAC = 0.55  # Reject vehicle-sized boxes (> 55% frame width)
+    MAX_ANIMAL_AREA_FRAC = 0.40   # Reject boxes covering > 40% of total frame
+
+    def __init__(
+        self,
+        hef,
+        input_size=1280,
+        y_pad_offset=280,
+        conf_thresh=0.55,
+        iou_thresh=0.45,
+        person_veto_thresh=0.20,
+        vehicle_veto_thresh=0.20,
+    ):
         self.input_size = input_size
         self.y_pad_offset = y_pad_offset
         self.conf_thresh = conf_thresh
         self.iou_thresh = iou_thresh
         self.person_veto_thresh = person_veto_thresh
+        self.vehicle_veto_thresh = vehicle_veto_thresh
         self.strides = (8, 16, 32)
         self.reg_max = 16
         self.project = np.arange(self.reg_max, dtype=np.float32)
@@ -582,6 +672,7 @@ class MDV6Decoder1280:
         # Logit thresholds: sigmoid(x) > p  <=>  x > -ln(1/p - 1)
         self.logit_thresh = -math.log((1.0 / self.conf_thresh) - 1.0)
         self.person_logit_thresh = -math.log((1.0 / self.person_veto_thresh) - 1.0)
+        self.vehicle_logit_thresh = -math.log((1.0 / self.vehicle_veto_thresh) - 1.0)
 
         # Pre-compute per-stride anchor grids
         self.head_anchors = []
@@ -599,6 +690,7 @@ class MDV6Decoder1280:
         self.quant_params = {}
         self.u8_animal_thresholds = {}
         self.u8_person_thresholds = {}
+        self.u8_vehicle_thresholds = {}
         try:
             for vinfo in hef.get_output_vstream_infos():
                 qp = vinfo.quant_info
@@ -608,8 +700,10 @@ class MDV6Decoder1280:
                 if vinfo.name in self.CLASS_LAYERS:
                     raw_anim_u8 = math.ceil((self.logit_thresh / scale) + zp)
                     raw_pers_u8 = math.ceil((self.person_logit_thresh / scale) + zp)
+                    raw_veh_u8 = math.ceil((self.vehicle_logit_thresh / scale) + zp)
                     self.u8_animal_thresholds[vinfo.name] = int(max(0, min(255, raw_anim_u8)))
                     self.u8_person_thresholds[vinfo.name] = int(max(0, min(255, raw_pers_u8)))
+                    self.u8_vehicle_thresholds[vinfo.name] = int(max(0, min(255, raw_veh_u8)))
             self.use_uint8_fastpath = (len(self.u8_animal_thresholds) == 3)
         except Exception as e:
             log.warning(f"[HAILO] Quantization metadata unavailable ({e}); using float32 fallback.")
@@ -620,30 +714,25 @@ class MDV6Decoder1280:
         e_x = np.exp(x - np.max(x, axis=axis, keepdims=True))
         return e_x / np.sum(e_x, axis=axis, keepdims=True)
 
-    @staticmethod
-    def _overlaps_person(anim_box, person_boxes, iou_limit=0.10):
-        """Returns True if anim_box [x1, y1, x2, y2] overlaps or sits inside any person_box."""
+    @classmethod
+    def _check_veto_overlap(cls, anim_box, veto_boxes):
+        """
+        Returns (True, veto_dict) if anim_box [x1, y1, x2, y2] has ANY overlap
+        with any padded person or vehicle box.
+        """
         ax1, ay1, ax2, ay2 = anim_box
-        a_area = max(1.0, float((ax2 - ax1) * (ay2 - ay1)))
-        for px1, py1, px2, py2 in person_boxes:
-            ix1 = max(ax1, px1)
-            iy1 = max(ay1, py1)
-            ix2 = min(ax2, px2)
-            iy2 = min(ay2, py2)
-            if ix2 > ix1 and iy2 > iy1:
-                inter = float((ix2 - ix1) * (iy2 - iy1))
-                p_area = max(1.0, float((px2 - px1) * (py2 - py1)))
-                # Veto if IoU > 10% OR if >= 25% of the animal box is inside the person box
-                if (inter / (a_area + p_area - inter)) > iou_limit or (inter / a_area) > 0.25:
-                    return True
-        return False
+        pad = cls.VETO_PADDING_PX
+        for v in veto_boxes:
+            vx1, vy1, vx2, vy2 = v["box"]
+            if (ax1 < vx2 + pad) and (ax2 > vx1 - pad) and (ay1 < vy2 + pad) and (ay2 > vy1 - pad):
+                return True, v
+        return False, None
 
     def decode(self, raw_outputs, assumed_height_mm):
-        cand_scores_list = []
+        cand_probs_list = []
         cand_boxes_list = []
         cand_anchors_list = []
         cand_scales_list = []
-        cand_classes_list = []  # 0 = animal, 1 = person
 
         for idx, stride in enumerate(self.strides):
             cls_name = self.CLASS_LAYERS[idx]
@@ -657,13 +746,13 @@ class MDV6Decoder1280:
             if self.use_uint8_fastpath and cls_tensor.dtype == np.uint8:
                 u8_anim_t = self.u8_animal_thresholds[cls_name]
                 u8_pers_t = self.u8_person_thresholds[cls_name]
+                u8_veh_t = self.u8_vehicle_thresholds[cls_name]
 
-                # Fast C-level filter: keep anchors that are EITHER a candidate animal OR a person
-                # Since scale/zp are shared across all 3 channels of the same conv head,
-                # direct uint8 comparison (animal_col > person_col) is mathematically exact!
+                # Collect ALL anchors exceeding animal, person, OR vehicle thresholds
                 anim_mask = (animal_col >= u8_anim_t) & (animal_col > person_col) & (animal_col > vehicle_col)
-                pers_mask = (person_col >= u8_pers_t) & (person_col >= animal_col)
-                combined_mask = anim_mask | pers_mask
+                pers_mask = (person_col >= u8_pers_t)
+                veh_mask = (vehicle_col >= u8_veh_t)
+                combined_mask = anim_mask | pers_mask | veh_mask
                 if not np.any(combined_mask):
                     continue
 
@@ -676,8 +765,9 @@ class MDV6Decoder1280:
                 raw_boxes = (raw_box_u8.astype(np.float32) - b_zp) * b_scale
             else:
                 anim_mask = (animal_col > self.logit_thresh) & (animal_col > person_col) & (animal_col > vehicle_col)
-                pers_mask = (person_col > self.person_logit_thresh) & (person_col >= animal_col)
-                combined_mask = anim_mask | pers_mask
+                pers_mask = (person_col > self.person_logit_thresh)
+                veh_mask = (vehicle_col > self.vehicle_logit_thresh)
+                combined_mask = anim_mask | pers_mask | veh_mask
                 if not np.any(combined_mask):
                     continue
 
@@ -685,44 +775,20 @@ class MDV6Decoder1280:
                 sub_cls_f32 = cls_tensor[valid_indices]
                 raw_boxes = raw_outputs[box_name].reshape(-1, 4, self.reg_max)[valid_indices]
 
-            # Compute exact sigmoid probabilities on surviving candidates
             probs = 1.0 / (1.0 + np.exp(-sub_cls_f32))
-            p_anim = probs[:, 0]
-            p_pers = probs[:, 1]
-            p_veh = probs[:, 2]
+            cand_probs_list.append(probs)
+            cand_boxes_list.append(raw_boxes)
+            cand_anchors_list.append(self.head_anchors[idx][valid_indices])
+            cand_scales_list.append(np.full(len(valid_indices), stride, dtype=np.float32))
 
-            # Class 1 (Person) candidates for spatial safety veto
-            is_person = (p_pers >= self.person_veto_thresh) & (p_pers >= p_anim)
-            # Class 0 (Animal) candidates: must exceed conf_thresh AND beat person/vehicle by at least 0.15 margin
-            is_animal = (
-                (p_anim >= self.conf_thresh)
-                & (p_anim > (p_pers + 0.15))
-                & (p_anim > (p_veh + 0.15))
-            )
+        debug_info = {"veto_boxes": [], "rejected_animals": []}
+        if not cand_probs_list:
+            return [], debug_info
 
-            keep = is_animal | is_person
-            if not np.any(keep):
-                continue
-
-            keep_idx = np.flatnonzero(keep)
-            final_indices = valid_indices[keep_idx]
-            cls_ids = np.where(is_person[keep_idx], 1, 0)
-            scores = np.where(cls_ids == 1, p_pers[keep_idx], p_anim[keep_idx])
-
-            cand_scores_list.append(scores)
-            cand_boxes_list.append(raw_boxes[keep_idx])
-            cand_anchors_list.append(self.head_anchors[idx][final_indices])
-            cand_scales_list.append(np.full(len(final_indices), stride, dtype=np.float32))
-            cand_classes_list.append(cls_ids)
-
-        if not cand_scores_list:
-            return []
-
-        cand_scores = np.concatenate(cand_scores_list)
+        cand_probs = np.vstack(cand_probs_list)
         cand_boxes = np.vstack(cand_boxes_list)
         cand_anchors = np.vstack(cand_anchors_list)
         cand_scales = np.concatenate(cand_scales_list)
-        cand_classes = np.concatenate(cand_classes_list)
 
         dist = self._softmax(cand_boxes, axis=-1)
         ltrb = np.dot(dist, self.project) * cand_scales[:, None]
@@ -735,60 +801,113 @@ class MDV6Decoder1280:
         w = x2 - x1
         h = y2 - y1
 
-        # Separate decoded boxes into Person Veto Zones vs. Animal Candidates
-        person_boxes = []
-        anim_cv_boxes = []
-        anim_scores = []
+        # 1. Separate decoded boxes into NMS-filtered Veto Zones (PERSON & VEHICLE) vs Animal Candidates
+        veto_cv_boxes, veto_scores, veto_meta = [], [], []
+        anim_cv_boxes, anim_scores, anim_probs = [], [], []
 
-        for i in range(len(cand_scores)):
+        for i in range(len(cand_probs)):
             bw_i = int(w[i])
             bh_i = int(h[i])
             if bw_i < 8 or bh_i < 8:
                 continue
             bx_i = int(x1[i])
             by_i = int(y1[i])
-            if cand_classes[i] == 1:
-                person_boxes.append((bx_i, by_i, bx_i + bw_i, by_i + bh_i))
-            else:
+            p_anim = float(cand_probs[i, 0])
+            p_pers = float(cand_probs[i, 1])
+            p_veh = float(cand_probs[i, 2])
+
+            if p_pers >= self.person_veto_thresh:
+                veto_cv_boxes.append([bx_i, by_i, bw_i, bh_i])
+                veto_scores.append(p_pers)
+                veto_meta.append(("PERSON", p_pers))
+            if p_veh >= self.vehicle_veto_thresh:
+                veto_cv_boxes.append([bx_i, by_i, bw_i, bh_i])
+                veto_scores.append(p_veh)
+                veto_meta.append(("VEHICLE", p_veh))
+
+            # Strict animal eligibility: above conf_thresh AND beats both person & vehicle by CLASS_MARGIN
+            if (
+                p_anim >= self.conf_thresh
+                and p_anim >= (p_pers + self.CLASS_MARGIN)
+                and p_anim >= (p_veh + self.CLASS_MARGIN)
+            ):
                 anim_cv_boxes.append([bx_i, by_i, bw_i, bh_i])
-                anim_scores.append(float(cand_scores[i]))
+                anim_scores.append(p_anim)
+                anim_probs.append((p_anim, p_pers, p_veh))
 
+        veto_boxes = []
+        if veto_cv_boxes:
+            v_idx = cv2.dnn.NMSBoxes(
+                veto_cv_boxes,
+                veto_scores,
+                min(self.person_veto_thresh, self.vehicle_veto_thresh),
+                0.45,
+            )
+            if len(v_idx) > 0:
+                for vi in v_idx.flatten():
+                    vx, vy, vw, vh = veto_cv_boxes[vi]
+                    v_cls, v_score = veto_meta[vi]
+                    veto_boxes.append({
+                        "class": v_cls,
+                        "score": v_score,
+                        "box": [vx, vy, vx + vw, vy + vh],
+                    })
+
+        debug_info["veto_boxes"] = veto_boxes
         if not anim_cv_boxes:
-            return []
+            return [], debug_info
 
+        # 2. NMS on Animal Candidates + Zero-Overlap Veto & Size Sanity Check
         indices = cv2.dnn.NMSBoxes(anim_cv_boxes, anim_scores, self.conf_thresh, self.iou_thresh)
 
         detections = []
+        frame_area = float(FRAME_WIDTH * FRAME_HEIGHT)
+
         if len(indices) > 0:
             for idx in indices.flatten():
                 bx, by, bw, bh = anim_cv_boxes[idx]
                 box_xyxy = [bx, by, bx + bw, by + bh]
-
-                # Spatial Veto: Discard any "animal" box that overlaps a detected human
-                if person_boxes and self._overlaps_person(box_xyxy, person_boxes):
-                    continue
-
-                score = anim_scores[idx]
-                cx = bx + (bw / 2.0)
-                cy = by + (bh * 0.60)
+                p_anim, p_pers, p_veh = anim_probs[idx]
                 area = float(bw * bh)
 
+                # Size sanity check (reject vehicle-sized boxes)
+                if (bw / FRAME_WIDTH) > self.MAX_ANIMAL_WIDTH_FRAC or (area / frame_area) > self.MAX_ANIMAL_AREA_FRAC:
+                    debug_info["rejected_animals"].append({
+                        "reason": "SIZE_LIMIT",
+                        "box": box_xyxy,
+                        "probs": (p_anim, p_pers, p_veh),
+                    })
+                    continue
+
+                # Zero-overlap spatial veto against any PERSON or VEHICLE
+                is_vetoed, veto_hit = self._check_veto_overlap(box_xyxy, veto_boxes)
+                if is_vetoed:
+                    debug_info["rejected_animals"].append({
+                        "reason": f"OVERLAP_{veto_hit['class']}({veto_hit['score']:.2f})",
+                        "box": box_xyxy,
+                        "probs": (p_anim, p_pers, p_veh),
+                    })
+                    continue
+
+                cx = bx + (bw / 2.0)
+                cy = by + (bh * 0.60)
                 est_range_m = (assumed_height_mm * FOCAL_LENGTH_PX) / (max(12.0, float(bh)) * 1000.0)
                 clamped_range_m = float(np.clip(est_range_m, MIN_VALID_RANGE_M, MAX_VALID_RANGE_M))
 
                 detections.append({
                     "box": box_xyxy,
                     "center": (cx, cy),
-                    "score": score,
+                    "score": p_anim,
+                    "probs": (p_anim, p_pers, p_veh),
                     "area": area,
                     "range_m": clamped_range_m,
                     "id": 1,
-                    "label": f"ANIMAL {score*100:.0f}%"
+                    "label": f"ANIMAL {p_anim*100:.0f}%"
                 })
 
             detections.sort(key=lambda d: (d["score"], d["area"]), reverse=True)
 
-        return detections
+        return detections, debug_info
 
 def _hailo_subprocess_entry(model_path, shm_name, cap_mono_val, active_flag, avail_flag, stop_flag, conn_tx):
     """
@@ -818,7 +937,9 @@ def _hailo_subprocess_entry(model_path, shm_name, cap_mono_val, active_flag, ava
             input_size=HailoWildlifeDetector.INFER_SIZE,
             y_pad_offset=HailoWildlifeDetector.Y_PAD_OFFSET,
             conf_thresh=HailoWildlifeDetector.CONF_THRESH,
-            iou_thresh=HailoWildlifeDetector.IOU_THRESH
+            iou_thresh=HailoWildlifeDetector.IOU_THRESH,
+            person_veto_thresh=HailoWildlifeDetector.PERSON_VETO_THRESH,
+            vehicle_veto_thresh=HailoWildlifeDetector.VEHICLE_VETO_THRESH,
         )
 
         params = VDevice.create_params()
@@ -875,7 +996,7 @@ def _hailo_subprocess_entry(model_path, shm_name, cap_mono_val, active_flag, ava
                         cv2.cvtColor(shared_frame, cv2.COLOR_BGR2RGB, dst=letterbox_roi)
 
                         raw_outputs = pipeline.infer({input_name: letterbox_tensor})
-                        dets = decoder.decode(raw_outputs, HailoWildlifeDetector.ASSUMED_TARGET_HEIGHT_MM)
+                        dets, debug_info = decoder.decode(raw_outputs, HailoWildlifeDetector.ASSUMED_TARGET_HEIGHT_MM)
                         dt_ms = (time.perf_counter() - t0) * 1000.0
 
                         frames_processed += 1
@@ -887,7 +1008,7 @@ def _hailo_subprocess_entry(model_path, shm_name, cap_mono_val, active_flag, ava
                             last_fps_time = now
 
                         try:
-                            conn_tx.send((dets, cap_mono, dt_ms, cur_fps))
+                            conn_tx.send((dets, debug_info, cap_mono, dt_ms, cur_fps))
                         except (BrokenPipeError, EOFError, OSError):
                             break
 
@@ -911,8 +1032,10 @@ class HailoWildlifeDetector(BaseTargetDetector):
     """
     INFER_SIZE = 1280
     Y_PAD_OFFSET = (INFER_SIZE - FRAME_HEIGHT) // 2
-    CONF_THRESH = 0.38
+    CONF_THRESH = 0.55
     IOU_THRESH = 0.45
+    PERSON_VETO_THRESH = 0.20
+    VEHICLE_VETO_THRESH = 0.20
     ASSUMED_TARGET_HEIGHT_MM = 950.0
 
     CANDIDATE_PATHS = [
@@ -942,6 +1065,7 @@ class HailoWildlifeDetector(BaseTargetDetector):
     def __init__(self):
         self._lock = threading.Lock()
         self._latest_detections = []
+        self._latest_debug_info = {"veto_boxes": [], "rejected_animals": []}
         self._latest_capture_mono = 0.0
         self._npu_latency_ms = 0.0
         self._npu_fps = 0.0
@@ -1000,6 +1124,7 @@ class HailoWildlifeDetector(BaseTargetDetector):
         if not active:
             with self._lock:
                 self._latest_detections = []
+                self._latest_debug_info = {"veto_boxes": [], "rejected_animals": []}
                 self._npu_fps = 0.0
 
     def get_telemetry(self) -> dict:
@@ -1008,6 +1133,13 @@ class HailoWildlifeDetector(BaseTargetDetector):
                 "npu_fps": self._npu_fps,
                 "npu_latency_ms": self._npu_latency_ms,
                 "available": self.is_available
+            }
+
+    def get_last_debug_info(self) -> dict:
+        with self._lock:
+            return {
+                "veto_boxes": list(self._latest_debug_info.get("veto_boxes", [])),
+                "rejected_animals": list(self._latest_debug_info.get("rejected_animals", [])),
             }
 
     def detect(self, frame_bgr: np.ndarray, capture_mono_time: float):
@@ -1019,9 +1151,10 @@ class HailoWildlifeDetector(BaseTargetDetector):
         # 1. Drain any completed inference results from the NPU subprocess pipe (non-blocking)
         while self._conn_rx.poll():
             try:
-                dets, eff_mono, dt_ms, cur_fps = self._conn_rx.recv()
+                dets, debug_info, eff_mono, dt_ms, cur_fps = self._conn_rx.recv()
                 with self._lock:
                     self._latest_detections = dets
+                    self._latest_debug_info = debug_info
                     self._latest_capture_mono = eff_mono
                     self._npu_latency_ms = dt_ms
                     self._npu_fps = cur_fps
@@ -1419,7 +1552,6 @@ def motion_servoing_worker(target_filter, turret_queue):
     last_fire_gate_ok_time = 0.0
 
     last_target_time = time.time()
-    HOME_TIMEOUT_SEC = 300.0
     is_homing = False
 
     MUZZLE_VELOCITY_M_S = 85.0
@@ -1653,14 +1785,28 @@ def motion_servoing_worker(target_filter, turret_queue):
 
                 idle_duration = now - last_target_time
                 if idle_duration >= HOME_TIMEOUT_SEC:
-                    if not is_homing and (abs(current_pan) > 2 or abs(current_tilt) > 2):
-                        log.info(f"[{mode}] Idle for {HOME_TIMEOUT_SEC}s. Returning turret to scan home (0,0).")
+                    off_home = (abs(current_pan) > 2 or abs(current_tilt) > 2)
+                    if not is_homing and off_home:
+                        log.info(
+                            f"[{mode}] Idle for {idle_duration:.1f}s at "
+                            f"({current_pan:+d},{current_tilt:+d}). Returning turret to scan home (0,0)."
+                        )
                         is_homing = True
-
-                    if is_homing:
-                        if abs(current_pan) <= 2 and abs(current_tilt) <= 2:
+                        turret_queue.put({
+                            "cmd": "SETPOINT",
+                            "pan": 0,
+                            "tilt": 0
+                        })
+                        last_setpoint_time = now
+                    elif is_homing:
+                        if not off_home:
                             is_homing = False
-                        elif (now - last_setpoint_time >= 2.0):
+                            log.info(f"[{mode}] Returned to scan home (0,0).")
+                        elif (not hw_moving) and (now - last_setpoint_time >= 2.0):
+                            log.info(
+                                f"[{mode}] Re-issuing home setpoint (0,0) from "
+                                f"({current_pan:+d},{current_tilt:+d})."
+                            )
                             turret_queue.put({
                                 "cmd": "SETPOINT",
                                 "pan": 0,
@@ -1763,6 +1909,7 @@ def vision_thread():
     tentative_target = None
     tentative_streak = 0
     last_processed_capture_mono = 0.0
+    last_veto_audit_time = 0.0
 
     is_recording = False
     lock_consecutive_frames = 0
@@ -1889,6 +2036,7 @@ def vision_thread():
             clear_primary_target()
 
         detections, effective_capture_mono = active_detector.detect(frame_main, capture_arrival_mono)
+        debug_info = active_detector.get_last_debug_info()
         is_new_inference_batch = (effective_capture_mono != last_processed_capture_mono)
 
         best_candidate = detections[0] if len(detections) > 0 else None
@@ -1896,16 +2044,67 @@ def vision_thread():
 
         if is_new_inference_batch:
             last_processed_capture_mono = effective_capture_mono
+
+            if active_detector.name == "WILDLIFE":
+                veto_boxes = debug_info.get("veto_boxes", [])
+                rejected_animals = debug_info.get("rejected_animals", [])
+
+                # Immediate safety abort if a person/vehicle overlaps the currently locked target
+                cur_primary = get_primary_target_snapshot()
+                if cur_primary is not None and veto_boxes:
+                    hit, veto_obj = MDV6Decoder1280._check_veto_overlap(cur_primary["box"], veto_boxes)
+                    if hit:
+                        log.warning(
+                            f"[SAFETY VETO:ACTIVE] Aborting lock — {veto_obj['class']} "
+                            f"({veto_obj['score']:.2f}) overlapped active target box {cur_primary['box']}"
+                        )
+                        clear_primary_target()
+                        target_filter.reset()
+                        tentative_target = None
+                        tentative_streak = 0
+                        best_candidate = None
+                        try:
+                            turret_queue.put_nowait({"cmd": "TRIGGER", "state": 0})
+                        except Exception:
+                            pass
+                        if now - last_veto_audit_time >= AUDIT_VETO_COOLDOWN_SEC:
+                            last_veto_audit_time = now
+                            save_audit_snapshot(frame_main, "VETO_ACTIVE", [], debug_info)
+
+                # Post-mortem audit logging & throttled snapshot for rejected animal candidates
+                if rejected_animals and (now - last_veto_audit_time >= AUDIT_VETO_COOLDOWN_SEC):
+                    last_veto_audit_time = now
+                    rej_summary = "; ".join(
+                        f"{r['reason']} A:{r['probs'][0]:.2f}/P:{r['probs'][1]:.2f}/V:{r['probs'][2]:.2f} box={r['box']}"
+                        for r in rejected_animals[:3]
+                    )
+                    log.info(f"[AUDIT:REJECTED] Blocked {len(rejected_animals)} candidate(s): {rej_summary}")
+                    save_audit_snapshot(frame_main, "VETO", detections, debug_info)
+
             if best_candidate is not None:
                 has_active = (get_primary_target_snapshot() is not None)
                 if has_active:
                     verified_detection = best_candidate
                 else:
                     if tentative_target is not None:
-                        tentative_streak += 1
+                        prev_cx, prev_cy = tentative_target["center"]
+                        cur_cx, cur_cy = best_candidate["center"]
+                        if math.hypot(cur_cx - prev_cx, cur_cy - prev_cy) <= CONFIRMATION_MAX_JUMP_PX:
+                            tentative_streak += 1
+                        else:
+                            tentative_streak = 1
                         tentative_target = best_candidate
                         if tentative_streak >= CONFIRMATION_FRAMES:
                             verified_detection = best_candidate
+                            if active_detector.name == "WILDLIFE":
+                                pa, pp, pv = best_candidate.get("probs", (best_candidate["score"], 0.0, 0.0))
+                                log.warning(
+                                    f"[ACQUIRE:WILDLIFE] Locked after {tentative_streak} frames | "
+                                    f"Probs(A:{pa:.2f} P:{pp:.2f} V:{pv:.2f}) | "
+                                    f"Box:{best_candidate['box']} | Range:{best_candidate['range_m']:.1f}m | "
+                                    f"VetoZones:{len(debug_info.get('veto_boxes', []))}"
+                                )
+                                save_audit_snapshot(frame_main, "ACQUIRE", detections, debug_info)
                     else:
                         tentative_target = best_candidate
                         tentative_streak = 1
@@ -2091,6 +2290,23 @@ def vision_thread():
             cv2.circle(annotated, (aim_x, aim_y), db_radius, ring_color, 1)
             cv2.drawMarker(annotated, (aim_x, aim_y), ring_color, cv2.MARKER_CROSS, 24, 1)
 
+            for v in debug_info.get("veto_boxes", []):
+                vx1 = int(v["box"][0] * SCALE_X)
+                vy1 = int(v["box"][1] * SCALE_Y)
+                vx2 = int(v["box"][2] * SCALE_X)
+                vy2 = int(v["box"][3] * SCALE_Y)
+                cv2.rectangle(annotated, (vx1, vy1), (vx2, vy2), (0, 0, 255), 1)
+                cv2.putText(
+                    annotated,
+                    f"VETO:{v['class']} {v['score']*100:.0f}%",
+                    (vx1, max(vy1 - 4, 12)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.35,
+                    (0, 0, 255),
+                    1,
+                    cv2.LINE_AA,
+                )
+
             for det in detections:
                 x1 = int(det["box"][0] * SCALE_X)
                 y1 = int(det["box"][1] * SCALE_Y)
@@ -2187,6 +2403,24 @@ def vision_thread():
 # =========================================================================
 # Web API & Interface
 # =========================================================================
+
+@app.before_request
+def require_web_auth():
+    """Enforces HTTP Basic Auth across all Web UI, MJPEG stream, and control API routes."""
+    if not WEB_AUTH_USER and not WEB_AUTH_PASS:
+        return None
+    auth = request.authorization
+    if (
+        auth is None
+        or not hmac.compare_digest(auth.username or "", WEB_AUTH_USER)
+        or not hmac.compare_digest(auth.password or "", WEB_AUTH_PASS)
+    ):
+        return Response(
+            "Authentication required.",
+            401,
+            {"WWW-Authenticate": 'Basic realm="Bombardeer Console"'},
+        )
+    return None
 
 @app.route("/api/mode", methods=["GET", "POST"])
 def api_mode():
