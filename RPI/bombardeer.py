@@ -170,7 +170,12 @@ HOME_TIMEOUT_SEC = 60.0
 COAST_MAX_HORIZON_SEC = 1.500
 COAST_EXP_DECAY_RATE = 2.5
 
-DEFAULT_SERIAL_PORTS = ["/dev/ttyUSB0", "/dev/ttyACM0", "/dev/ttyUSB1"]
+DEFAULT_SERIAL_PORTS = [
+    "/dev/serial/by-id/usb-Silicon_Labs_CP2102_USB_to_UART_Bridge_Controller_0001-if00-port0",
+    "/dev/ttyUSB0",
+    "/dev/ttyACM0",
+    "/dev/ttyUSB1",
+]
 BAUD_RATE = 921600
 SERIAL_HEARTBEAT_TIMEOUT_SEC = 2.5
 
@@ -1239,15 +1244,27 @@ class HailoWildlifeDetector(BaseTargetDetector):
 # =========================================================================
 # Robust Serial Worker Thread
 # =========================================================================
+try:
+    import termios
+except ImportError:
+    termios = None
+
+def _disable_hupcl(fd):
+    """Prevents Linux from toggling DTR/RTS when the serial port closes on service restart."""
+    if termios is None:
+        return
+    try:
+        attrs = termios.tcgetattr(fd)
+        attrs[2] &= ~termios.HUPCL  # cflag
+        termios.tcsetattr(fd, termios.TCSANOW, attrs)
+    except Exception as e:
+        log.debug(f"[SERIAL] Could not clear HUPCL: {e}")
+
 def find_working_serial_port():
+    """Checks for an accessible serial device without opening/closing it (avoids DTR/RTS reset)."""
     for port in DEFAULT_SERIAL_PORTS:
-        if os.path.exists(port):
-            try:
-                ser = serial.Serial(port, BAUD_RATE, timeout=0.02)
-                ser.close()
-                return port
-            except (OSError, serial.SerialException):
-                continue
+        if os.path.exists(port) and os.access(port, os.R_OK | os.W_OK):
+            return port
     return None
 
 def turret_serial_worker(cmd_queue):
@@ -1279,29 +1296,30 @@ def turret_serial_worker(cmd_queue):
                 active_port = find_working_serial_port()
                 if active_port:
                     try:
-                        ser = serial.Serial(
-                            active_port,
-                            BAUD_RATE,
-                            timeout=0.01,
-                            write_timeout=0.1,
-                            rtscts=False,
-                            dsrdtr=False
-                        )
-                        try:
-                            ser.dtr = False
-                            ser.rts = False
-                        except Exception:
-                            pass
+                        # Configure DTR/RTS BEFORE calling open() so the ESP32 auto-reset circuit is not triggered
+                        ser = serial.Serial()
+                        ser.port = active_port
+                        ser.baudrate = BAUD_RATE
+                        ser.timeout = 0.01
+                        ser.write_timeout = 0.1
+                        ser.rtscts = False
+                        ser.dsrdtr = False
+                        ser.dtr = False
+                        ser.rts = False
+                        ser.open()
+
+                        # Prevent DTR/RTS drop when the port is later closed on service stop/restart
+                        _disable_hupcl(ser.fileno())
 
                         rx_buf.clear()
                         last_telemetry_rx_time = mono_now
 
-                        time.sleep(0.3)
+                        time.sleep(0.05)
                         ser.reset_input_buffer()
                         ser.reset_output_buffer()
 
                         set_serial_connected(True)
-                        log.info(f"[SERIAL] Connected to {active_port} at {BAUD_RATE} baud.")
+                        log.info(f"[SERIAL] Connected to {active_port} at {BAUD_RATE} baud (no-reset).")
                         set_alert(f"Connected: {active_port}", duration=2.0)
 
                     except Exception as e:
@@ -1416,7 +1434,10 @@ def turret_serial_worker(cmd_queue):
                         line_bytes = rx_buf[:nl_idx].strip()
                         del rx_buf[:nl_idx + 1]
 
-                        if not line_bytes or not line_bytes.startswith(b"S "):
+                        if not line_bytes:
+                            continue
+                        if not line_bytes.startswith(b"S "):
+                            log.warning(f"[ESP32 MSG] {line_bytes.decode('ascii', errors='replace')}")
                             continue
 
                         rx_mono_time = time.monotonic()
