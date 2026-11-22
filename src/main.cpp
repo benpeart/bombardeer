@@ -4,8 +4,8 @@
     - Native Milliradian (mrad) Motion Protocol:
         * P <pan_mrad> <tilt_mrad> : Atomic absolute waypoint target (mrad)
         * V <pan_s> <tilt_s>       : Dynamic continuous velocity trim (mrad/s)
-        * X                        : Immediate dynamic controlled halt
-        * H                        : Zero current mechanical coordinates
+        * X                        : Emergency instant halt (motion + firing)
+        * H                        : Zero current mechanical coordinates (waits for stop)
         * T <0|1>                  : Autonomous solenoid trigger enable/disable
         * S <p> <t> <f> <m>        : 20 Hz deterministic telemetry stream
     - FastAccelStepper hardware-timed trapezoidal acceleration profiles.
@@ -21,6 +21,7 @@
 #include <FastAccelStepper.h>
 #include <XboxSeriesXControllerESP32_asukiaaa.hpp>
 #include <errno.h>
+#include <inttypes.h>
 #include "debug.h"
 
 // ============================================================================
@@ -28,14 +29,14 @@
 // ============================================================================
 
 // Driver 1: Pan Axis
-#define PAN_USTEP_PIN1 04
+#define PAN_USTEP_PIN1 4
 #define PAN_USTEP_PIN2 27
 #define PAN_STEP_PIN 26
 #define PAN_DIR_PIN 25
 
 // Driver 2: Tilt Axis
 #define TILT_USTEP_PIN1 18
-#define TILT_USTEP_PIN2 05
+#define TILT_USTEP_PIN2 5
 #define TILT_STEP_PIN 33
 #define TILT_DIR_PIN 32
 
@@ -58,21 +59,21 @@
 // Milliradian Kinematic Conversion Constants
 // ============================================================================
 // Standard 1.8 deg NEMA 17 motor: 200 full steps/rev * 16 usteps = 3200 steps/rev
-#define STEPPER_FULL_STEPS 200.0
-#define STEPPER_MICROSTEPS 16.0
-#define STEPS_PER_MOTOR_REV (STEPPER_FULL_STEPS * STEPPER_MICROSTEPS) // 3200.0 steps/rev
+constexpr double STEPPER_FULL_STEPS = 200.0;
+constexpr uint16_t STEPPER_MICROSTEPS = 16;
+constexpr double STEPS_PER_MOTOR_REV = STEPPER_FULL_STEPS * STEPPER_MICROSTEPS; // 3200.0 steps/rev
 
 // Pan Axis: copied from pan_timing_gears.scad
-#define PAN_RING_TEETH 246.0  // ring_teeth
-#define PAN_PINION_TEETH 37.0 // pinion_teeth
+constexpr double PAN_RING_TEETH = 246.0;  // ring_teeth
+constexpr double PAN_PINION_TEETH = 37.0; // pinion_teeth
 
 // Tilt Axis: copied from tilt_gears.scad
-#define TILT_GEAR_TEETH 50.0 // teeth
-#define TILT_WORM_STARTS 1.0 // starts
+constexpr double TILT_GEAR_TEETH = 50.0; // teeth
+constexpr double TILT_WORM_STARTS = 1.0; // starts
 
 // Mathematical constants
-#define K_PI 3.14159265358979323846
-#define MRAD_PER_REV (2000.0 * K_PI) // ~6283.1853 mrad
+constexpr double K_PI = 3.14159265358979323846;
+constexpr double MRAD_PER_REV = 2000.0 * K_PI; // ~6283.1853 mrad
 
 // Compile-time ratio calculations
 constexpr double PAN_GEAR_RATIO = PAN_RING_TEETH / PAN_PINION_TEETH;
@@ -85,55 +86,58 @@ constexpr double TILT_STEPS_PER_REV = STEPS_PER_MOTOR_REV * TILT_GEAR_RATIO;
 constexpr double TILT_STEPS_PER_MRAD = TILT_STEPS_PER_REV / MRAD_PER_REV;
 constexpr double TILT_MRAD_PER_STEP = MRAD_PER_REV / TILT_STEPS_PER_REV;
 
-inline long panMradToSteps(long mrad)
+inline int32_t panMradToSteps(int32_t mrad)
 {
-    return (mrad >= 0) ? (long)((mrad * PAN_STEPS_PER_MRAD) + 0.5)
-                       : (long)((mrad * PAN_STEPS_PER_MRAD) - 0.5);
+    double steps = mrad * PAN_STEPS_PER_MRAD;
+    return static_cast<int32_t>((steps >= 0.0) ? (steps + 0.5) : (steps - 0.5));
 }
 
-inline long panStepsToMrad(long steps)
+inline int32_t panStepsToMrad(int32_t steps)
 {
-    return (steps >= 0) ? (long)((steps * PAN_MRAD_PER_STEP) + 0.5)
-                        : (long)((steps * PAN_MRAD_PER_STEP) - 0.5);
+    double mrad = steps * PAN_MRAD_PER_STEP;
+    return static_cast<int32_t>((mrad >= 0.0) ? (mrad + 0.5) : (mrad - 0.5));
 }
 
-inline long tiltMradToSteps(long mrad)
+inline int32_t tiltMradToSteps(int32_t mrad)
 {
-    return (mrad >= 0) ? (long)((mrad * TILT_STEPS_PER_MRAD) + 0.5)
-                       : (long)((mrad * TILT_STEPS_PER_MRAD) - 0.5);
+    double steps = mrad * TILT_STEPS_PER_MRAD;
+    return static_cast<int32_t>((steps >= 0.0) ? (steps + 0.5) : (steps - 0.5));
 }
 
-inline long tiltStepsToMrad(long steps)
+inline int32_t tiltStepsToMrad(int32_t steps)
 {
-    return (steps >= 0) ? (long)((steps * TILT_MRAD_PER_STEP) + 0.5)
-                        : (long)((steps * TILT_MRAD_PER_STEP) - 0.5);
+    double mrad = steps * TILT_MRAD_PER_STEP;
+    return static_cast<int32_t>((mrad >= 0.0) ? (mrad + 0.5) : (mrad - 0.5));
 }
 
 // ============================================================================
-// Physical Travel Boundaries (FastAccelStepper Steps)
+// Physical Travel Boundaries (FastAccelStepper int32_t Steps)
 // ============================================================================
 // Pan: +-180.0 deg (+-0.5 revs = 360 deg total continuous sweep)
-#define PAN_MAX_DEGREES 180.0
-constexpr long PAN_MAX_STEPS = (long)((PAN_STEPS_PER_REV * (PAN_MAX_DEGREES / 360.0)) + 0.5);
-constexpr long PAN_MIN_STEPS = -PAN_MAX_STEPS;
+constexpr double PAN_MAX_DEGREES = 180.0;
+constexpr int32_t PAN_MAX_STEPS = static_cast<int32_t>((PAN_STEPS_PER_REV * (PAN_MAX_DEGREES / 360.0)) + 0.5);
+constexpr int32_t PAN_MIN_STEPS = -PAN_MAX_STEPS;
 
 // Tilt: +-22.5 deg (+-1/16 revs = 45 deg total vertical envelope)
-#define TILT_MAX_DEGREES 22.5
-constexpr long TILT_MAX_STEPS = (long)((TILT_STEPS_PER_REV * (TILT_MAX_DEGREES / 360.0)) + 0.5);
-constexpr long TILT_MIN_STEPS = -TILT_MAX_STEPS;
+constexpr double TILT_MAX_DEGREES = 22.5;
+constexpr int32_t TILT_MAX_STEPS = static_cast<int32_t>((TILT_STEPS_PER_REV * (TILT_MAX_DEGREES / 360.0)) + 0.5);
+constexpr int32_t TILT_MIN_STEPS = -TILT_MAX_STEPS;
 
 /*
-    Timing for Heschen HS-1564B / HS-4564B Solenoid
+    Timing for Heschen HS-1564B / HS-4564B Solenoid (Arduino millis() native unsigned long)
     * SOLENOID_PULSE_LENGTH = 40-60 ms
     * SOLENOID_COOLDOWN_LENGTH = 190 ms
     * Total cycle = 250 ms (4.0 BPS)
 */
-constexpr uint32_t SOLENOID_PULSE_LENGTH = 60;
-constexpr uint32_t SOLENOID_COOLDOWN_LENGTH = 190;
-constexpr uint32_t MAX_AUTONOMOUS_FIRE_DURATION_MS = 2000;
+constexpr unsigned long SOLENOID_PULSE_LENGTH = 60;
+constexpr unsigned long SOLENOID_COOLDOWN_LENGTH = 190;
+constexpr unsigned long MAX_AUTONOMOUS_FIRE_DURATION_MS = 2000;
 
 // Host Serial Link Watchdog Timeout (500ms without serial data -> halt autonomous motion)
-constexpr uint32_t SERIAL_WATCHDOG_TIMEOUT_MS = 500;
+constexpr unsigned long SERIAL_WATCHDOG_TIMEOUT_MS = 500;
+
+// Bounded wait timeout for 'H' homing deceleration
+constexpr unsigned long HOME_STOP_TIMEOUT_MS = 1500;
 
 // Xbox Controller Deadzone and Trigger Thresholds
 constexpr float DEADZONE_RADIUS = 0.30f;
@@ -144,19 +148,28 @@ constexpr unsigned long MANUAL_OVERRIDE_TIMEOUT_MS = 400;
 XboxSeriesXControllerESP32_asukiaaa::Core xboxController;
 
 // ============================================================================
-// Stepper Library Configuration & Instantiations
+// Stepper & TMC2209 Configuration Constants
 // ============================================================================
 
-#define PAN_STEPPER_ACCELERATION 13500 // Benchmarked production acceleration (75% limit)
-#define PAN_STEPPER_MAXSPEEDHZ 11600   // Benchmarked production max speed (80% limit)
-#define PAN_STEPPER_MINSPEEDHZ 15
+constexpr uint16_t PAN_RUN_MA = 1200;
+constexpr float PAN_HOLD_MULT = 0.75f;        // ~885 mA RMS hold against outdoor wind
+constexpr bool PAN_FORCE_SPREADCYCLE = false; // Keep quiet StealthChop for slow deer tracking
 
-#define TILT_STEPPER_ACCELERATION 50000 // Benchmarked production acceleration (~72% limit)
-#define TILT_STEPPER_MAXSPEEDHZ 14800   // Benchmarked production max speed (80% limit)
-#define TILT_STEPPER_MINSPEEDHZ 15
+constexpr uint16_t TILT_RUN_MA = 1100;
+constexpr float TILT_HOLD_MULT = 0.15f; // Self-locking 50:1 worm gear needs minimal hold
+constexpr bool TILT_FORCE_SPREADCYCLE = false;
 
-#define STEPPER_HYSTERESISHZ 300
-#define STEPPER_EXPONENT 2.0f // 1.0f = linear, 2.0f = quadratic, 3.0f = cubic
+constexpr int32_t PAN_STEPPER_ACCELERATION = 13500; // Benchmarked production acceleration (75% limit)
+constexpr uint32_t PAN_STEPPER_MAXSPEEDHZ = 11600;  // Benchmarked production max speed (80% limit)
+constexpr uint32_t PAN_STEPPER_MINSPEEDHZ = 15;
+
+constexpr int32_t TILT_STEPPER_ACCELERATION = 50000; // Benchmarked production acceleration (~72% limit)
+constexpr uint32_t TILT_STEPPER_MAXSPEEDHZ = 14800;  // Benchmarked production max speed (80% limit)
+constexpr uint32_t TILT_STEPPER_MINSPEEDHZ = 15;
+
+constexpr uint32_t STEPPER_HYSTERESISHZ = 300;
+constexpr uint32_t VELOCITY_SPEED_HYSTERESIS_HZ = 40;
+constexpr float STEPPER_EXPONENT = 2.0f; // 1.0f = linear, 2.0f = quadratic, 3.0f = cubic
 
 // TMCStepper Driver Configuration Objects
 TMC2209Stepper panTMC(&SERIAL_PORT, R_SENSE, PAN_DRIVER_ADDR);
@@ -168,7 +181,7 @@ FastAccelStepper *panStepper = NULL;
 FastAccelStepper *tiltStepper = NULL;
 
 static bool autoFireRequested = false;
-static uint32_t autoFireStartTime = 0;
+static unsigned long autoFireStartTime = 0;
 static bool manualOverrideActive = false;
 static unsigned long lastSerialRxTime = 0;
 
@@ -181,14 +194,14 @@ enum MotionMode
 static MotionMode currentMotionMode = MODE_VELOCITY;
 
 // Autonomous Target Speeds (mrad/s)
-static long commandedPanSpeed = 0;
-static long commandedTiltSpeed = 0;
+static int32_t commandedPanSpeed = 0;
+static int32_t commandedTiltSpeed = 0;
 
-// Active Applied Stepper States
-static long appliedPanSpeed = 0;
-static long appliedTiltSpeed = 0;
-static int activePanDir = 0; // -1 = backward, 0 = stopped, 1 = forward
-static int activeTiltDir = 0;
+// Active Applied Stepper States (Hz, matching FastAccelStepper::setSpeedInHz)
+static uint32_t appliedPanSpeed = 0;
+static uint32_t appliedTiltSpeed = 0;
+static int8_t activePanDir = 0; // -1 = backward, 0 = stopped, 1 = forward
+static int8_t activeTiltDir = 0;
 
 // ============================================================================
 // TMC2209 Driver Configuration
@@ -205,13 +218,14 @@ bool initTMC2209(TMC2209Stepper &driver, const char *axisName, uint16_t current_
     uint8_t result = driver.test_connection();
     if (result != 0)
     {
-        DB_PRINTF("[TMC2209] ERROR: %s axis connection failed! Code: %d (Check wiring/addressing)\n", axisName, result);
+        DB_PRINTF("[TMC2209] ERROR: %s axis connection failed! Code: %u (Check wiring/addressing)\n", axisName, result);
         return false;
     }
 
     // 2. Clear fault flags & configure operating mode
     driver.toff(0);                // Disable driver output during register configuration
     driver.pdn_disable(true);      // Use PDN pin exclusively for UART communication
+    driver.I_scale_analog(false);  // Use internal VREF so trimpot cannot scale down UART current
     driver.mstep_reg_select(true); // Microsteps configured via UART registers, not hardware pins
 
     // 3. Set RMS active current and reduced holding current to prevent standstill overheating
@@ -221,10 +235,10 @@ bool initTMC2209(TMC2209Stepper &driver, const char *axisName, uint16_t current_
     driver.microsteps(STEPPER_MICROSTEPS); // 1/16 Microstepping from FastAccelStepper
     driver.intpol(true);                   // Interpolate to 1/256 internally for smooth motion
 
-    // 5. Standstill & Powerdown Timing (drops to hold current ~0.15s after motion stops)
-    driver.iholddelay(4);   // Delay before current reduction begins
-    driver.TPOWERDOWN(128); // Smooth transition window to hold current
-    driver.freewheel(0);    // Normal current reduction during hold
+    // 5. Standstill & Powerdown Timing (drops to hold current ~2.8s after motion stops)
+    driver.iholddelay(4);   // Smooth ramp-down rate to hold current (~87 ms per step)
+    driver.TPOWERDOWN(128); // Delay before current reduction begins (~2.8 s at 12 MHz)
+    driver.freewheel(0);    // Normal energized coil holding during standstill
 
     // 6. Chopper Configuration
     driver.blank_time(24); // Comparator blank time
@@ -234,7 +248,7 @@ bool initTMC2209(TMC2209Stepper &driver, const char *axisName, uint16_t current_
         // Pure SpreadCycle (Higher torque across all speeds, but hums at standstill)
         driver.en_spreadCycle(true);
         driver.pwm_autoscale(false);
-        DB_PRINTF("[TMC2209] %s Configured: %d mA RMS, Pure SpreadCycle\n", axisName, current_mA);
+        DB_PRINTF("[TMC2209] %s Configured: %u mA RMS, Pure SpreadCycle\n", axisName, current_mA);
     }
     else
     {
@@ -242,11 +256,12 @@ bool initTMC2209(TMC2209Stepper &driver, const char *axisName, uint16_t current_
         // automatically transitions to SpreadCycle at high speed to avoid step loss.
         driver.en_spreadCycle(false); // Enable StealthChop for dead-silent standstill
         driver.pwm_autoscale(true);   // Automatically scale StealthChop voltage
+        driver.pwm_autograd(true);    // Automatically tune PWM gradient
 
         // Threshold where driver switches from StealthChop to SpreadCycle:
         // Set so standstill and low/mid speeds remain silent, while top speeds (>3000 Hz) engage SpreadCycle
         driver.TPWMTHRS(200);
-        DB_PRINTF("[TMC2209] %s Configured: %d mA RMS, StealthChop Standstill + Hybrid Switch\n", axisName, current_mA);
+        DB_PRINTF("[TMC2209] %s Configured: %u mA RMS, StealthChop Standstill + Hybrid Switch\n", axisName, current_mA);
     }
 
     // 7. Enable chopper
@@ -254,25 +269,27 @@ bool initTMC2209(TMC2209Stepper &driver, const char *axisName, uint16_t current_
 
     // 8. Read-back register validation to ensure UART writes were latched
     uint16_t readMicrosteps = driver.microsteps();
-    uint16_t readCurrent = driver.cs2rms(driver.irun());
+    uint16_t readRunCurrent = driver.cs2rms(driver.irun());
+    uint16_t readHoldCurrent = driver.cs2rms(driver.ihold());
     bool regSelectActive = driver.mstep_reg_select();
+    bool internalVref = !driver.I_scale_analog();
 
-    if (!regSelectActive || readMicrosteps != STEPPER_MICROSTEPS)
+    if (!regSelectActive || !internalVref || readMicrosteps != STEPPER_MICROSTEPS)
     {
-        DB_PRINTF("[TMC2209] ERROR: %s register read-back failed! (Microsteps: %u, RegSelect: %d)\n",
-                  axisName, readMicrosteps, regSelectActive ? 1 : 0);
+        DB_PRINTF("[TMC2209] ERROR: %s register read-back failed! (Microsteps: %u, RegSelect: %d, IntVref: %d)\n",
+                  axisName, readMicrosteps, regSelectActive ? 1 : 0, internalVref ? 1 : 0);
         return false;
     }
 
-    DB_PRINTF("[TMC2209] %s OK: %u mA Run, %u%% Hold, %u Microsteps, RegCtrl: Verified\n",
-              axisName, readCurrent, (uint16_t)(hold_multiplier * 100.0f), readMicrosteps);
+    DB_PRINTF("[TMC2209] %s OK: %u mA Run, %u mA Hold, %u Microsteps, SpreadCycle: %d\n",
+              axisName, readRunCurrent, readHoldCurrent, readMicrosteps, forceSpreadCycle ? 1 : 0);
     return true;
 }
 
 // Persistent state tracker per axis to manage hysteresis and single-shot stops
 struct AxisControlState
 {
-    int lastDir = 0;          // -1 = Reverse, 0 = Stopped, 1 = Forward
+    int8_t lastDir = 0;       // -1 = Reverse, 0 = Stopped, 1 = Forward
     uint32_t lastSpeedHz = 0; // Last speed commanded to the driver
 };
 
@@ -292,7 +309,7 @@ void updateAxisFromJoystick(
     if (!stepper)
         return;
 
-    float absInput = fabs(rawInput);
+    float absInput = fabsf(rawInput);
 
     // Single-Shot Stop on Deadzone Release
     if (absInput <= deadzone)
@@ -314,14 +331,17 @@ void updateAxisFromJoystick(
     // Exponential Response Curve
     float curvedPct = powf(normPct, exponent);
 
-    uint32_t targetSpeedHz = (uint32_t)(curvedPct * maxSpeedHz);
+    uint32_t targetSpeedHz = static_cast<uint32_t>(curvedPct * maxSpeedHz);
     if (targetSpeedHz < minSpeedHz)
         targetSpeedHz = minSpeedHz;
 
-    int currentDir = (rawInput > 0.0f) ? 1 : -1;
+    int8_t currentDir = (rawInput > 0.0f) ? 1 : -1;
 
+    uint32_t speedDiffHz = (targetSpeedHz > state.lastSpeedHz)
+                               ? (targetSpeedHz - state.lastSpeedHz)
+                               : (state.lastSpeedHz - targetSpeedHz);
     bool dirChanged = (currentDir != state.lastDir);
-    bool speedChangedSignificantly = (abs((long)targetSpeedHz - (long)state.lastSpeedHz) > (long)hysteresisHz);
+    bool speedChangedSignificantly = (speedDiffHz > hysteresisHz);
 
     if (dirChanged)
     {
@@ -403,6 +423,7 @@ void updateSolenoid()
 void processXboxOverride(AxisControlState &panState, AxisControlState &tiltState)
 {
     static unsigned long lastManualInputTime = 0;
+    static bool manualInputSeen = false;
     static bool lastBtnA = false;
 
     float rawPan = 0.0f;
@@ -415,14 +436,14 @@ void processXboxOverride(AxisControlState &panState, AxisControlState &tiltState
 
     if (xboxController.isConnected() && !xboxController.isWaitingForFirstNotification())
     {
-        constexpr float invHalfJoy = 2.0f / (float)XboxControllerNotificationParser::maxJoy;
-        constexpr float invMaxTrig = 1.0f / (float)XboxControllerNotificationParser::maxTrig;
+        constexpr float invHalfJoy = 2.0f / XboxControllerNotificationParser::maxJoy;
+        constexpr float invMaxTrig = 1.0f / XboxControllerNotificationParser::maxTrig;
 
-        rawPan = ((float)xboxController.xboxNotif.joyLHori * invHalfJoy) - 1.0f;
-        rawTilt = ((float)xboxController.xboxNotif.joyLVert * invHalfJoy) - 1.0f;
-        trigger = (float)xboxController.xboxNotif.trigRT * invMaxTrig;
+        rawPan = (xboxController.xboxNotif.joyLHori * invHalfJoy) - 1.0f;
+        rawTilt = (xboxController.xboxNotif.joyLVert * invHalfJoy) - 1.0f;
+        trigger = xboxController.xboxNotif.trigRT * invMaxTrig;
 
-        stickActive = (fabs(rawPan) > DEADZONE_RADIUS || fabs(rawTilt) > DEADZONE_RADIUS);
+        stickActive = (fabsf(rawPan) > DEADZONE_RADIUS || fabsf(rawTilt) > DEADZONE_RADIUS);
         triggerActive = (trigger > TRIGGER_THRESHOLD);
 
         // Single-Shot 'A' Button: Zero Current Mechanical Coordinates
@@ -451,8 +472,13 @@ void processXboxOverride(AxisControlState &panState, AxisControlState &tiltState
         if (stickActive || triggerActive || btnAPressed)
         {
             lastManualInputTime = millis();
+            manualInputSeen = true;
             commandedPanSpeed = 0;
             commandedTiltSpeed = 0;
+            activePanDir = 0;
+            activeTiltDir = 0;
+            appliedPanSpeed = 0;
+            appliedTiltSpeed = 0;
             currentMotionMode = MODE_VELOCITY;
         }
     }
@@ -464,7 +490,11 @@ void processXboxOverride(AxisControlState &panState, AxisControlState &tiltState
         lastBtnA = false;
     }
 
-    manualOverrideActive = (millis() - lastManualInputTime < MANUAL_OVERRIDE_TIMEOUT_MS);
+    if (manualInputSeen && (millis() - lastManualInputTime >= MANUAL_OVERRIDE_TIMEOUT_MS))
+    {
+        manualInputSeen = false;
+    }
+    manualOverrideActive = manualInputSeen;
 
     if (manualOverrideActive)
     {
@@ -500,7 +530,7 @@ void processXboxOverride(AxisControlState &panState, AxisControlState &tiltState
 // Atomic Absolute Waypoint Actuation (P Command)
 // ============================================================================
 
-void commandAbsolutePositionMrad(long targetPanMrad, long targetTiltMrad)
+void commandAbsolutePositionMrad(int32_t targetPanMrad, int32_t targetTiltMrad)
 {
     currentMotionMode = MODE_POSITION;
     commandedPanSpeed = 0;
@@ -513,14 +543,14 @@ void commandAbsolutePositionMrad(long targetPanMrad, long targetTiltMrad)
     if (panStepper)
     {
         panStepper->setSpeedInHz(PAN_STEPPER_MAXSPEEDHZ);
-        long targetSteps = constrain(panMradToSteps(targetPanMrad), PAN_MIN_STEPS, PAN_MAX_STEPS);
+        int32_t targetSteps = constrain(panMradToSteps(targetPanMrad), PAN_MIN_STEPS, PAN_MAX_STEPS);
         panStepper->moveTo(targetSteps);
     }
 
     if (tiltStepper)
     {
         tiltStepper->setSpeedInHz(TILT_STEPPER_MAXSPEEDHZ);
-        long targetSteps = constrain(tiltMradToSteps(targetTiltMrad), TILT_MIN_STEPS, TILT_MAX_STEPS);
+        int32_t targetSteps = constrain(tiltMradToSteps(targetTiltMrad), TILT_MIN_STEPS, TILT_MAX_STEPS);
         tiltStepper->moveTo(targetSteps);
     }
 }
@@ -534,20 +564,21 @@ void applyVelocityActuation()
     if (currentMotionMode != MODE_VELOCITY || !panStepper || !tiltStepper)
         return;
 
-    long curPan = panStepper->getCurrentPosition();
-    long curTilt = tiltStepper->getCurrentPosition();
+    int32_t curPan = panStepper->getCurrentPosition();
+    int32_t curTilt = tiltStepper->getCurrentPosition();
 
     // --- 1. PAN AXIS VELOCITY ---
-    long targetPan = commandedPanSpeed; // in mrad/s
+    int32_t targetPan = commandedPanSpeed; // in mrad/s
     if (targetPan > 0 && curPan >= PAN_MAX_STEPS)
         targetPan = 0;
     if (targetPan < 0 && curPan <= PAN_MIN_STEPS)
         targetPan = 0;
 
-    // Convert mrad/s directly into steps/s (Hz)
-    long targetPanHz = labs(targetPan) * PAN_STEPS_PER_MRAD;
-    if (targetPanHz > PAN_STEPPER_MAXSPEEDHZ)
-        targetPanHz = PAN_STEPPER_MAXSPEEDHZ;
+    // Convert mrad/s into unsigned steps/s (Hz), clamping before integer conversion
+    double rawPanHz = fabs(targetPan * PAN_STEPS_PER_MRAD);
+    uint32_t targetPanHz = (rawPanHz >= PAN_STEPPER_MAXSPEEDHZ)
+                               ? PAN_STEPPER_MAXSPEEDHZ
+                               : static_cast<uint32_t>(rawPanHz);
 
     if (targetPanHz < PAN_STEPPER_MINSPEEDHZ)
     {
@@ -560,10 +591,10 @@ void applyVelocityActuation()
     }
     else
     {
-        int reqPanDir = (targetPan > 0) ? 1 : -1;
+        int8_t reqPanDir = (targetPan > 0) ? 1 : -1;
         if (reqPanDir != activePanDir)
         {
-            panStepper->setSpeedInHz((uint32_t)targetPanHz);
+            panStepper->setSpeedInHz(targetPanHz);
             if (reqPanDir > 0)
                 panStepper->runForward();
             else
@@ -571,25 +602,26 @@ void applyVelocityActuation()
             activePanDir = reqPanDir;
             appliedPanSpeed = targetPanHz;
         }
-        else if (targetPanHz < appliedPanSpeed || abs(targetPanHz - appliedPanSpeed) >= 40)
+        else if (targetPanHz < appliedPanSpeed || (targetPanHz - appliedPanSpeed) >= VELOCITY_SPEED_HYSTERESIS_HZ)
         {
-            panStepper->setSpeedInHz((uint32_t)targetPanHz);
+            panStepper->setSpeedInHz(targetPanHz);
             panStepper->applySpeedAcceleration();
             appliedPanSpeed = targetPanHz;
         }
     }
 
     // --- 2. TILT AXIS VELOCITY ---
-    long targetTilt = commandedTiltSpeed; // in mrad/s
+    int32_t targetTilt = commandedTiltSpeed; // in mrad/s
     if (targetTilt > 0 && curTilt >= TILT_MAX_STEPS)
         targetTilt = 0;
     if (targetTilt < 0 && curTilt <= TILT_MIN_STEPS)
         targetTilt = 0;
 
-    // Convert mrad/s directly into steps/s (Hz)
-    long targetTiltHz = labs(targetTilt) * TILT_STEPS_PER_MRAD;
-    if (targetTiltHz > TILT_STEPPER_MAXSPEEDHZ)
-        targetTiltHz = TILT_STEPPER_MAXSPEEDHZ;
+    // Convert mrad/s into unsigned steps/s (Hz), clamping before integer conversion
+    double rawTiltHz = fabs(targetTilt * TILT_STEPS_PER_MRAD);
+    uint32_t targetTiltHz = (rawTiltHz >= TILT_STEPPER_MAXSPEEDHZ)
+                                ? TILT_STEPPER_MAXSPEEDHZ
+                                : static_cast<uint32_t>(rawTiltHz);
 
     if (targetTiltHz < TILT_STEPPER_MINSPEEDHZ)
     {
@@ -602,10 +634,10 @@ void applyVelocityActuation()
     }
     else
     {
-        int reqTiltDir = (targetTilt > 0) ? 1 : -1;
+        int8_t reqTiltDir = (targetTilt > 0) ? 1 : -1;
         if (reqTiltDir != activeTiltDir)
         {
-            tiltStepper->setSpeedInHz((uint32_t)targetTiltHz);
+            tiltStepper->setSpeedInHz(targetTiltHz);
             if (reqTiltDir > 0)
                 tiltStepper->runForward();
             else
@@ -613,9 +645,9 @@ void applyVelocityActuation()
             activeTiltDir = reqTiltDir;
             appliedTiltSpeed = targetTiltHz;
         }
-        else if (targetTiltHz < appliedTiltSpeed || abs(targetTiltHz - appliedTiltSpeed) >= 40)
+        else if (targetTiltHz < appliedTiltSpeed || (targetTiltHz - appliedTiltSpeed) >= VELOCITY_SPEED_HYSTERESIS_HZ)
         {
-            tiltStepper->setSpeedInHz((uint32_t)targetTiltHz);
+            tiltStepper->setSpeedInHz(targetTiltHz);
             tiltStepper->applySpeedAcceleration();
             appliedTiltSpeed = targetTiltHz;
         }
@@ -641,7 +673,7 @@ void processSerialCommands()
 
     while (Serial.available() > 0)
     {
-        char c = (char)Serial.read();
+        char c = static_cast<char>(Serial.read());
 
         if (rxIdx == 0)
         {
@@ -670,7 +702,7 @@ void processSerialCommands()
 
                     // 1. Parse Pan Target
                     errno = 0;
-                    long targetPanMrad = strtol(ptr, &endptr, 10);
+                    long parsedPan = strtol(ptr, &endptr, 10);
                     if (endptr == ptr || errno == ERANGE || *endptr != ' ')
                     {
                         break; // No digits parsed, overflow/underflow, or missing space delimiter
@@ -679,7 +711,7 @@ void processSerialCommands()
                     // 2. Parse Tilt Target
                     ptr = endptr + 1;
                     errno = 0;
-                    long targetTiltMrad = strtol(ptr, &endptr, 10);
+                    long parsedTilt = strtol(ptr, &endptr, 10);
                     if (endptr == ptr || errno == ERANGE)
                     {
                         break; // No digits parsed or overflow/underflow
@@ -695,7 +727,7 @@ void processSerialCommands()
                         break; // Malformed payload with unparsed trailing bytes
                     }
 
-                    commandAbsolutePositionMrad(targetPanMrad, targetTiltMrad);
+                    commandAbsolutePositionMrad(static_cast<int32_t>(parsedPan), static_cast<int32_t>(parsedTilt));
                     break;
                 }
 
@@ -706,7 +738,7 @@ void processSerialCommands()
 
                     // 1. Parse Pan Speed
                     errno = 0;
-                    long targetPanSpeed = strtol(ptr, &endptr, 10);
+                    long parsedPanSpeed = strtol(ptr, &endptr, 10);
                     if (endptr == ptr || errno == ERANGE || *endptr != ' ')
                     {
                         break; // No digits parsed, overflow/underflow, or missing space delimiter
@@ -715,7 +747,7 @@ void processSerialCommands()
                     // 2. Parse Tilt Speed
                     ptr = endptr + 1;
                     errno = 0;
-                    long targetTiltSpeed = strtol(ptr, &endptr, 10);
+                    long parsedTiltSpeed = strtol(ptr, &endptr, 10);
                     if (endptr == ptr || errno == ERANGE)
                     {
                         break; // No digits parsed or overflow/underflow
@@ -732,12 +764,12 @@ void processSerialCommands()
                     }
 
                     currentMotionMode = MODE_VELOCITY;
-                    commandedPanSpeed = targetPanSpeed;
-                    commandedTiltSpeed = targetTiltSpeed;
+                    commandedPanSpeed = static_cast<int32_t>(parsedPanSpeed);
+                    commandedTiltSpeed = static_cast<int32_t>(parsedTiltSpeed);
                     break;
                 }
 
-                case 'X': // Emergency / Commanded Stop
+                case 'X': // Emergency Stop (big red button: cease all motion & firing immediately)
                 {
                     currentMotionMode = MODE_VELOCITY;
                     commandedPanSpeed = 0;
@@ -746,10 +778,20 @@ void processSerialCommands()
                     activeTiltDir = 0;
                     appliedPanSpeed = 0;
                     appliedTiltSpeed = 0;
+
+                    // Immediately cut solenoid power and cancel autonomous fire
+                    autoFireRequested = false;
+                    digitalWrite(PIN_SOLENOID, LOW);
+                    if (solenoidState == SOLENOID_FIRING)
+                    {
+                        solenoidTimer = millis();
+                        solenoidState = SOLENOID_COOLDOWN;
+                    }
+
                     if (panStepper)
-                        panStepper->forceStopAndNewPosition(panStepper->getCurrentPosition());
+                        panStepper->forceStop();
                     if (tiltStepper)
-                        tiltStepper->forceStopAndNewPosition(tiltStepper->getCurrentPosition());
+                        tiltStepper->forceStop();
                     break;
                 }
 
@@ -774,7 +816,7 @@ void processSerialCommands()
                     break;
                 }
 
-                case 'H': // Zero Current Coordinates
+                case 'H': // Zero Current Coordinates (decelerate to full stop, then zero)
                 {
                     currentMotionMode = MODE_VELOCITY;
                     commandedPanSpeed = 0;
@@ -783,16 +825,48 @@ void processSerialCommands()
                     activeTiltDir = 0;
                     appliedPanSpeed = 0;
                     appliedTiltSpeed = 0;
+
+                    // Ensure solenoid cannot remain energized while waiting for deceleration
+                    autoFireRequested = false;
+                    digitalWrite(PIN_SOLENOID, LOW);
+                    if (solenoidState == SOLENOID_FIRING)
+                    {
+                        solenoidTimer = millis();
+                        solenoidState = SOLENOID_COOLDOWN;
+                    }
+
+                    if (panStepper)
+                        panStepper->stopMove();
+                    if (tiltStepper)
+                        tiltStepper->stopMove();
+
+                    unsigned long stopStart = millis();
+                    while (((panStepper && panStepper->isRunning()) ||
+                            (tiltStepper && tiltStepper->isRunning())) &&
+                           (millis() - stopStart < HOME_STOP_TIMEOUT_MS))
+                    {
+                        updateSolenoid();
+                        delay(1);
+                    }
+
                     if (panStepper)
                     {
-                        panStepper->stopMove();
-                        panStepper->setCurrentPosition(0);
+                        if (panStepper->isRunning())
+                            panStepper->forceStopAndNewPosition(0);
+                        else
+                            panStepper->setCurrentPosition(0);
                     }
+
                     if (tiltStepper)
                     {
-                        tiltStepper->stopMove();
-                        tiltStepper->setCurrentPosition(0);
+                        if (tiltStepper->isRunning())
+                            tiltStepper->forceStopAndNewPosition(0);
+                        else
+                            tiltStepper->setCurrentPosition(0);
                     }
+
+                    lastSerialRxTime = millis();
+                    DB_PRINTLN("[SERIAL] Axes stopped; home coordinates zeroed to (0,0) via 'H'.");
                     break;
                 }
 
@@ -862,8 +936,8 @@ void setup()
 
     SERIAL_PORT.begin(115200, SERIAL_8N1, TMC_RX_PIN, TMC_TX_PIN);
 
-    initTMC2209(panTMC, "PAN", 1200, 0.25f);
-    initTMC2209(tiltTMC, "TILT", 1100, 0.15f);
+    initTMC2209(panTMC, "PAN", PAN_RUN_MA, PAN_HOLD_MULT, PAN_FORCE_SPREADCYCLE);
+    initTMC2209(tiltTMC, "TILT", TILT_RUN_MA, TILT_HOLD_MULT, TILT_FORCE_SPREADCYCLE);
 
     digitalWrite(SHARED_ENABLE_PIN, LOW);
 
@@ -911,18 +985,26 @@ void loop()
     static AxisControlState tiltState;
     static unsigned long lastTelemetryTime = 0;
 
-    // Periodic check to restore register configuration if TMC2209 brownout reset occurred
+    // Periodic check to restore register configuration if a TMC2209 brownout reset occurred
     static unsigned long lastDriverCheck = 0;
-    if ((millis() - lastDriverCheck >= 3000) && !panStepper->isRunning() && !tiltStepper->isRunning())
+    if ((millis() - lastDriverCheck >= 3000) &&
+        (!panStepper || !panStepper->isRunning()) &&
+        (!tiltStepper || !tiltStepper->isRunning()))
     {
         lastDriverCheck = millis();
 
-        if (!panTMC.mstep_reg_select() || panTMC.microsteps() != 16 ||
-            !tiltTMC.mstep_reg_select() || tiltTMC.microsteps() != 16)
+        if (panTMC.test_connection() == 0 &&
+            (!panTMC.mstep_reg_select() || panTMC.I_scale_analog() || panTMC.microsteps() != STEPPER_MICROSTEPS))
         {
-            DB_PRINTLN("[TMC2209] Driver reset detected! Re-applying UART parameters...");
-            initTMC2209(panTMC, "PAN", 1200, 0.25f);
-            initTMC2209(tiltTMC, "TILT", 1100, 0.15f);
+            DB_PRINTLN("[TMC2209] PAN driver reset detected! Re-applying UART parameters...");
+            initTMC2209(panTMC, "PAN", PAN_RUN_MA, PAN_HOLD_MULT, PAN_FORCE_SPREADCYCLE);
+        }
+
+        if (tiltTMC.test_connection() == 0 &&
+            (!tiltTMC.mstep_reg_select() || tiltTMC.I_scale_analog() || tiltTMC.microsteps() != STEPPER_MICROSTEPS))
+        {
+            DB_PRINTLN("[TMC2209] TILT driver reset detected! Re-applying UART parameters...");
+            initTMC2209(tiltTMC, "TILT", TILT_RUN_MA, TILT_HOLD_MULT, TILT_FORCE_SPREADCYCLE);
         }
     }
 
@@ -939,6 +1021,10 @@ void loop()
         {
             commandedPanSpeed = 0;
             commandedTiltSpeed = 0;
+            activePanDir = 0;
+            activeTiltDir = 0;
+            appliedPanSpeed = 0;
+            appliedTiltSpeed = 0;
             if (panStepper)
                 panStepper->stopMove();
             if (tiltStepper)
@@ -974,12 +1060,12 @@ void loop()
     if (now - lastTelemetryTime >= 50)
     {
         lastTelemetryTime = now;
-        long currentPanSteps = panStepper ? panStepper->getCurrentPosition() : 0;
-        long currentTiltSteps = tiltStepper ? tiltStepper->getCurrentPosition() : 0;
+        int32_t currentPanSteps = panStepper ? panStepper->getCurrentPosition() : 0;
+        int32_t currentTiltSteps = tiltStepper ? tiltStepper->getCurrentPosition() : 0;
         bool isMoving = (panStepper && panStepper->isRunning()) || (tiltStepper && tiltStepper->isRunning());
         bool firingActive = (autoFireRequested || solenoidState != SOLENOID_IDLE);
 
-        Serial.printf("S %lu %ld %ld %d %d\n",
+        Serial.printf("S %lu %" PRId32 " %" PRId32 " %d %d\n",
                       now,
                       panStepsToMrad(currentPanSteps),
                       tiltStepsToMrad(currentTiltSteps),
