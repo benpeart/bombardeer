@@ -152,7 +152,7 @@ XboxSeriesXControllerESP32_asukiaaa::Core xboxController;
 // ============================================================================
 
 constexpr uint16_t PAN_RUN_MA = 1200;
-constexpr float PAN_HOLD_MULT = 0.75f;        // ~885 mA RMS hold against outdoor wind
+constexpr float PAN_HOLD_MULT = 0.50f;        // ~611 mA RMS hold against outdoor wind (IHOLD=10)
 constexpr bool PAN_FORCE_SPREADCYCLE = false; // Keep quiet StealthChop for slow deer tracking
 
 constexpr uint16_t TILT_RUN_MA = 1100;

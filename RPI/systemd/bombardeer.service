@@ -1,12 +1,18 @@
 [Unit]
 Description=Bombardeer Auto-Turret Vision Service
-After=network.target
+After=network-online.target
+Wants=network-online.target
 
 [Service]
-Type=simple
+Type=notify
+NotifyAccess=all
 User=ben
 WorkingDirectory=/home/ben/bombardeer
-ExecStart=/usr/bin/python3 /home/ben/bombardeer/bombardeer.py
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/gunicorn --workers 1 --threads 16 --graceful-timeout 10 --bind [::]:5000 --access-logfile - bombardeer:app
+TimeoutStartSec=30
+TimeoutStopSec=15
+WatchdogSec=15
 Restart=always
 RestartSec=5
 StandardOutput=journal

@@ -1,0 +1,1 @@
+"""Hardware abstraction workers: ESP32 serial link, video recorder, and camera pipeline."""

@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Bombardeer Console</title>
+    <link rel="icon" type="image/x-icon" href="/favicon.ico">
+    <link rel="icon" type="image/svg+xml" href="/static/bombardeer.svg">
+    <link rel="icon" type="image/png" sizes="32x32" href="/static/favicon-32x32.png">
+    <link rel="icon" type="image/png" sizes="16x16" href="/static/favicon-16x16.png">
+    <link rel="apple-touch-icon" sizes="180x180" href="/static/apple-touch-icon.png">
+    <link rel="manifest" href="/static/site.webmanifest">
+    <meta name="theme-color" content="#0d1117">
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            background: #0d1117; color: #c9d1d9;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            display: flex; flex-direction: column; align-items: center; justify-content: center;
+            min-height: 100vh; padding: 12px;
+        }
+        .hud-card {
+            background: #161b22; border: 1px solid #30363d; border-radius: 12px;
+            padding: 14px; box-shadow: 0 8px 24px rgba(0,0,0,0.6); text-align: center;
+            width: min(100%, {{ display_width + 30 }}px); display: flex; flex-direction: column; align-items: center;
+        }
+        .header-bar { display: flex; justify-content: space-between; align-items: center; width: 100%; margin-bottom: 10px; gap: 8px; flex-wrap: wrap; }
+        .brand-wrap { display: flex; align-items: center; gap: 8px; }
+        h1 { font-size: 1.05rem; letter-spacing: 0.05em; text-transform: uppercase; color: #39d353; }
+        .status-pill { font-size: 0.70rem; font-weight: 800; letter-spacing: 0.08em; padding: 3px 8px; border-radius: 12px; text-transform: uppercase; }
+        .pill-off { background: #23863622; color: #3fb950; border: 1px solid #238636; }
+        .pill-on { background: #1f6feb22; color: #58a6ff; border: 1px solid #1f6feb; }
+        .pill-cal { background: #d2992222; color: #f0883e; border: 1px solid #d29922; }
+        .pill-armed { background: #da363333; color: #f85149; border: 1px solid #da3633; animation: pulse-red 1.2s infinite; }
+        @keyframes pulse-red { 0%,100% { opacity: 0.85; } 50% { opacity: 1; } }
+        .detector-bar {
+            display: flex; align-items: center; justify-content: space-between; width: 100%;
+            background: #0d1117; border: 1px solid #30363d; border-radius: 8px; padding: 6px 10px; margin-bottom: 10px; gap: 8px;
+        }
+        .detector-label { font-size: 0.75rem; font-weight: 700; text-transform: uppercase; color: #8b949e; }
+        .detector-toggle-group { display: flex; gap: 6px; }
+        .btn-det { background: #21262d; color: #c9d1d9; border: 1px solid #30363d; border-radius: 6px; padding: 5px 12px; font-size: 0.76rem; font-weight: 700; cursor: pointer; }
+        .btn-det.active { background: #8957e5; color: #fff; border-color: #a371f7; }
+        .btn-det.disabled { opacity: 0.4; cursor: not-allowed; }
+        .video-container {
+            position: relative; width: 100%; background: #000; border-radius: 8px; overflow: hidden;
+            display: flex; align-items: center; justify-content: center; aspect-ratio: 16 / 9; border: 1px solid #30363d;
+        }
+        .video-container img { width: 100%; height: 100%; object-fit: contain; display: block; }
+        .controls-panel { width: 100%; display: grid; grid-template-columns: 1fr 1fr 1.3fr 1.5fr; gap: 8px; margin-top: 12px; }
+        .btn-base { border-radius: 8px; font-size: 0.82rem; font-weight: 700; cursor: pointer; min-height: 48px; border: 1px solid transparent; }
+        .btn-off { background: #21262d; color: #3fb950; border-color: #23863666; }
+        .btn-off.active { background: #238636; color: #fff; border-color: #2ea043; }
+        .btn-on { background: #21262d; color: #58a6ff; border-color: #1f6feb66; }
+        .btn-on.active { background: #1f6feb; color: #fff; border-color: #388bfd; }
+        .btn-cal { background: #21262d; color: #f0883e; border-color: #d2992266; }
+        .btn-cal.active { background: #d29922; color: #0d1117; border-color: #f0883e; }
+        .btn-cal.locked { color: #8b949e; border-color: #30363d; }
+        .switch-bay { position: relative; perspective: 600px; min-height: 48px; }
+        .safety-cover {
+            position: absolute; inset: 0; border-radius: 8px;
+            background: repeating-linear-gradient(-45deg, #2d2206, #2d2206 10px, #d29922 10px, #d29922 20px);
+            display: flex; align-items: center; justify-content: center; border: 2px solid #d29922;
+            cursor: pointer; transform-origin: top center; transition: transform 0.28s, opacity 0.2s; z-index: 5;
+        }
+        .cover-text { background: rgba(0,0,0,0.85); color: #f0883e; padding: 4px 8px; border-radius: 4px; font-size: 0.72rem; font-weight: 800; }
+        .safety-cover.disabled { opacity: 0.35; cursor: not-allowed; filter: grayscale(0.8); }
+        .safety-cover.flipped { transform: rotateX(85deg) translateY(-8px); opacity: 0.15; pointer-events: none; }
+        .armed-trigger {
+            width: 100%; height: 100%; border-radius: 8px; background: #490202; border: 2px dashed #f85149;
+            color: #ff7b72; font-weight: 800; font-size: 0.76rem; cursor: pointer; position: relative; overflow: hidden;
+        }
+        .armed-trigger.live-armed { background: #da3633; color: #fff; border-style: solid; animation: pulse-red 1s infinite; }
+        .timeout-bar { position: absolute; bottom: 0; left: 0; height: 4px; background: #f85149; width: 0%; }
+        .btn-fullscreen { background: #21262d; color: #c9d1d9; border: 1px solid #30363d; border-radius: 6px; padding: 6px 12px; font-size: 0.82rem; font-weight: 600; cursor: pointer; }
+        .fs-kill-btn { position: absolute; top: 14px; left: 14px; background: rgba(35,134,54,0.9); border: 1px solid #3fb950; color: #fff; padding: 8px 14px; border-radius: 6px; font-weight: 800; cursor: pointer; z-index: 10; display: none; }
+        .video-container:fullscreen .fs-kill-btn { display: block; }
+        .meta { margin-top: 10px; font-size: 0.76rem; color: #8b949e; line-height: 1.4; }
+    </style>
+</head>
+<body>
+<div class="hud-card">
+    <div class="header-bar">
+        <div class="brand-wrap">
+            <h1>Bombardeer HUD</h1>
+            <span id="modeBadge" class="status-pill pill-off">OFF / SAFE</span>
+        </div>
+        <button class="btn-fullscreen" onclick="toggleMaximize()">⛶ Fullscreen</button>
+    </div>
+    <div class="detector-bar">
+        <span class="detector-label">Perception Engine:</span>
+        <div class="detector-toggle-group">
+            <button id="btnDetAruco" class="btn-det active" onclick="requestDetector('ARUCO')">ArUco Target</button>
+            <button id="btnDetWildlife" class="btn-det" onclick="requestDetector('WILDLIFE')">Wildlife NPU (Hailo-8)</button>
+        </div>
+    </div>
+    <div class="video-container" id="videoBox" ondblclick="toggleMaximize()">
+        <button class="fs-kill-btn" onclick="requestMode('OFF')">SAFE / DISARM</button>
+        <img id="streamImg" src="/video_feed" alt="Live Targeting Feed">
+    </div>
+    <div class="controls-panel">
+        <button id="btnOff" class="btn-base btn-off active" onclick="requestMode('OFF')">OFF</button>
+        <button id="btnOn" class="btn-base btn-on" onclick="requestMode('ON')">TRACK</button>
+        <button id="btnCal" class="btn-base btn-cal" onclick="handleCalibrateClick()">1-SHOT</button>
+        <div class="switch-bay">
+            <button id="armedTrigger" class="armed-trigger" onclick="confirmArmTrigger()">
+                <span id="triggerLabel">ARM LIVE</span>
+                <div id="timeoutBar" class="timeout-bar"></div>
+            </button>
+            <div id="safetyCover" class="safety-cover disabled" onclick="flipOpenCover()">
+                <div class="cover-text"><span id="coverLabel">LOCKED</span></div>
+            </div>
+        </div>
+    </div>
+    <div class="meta">Deterministic 50Hz Motion | Horizon-Tiled 12MP Day / 3MP Dusk | Hailo-8 26 TOPS PCIe NPU</div>
+</div>
+<script>
+let currentMode = "OFF", isPrimed = false, currentDetector = "ARUCO", hailoAvailable = true, armedAllowed = false;
+let coverOpen = false, coverTimer = null, timerStart = 0;
+const TIMEOUT_MS = 4000;
+
+function flipOpenCover() {
+    if (currentMode !== "ON" || !armedAllowed) return;
+    coverOpen = true;
+    document.getElementById("safetyCover").classList.add("flipped");
+    const bar = document.getElementById("timeoutBar");
+    timerStart = Date.now();
+    clearInterval(coverTimer);
+    coverTimer = setInterval(() => {
+        const elapsed = Date.now() - timerStart;
+        bar.style.width = (Math.max(0, 1 - elapsed / TIMEOUT_MS) * 100) + "%";
+        if (elapsed >= TIMEOUT_MS) snapCoverClosed();
+    }, 40);
+}
+function snapCoverClosed() {
+    clearInterval(coverTimer); coverOpen = false;
+    document.getElementById("timeoutBar").style.width = "0%";
+    document.getElementById("safetyCover").classList.remove("flipped");
+}
+function confirmArmTrigger() {
+    if (currentMode === "ON" && coverOpen) { snapCoverClosed(); requestMode("ARMED"); }
+    else if (currentMode === "ARMED") { snapCoverClosed(); requestMode("ON"); }
+}
+function postApi(payload) {
+    fetch("/api/mode", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) })
+        .then(r => r.json())
+        .then(d => { if (d.status === "ok") updateUIState(d); else if (d.message) alert(d.message); })
+        .catch(err => console.error("API error:", err));
+}
+function handleCalibrateClick() {
+    if (currentMode === "CALIBRATE") postApi({ reprime: true });
+    else if (currentMode === "ON") requestMode("CALIBRATE");
+}
+function requestDetector(det) { postApi({ detector: det }); }
+function requestMode(mode) { postApi({ mode: mode }); }
+function updateUIState(d) {
+    currentMode = d.mode; isPrimed = !!d.primed;
+    if (d.detector) currentDetector = d.detector;
+    if (typeof d.hailo_available === "boolean") hailoAvailable = d.hailo_available;
+    if (typeof d.armed_allowed === "boolean") armedAllowed = d.armed_allowed;
+
+    const badge = document.getElementById("modeBadge"), btnOff = document.getElementById("btnOff"),
+          btnOn = document.getElementById("btnOn"), btnCal = document.getElementById("btnCal"),
+          cover = document.getElementById("safetyCover"), trigger = document.getElementById("armedTrigger"),
+          triggerLabel = document.getElementById("triggerLabel"), coverLabel = document.getElementById("coverLabel");
+
+    document.getElementById("btnDetAruco").classList.toggle("active", currentDetector === "ARUCO");
+    document.getElementById("btnDetWildlife").classList.toggle("active", currentDetector === "WILDLIFE");
+    document.getElementById("btnDetWildlife").classList.toggle("disabled", !hailoAvailable);
+
+    btnOff.classList.remove("active"); btnOn.classList.remove("active");
+    btnCal.classList.remove("active", "locked"); trigger.classList.remove("live-armed");
+    badge.className = "status-pill";
+
+    if (currentMode === "OFF") {
+        badge.textContent = "OFF / SAFE"; badge.classList.add("pill-off"); btnOff.classList.add("active");
+        btnCal.textContent = "1-SHOT"; btnCal.classList.add("locked");
+        cover.classList.add("disabled"); coverLabel.textContent = "LOCKED"; triggerLabel.textContent = "ARM LIVE";
+        snapCoverClosed();
+    } else if (currentMode === "ON") {
+        badge.textContent = "TRACKING (SAFE)"; badge.classList.add("pill-on"); btnOn.classList.add("active");
+        btnCal.textContent = "1-SHOT";
+        cover.classList.toggle("disabled", !armedAllowed);
+        coverLabel.textContent = armedAllowed ? "LIFT TO ARM" : "SET PASS";
+        triggerLabel.textContent = "ARM LIVE";
+        if (coverOpen) snapCoverClosed();
+    } else if (currentMode === "CALIBRATE") {
+        badge.textContent = isPrimed ? "CAL: PRIMED" : "CAL: LOCKED"; badge.classList.add("pill-cal");
+        btnCal.classList.add("active"); btnCal.textContent = isPrimed ? "PRIMED" : "RE-PRIME";
+        cover.classList.add("disabled"); coverLabel.textContent = "TESTING"; snapCoverClosed();
+    } else if (currentMode === "ARMED") {
+        badge.textContent = "ARMED / LIVE"; badge.classList.add("pill-armed");
+        btnCal.textContent = "1-SHOT"; btnCal.classList.add("locked");
+        cover.classList.add("flipped"); trigger.classList.add("live-armed"); triggerLabel.textContent = "DISARM";
+    }
+}
+function syncMode() { fetch("/api/mode").then(r => r.json()).then(d => { if (d.status === "ok") updateUIState(d); }).catch(() => {}); }
+setInterval(syncMode, 1000); syncMode();
+function toggleMaximize() {
+    const box = document.getElementById("videoBox");
+    if (!document.fullscreenElement) box.requestFullscreen?.().catch(() => {});
+    else document.exitFullscreen?.();
+}
+</script>
+</body>
+</html>

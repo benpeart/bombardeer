@@ -1,233 +1,120 @@
-# Bombardeer Wildlife Deterrent Turret: System Architecture Specification
+# Bombardeer — Autonomous Vision-Guided Wildlife Deterrent Turret
 
-**Bombardeer** is an open-source, vision-guided autonomous deterrent turret designed to protect outdoor spaces, gardens, orchards, and agricultural property from intrusive wildlife (such as deer).
+**Bombardeer** is an open-source, vision-guided autonomous deterrent turret designed to protect yards, gardens, orchards, and agricultural property from intrusive wildlife (such as deer) using non-lethal air/paintball deterrence.
 
-<img src="images/bombardeer.jpg" alt="Bombardeer: Autonomous Vision-Guided Deterrent Turret" width="480"  />
+<img src="images/bombardeer.jpg" alt="Bombardeer: Autonomous Vision-Guided Deterrent Turret" width="480" />
 
-Powered by a **Raspberry Pi 5** for real-time visual perception, range estimation, and dynamic parallax compensation, paired with a dedicated **ESP32** microcontroller executing hardware-timed pan/tilt motion profiles across dual TMC2209 silent stepper drivers.
+The system splits high-level perception and ballistic trajectory planning from real-time motor pulse generation across two specialized processors:
 
----
-
-## 🚀 Features
-
-* **Asynchronous Perception & Motion Decoupling:** Vision inference runs at sensor rate (15–30 Hz) while a dedicated 50 Hz (20 ms tick) real-time motion servo calculates trajectory vectors, preventing camera frame drops from stalling motor actuation.
-
-
-* **Segregated Lock Architecture:** Isolates concurrency across three independent lock domains (`telemetry_lock`, `target_lock`, and `frame_lock`) to eliminate lock contention, priority inversion, and serial UART stalls at 921,600 baud.
-
-
-* **Forward-Projected Kalman State Estimation:** 4-state constant-velocity Kalman filter estimates 3D world-space coordinates, projecting target state forward across a fixed ~40 ms optical pipeline exposure delay directly to the actuation instant.
-
-
-* **1.5-Second Dead-Reckoning Coasting:** Maintains smooth pursuit through optical occlusions, foliage, and motion blur with exponential velocity decay, avoiding target loss or abrupt stops.
-
-
-* **Dual-Mode Control Hysteresis:** Seamlessly transitions between open-loop ballistic waypoint snaps (`P <pan> <tilt>`) for large angular displacements (>120 mrad) and closed-loop proportional velocity pursuit (`V <pan_s> <tilt_s>`) with 1.0× feed-forward velocity matching.
-
-
-* **Dynamic Slew-Gated Solenoid Engagement:** Heschen 24V firing solenoid actuation requires optical freshness (<150 ms), verified crosshair deadband alignment (<40 mrad), and a barrel slew speed ceiling (<180 mrad/s) to prevent firing during rapid transits.
-
-
-* **Software Axis Travel Clamping:** Real-time telemetry monitoring actively zeroes commanded velocity before the tilt axis can impact mechanical endstops (-420 to +400 mrad).
-
-
-* **Dynamic Range Estimation & Parallax Convergence:** Computes target distance via pinhole projection (ArUco calibration or bounding-box height) and dynamically converges the bore sightline to compensate for the physical camera offset ($170\text{ mm}$ left, $60\text{ mm}$ below the bore).
-
-
-* **Native Milliradian (mrad) Motion Protocol:** High-speed binary/ASCII UART link at **921,600 baud** commands velocity trims (`mrad/s`) and absolute waypoints (`mrad`), completely decoupled from hardware microstepping and gearing.
-
-
-* **Precision Kinematic Reductions:**
-* **Pan Axis:** Custom $6.65:1$ timing ring drive ($246\text{T} / 37\text{T}$) achieving up to $11{,}600\text{ steps/s}$ ($\approx 3{,}425\text{ mrad/s}$).
-* **Tilt Axis:** Anti-backdrive $50:1$ single-start worm drive ($50\text{T} / 1\text{T}$) achieving up to $14{,}800\text{ steps/s}$ ($\approx 580\text{ mrad/s}$) with zero backdrive.
-
-
-* **Dual Control Modes with Clean Handoff:** Autonomous visual pursuit over high-speed UART with seamless manual override via Bluetooth Xbox Series X/S controller integration.
-* **TMC2209 UART Integration:** Dynamically manages current limits ($1200\text{ mA}$ Pan, $1100\text{ mA}$ Tilt), microstepping ($1/16$ interpolated to $1/256$), standstill `ihold` power saving, and automatic StealthChop-to-SpreadCycle transitions.
+1. **Raspberry Pi 5 + Hailo-8 NPU (26 TOPS) + IMX708 Wide NoIR Camera:** Captures dual-resolution `12 MP` Day / `3 MP` Dusk video, runs horizon-tiled MegaDetector v6 (`MDV6-yolov9-c-1280`) neural inference, enforces multi-layer human/vehicle safety vetoes, estimates 3D range and aerodynamic drag ballistics, and hosts a password-protected `1280×720` live Heads-Up Display (HUD) web console with progressive web app icons.
+2. **ESP32 Motion Controller + Dual TMC2209 Stepper Drivers:** Executes hardware-timer trapezoidal step profiles (`FastAccelStepper`) over a `921,600` baud milliradian (`mrad`) UART link, drives the 24V Heschen firing solenoid with hardware pulse/cooldown cutoffs, and supports instant manual override via a Bluetooth Xbox Series X/S controller.
 
 ---
 
-## 🛠️ System Architecture
+## High-Level System Architecture
 
-```
-       +-----------------------------------------------------+
-       |                  Raspberry Pi 5                     |
-       |  - Vision Worker (15-30 Hz PiSP / OpenCV / CLAHE)   |
-       |  - Kalman Predictive State Estimator (World Space)  |
-       |  - 50 Hz Motion Servoing Loop (20ms Cadence)        |
-       |  - Flask Diagnostic HUD & Auto-Video Recorder       |
-       +-----------------------------------------------------+
-                                  |
-                                  |  Bidirectional UART (921,600 Baud)
-                                  |  Packets in Milliradians (mrad / mrad/s)
-                                  v
-       +---------------------------------------------+    +-------------------------------+
-       |             ESP32 Microcontroller           |<---|   Xbox Series X Controller    |
-       |  - FastAccelStepper Hardware Pulse Timer    |    |       (Bluetooth Manual)      |
-       |  - Solenoid Timing State Machine            |    +---------------+---------------+
-       +---------------------------------------------+
-               /              |              \
-              v               v               v
-     +----------------+ +----------------+ +--------------------+
-     | TMC2209 / Pan  | | TMC2209 / Tilt | | 24V Firing Circuit |
-     | Stepper Motor  | | Stepper Motor  | | Heschen Solenoid   |
-     +----------------+ +----------------+ +--------------------+
-
+```text
++-----------------------------------------------------------------------+
+|                           Raspberry Pi 5                              |
+|  - VisionMain (Core 0): PiSP 12MP/3MP Capture, ROI Scratch, ISP Ctrl  |
+|  - HudEncoder (Core 1): Client-Aware 1280x720 HUD Overlay & JPEG      |
+|  - HailoNPUProc (Core 2): Forked MDv6 1280x1280 Inference via SHM     |
+|  - VidRecorder (Core 2): 1280x720 Pre/Post-Roll Event Archiver        |
+|  - MotionServo & TurretSerial (Core 3): 50 Hz Loop & 921.6k UART      |
+|  - Gunicorn + Flask Web Console: Basic Auth, /api/mode, /video_feed   |
++-----------------------------------------------------------------------+
+                                    |
+                                    |  Bidirectional UART (921,600 Baud, 8N1)
+                                    |  Milliradian Commands & State Telemetry
+                                    v
++-----------------------------------------------+     +-----------------------------+
+|            ESP32 Microcontroller              |<----|  Xbox Series X Controller   |
+|  - FastAccelStepper Hardware Pulse Timers     |     |     (Bluetooth Manual)      |
+|  - TMC2209 Single-Wire UART Driver Control    |     +-----------------------------+
+|  - Solenoid Timing & Hard Cutoff Watchdogs    |
++-----------------------------------------------+
+         /              |              \
+        v               v               v
++--------------+ +--------------+ +--------------------+
+| TMC2209 Pan  | | TMC2209 Tilt | | 24V Firing Circuit |
+| Stepper Axis | | Stepper Axis | | Heschen Solenoid   |
++--------------+ +--------------+ +--------------------+
 ```
 
 ---
 
-## 🧰 Hardware Requirements
+## Repository Layout
 
-| Component | Specification | Description |
-| --- | --- | --- |
-| **Compute Board** | Raspberry Pi 5 (8GB) | Vision pipeline, 50 Hz motion servo, Kalman prediction, HUD streaming |
-| **AI Accelerator** | Hailo-8 M.2 Module (26 TOPS) | Low-latency neural network inference for real-time target detection |
-| **Vision Sensor** | RPi Camera Module 3 (Wide/Standard) | $1280 \times 720$ @ $30\text{ FPS}$ low-light capture via `Picamera2`<br> |
-| **Motion MCU** | ESP32-WROOM-32 | Multi-axis hardware timer pulse generation & safety watchdogs |
-| **Stepper Drivers** | $2\times$ TMC2209 (v1.2+) | Single-wire UART addressing (`0b00` Pan, `0b01` Tilt) |
-| **Stepper Motors** | $2\times$ STEPPERONLINE 17HS19-2004S1 | NEMA 17 ($2.0\text{A}$ Peak, $59\text{ N}\cdot\text{cm}$ Holding Torque) |
-| **Pan Drive** | $6.65:1$ GT2 Timing Belt Reduction ($246\text{T} / 37\text{T}$) | High-slew azimuth tracking ($3.386\text{ steps/mrad}$) |
-| **Tilt Drive** | $50:1$ Anti-Backdrive Worm Gear ($50\text{T} / 1\text{T}$) | Self-locking elevation drive ($25.465\text{ steps/mrad}$) |
-| **Actuator** | Heschen HS-1564B / HS-4564B Solenoid | 24V push-pull trigger actuation ($4.0\text{ BPS}$) |
-| **Mounting Offset** | $170\text{ mm}$ Left, $60\text{ mm}$ Below Bore Centerline | Baseline camera-to-barrel offset compensated in software |
-| **Power Supply** | 12V–24V LiFePO4 / Battery Bank | Powers steppers, solenoid circuit, and logic step-downs |
-
----
-
-## Subsystem Roles
-
-### 1. Vision & Trajectory Planning (Raspberry Pi 5)
-
-* **Multi-Threaded Architecture:** Clamps OpenCV to 2 dedicated physical cores, preserving remaining CPU cores for 50 Hz motion servo timing, PiSP DMA frame transfers, and serial I/O.
-
-
-* **Lock Segregation:**
-* `telemetry_lock`: Protects high-speed motor angles, movement flags, and historical telemetry deques.
-
-
-* `target_lock`: Protects vision coordinates, target bounding boxes, disk metrics, and supervisory alerts.
-
-
-* `frame_lock`: Protects JPEG buffers for the Flask diagnostic web stream.
-
-
-
-
-* **Optical Intrinsics & Parallax Compensation:** Native $1280 \times 720$ capture with $f = 540.4\text{ px}$ ($1.850\text{ mrad/px}$). Calibrated trigonometric parallax adjustment aligns the barrel at range $D$ (in millimeters):
-
-
-
-$$\Delta \theta_{\text{pan}} = \frac{-\text{OffsetX}}{D} \times 1000 = \frac{170\text{ mm}}{D} \times 1000 \quad [\text{mrad}]$$
-
-$$\Delta \theta_{\text{tilt}} = \frac{\text{OffsetY}}{D} \times 1000 = \frac{-60\text{ mm}}{D} \times 1000 \quad [\text{mrad}]$$
-
-* **Dynamic Firing Gate:** Actuation signals (`T 1`) are only transmitted if the target is fresh (<150 ms), radial aim error is $\le 40\text{ mrad}$, and total barrel slew speed is $<180\text{ mrad/s}$.
-
-
-* **Autonomous Archival Recording:** Automatic rolling video buffer records 2.0 seconds of pre-lock context and 3.0 seconds of post-roll context upon confirmed target engagement, with automatic disk-space quota recycling.
-
-
-
-### 2. Motion & Actuation Engine (ESP32)
-
-* **Hardware Motion Profiler:** `FastAccelStepper` dynamically executes trapezoidal acceleration profiles on ESP32 hardware timer interrupts ($13{,}500\text{ steps/s}^2$ Pan, $50{,}000\text{ steps/s}^2$ Tilt).
-* **Milliradian-to-Step Translation:** Converts incoming integer milliradians directly to stepper motor step coordinates using compile-time geometric ratios:
-
-$$\text{Pan Steps} = \text{Angle [mrad]} \times \left(\frac{3200 \times (246 / 37)}{2000\pi}\right) \approx \text{Angle [mrad]} \times 3.3863$$
-
-$$\text{Tilt Steps} = \text{Angle [mrad]} \times \left(\frac{3200 \times (50 / 1)}{2000\pi}\right) \approx \text{Angle [mrad]} \times 25.4648$$
-
-* **Driver Control:** Dual TMC2209 silent stepper drivers managed over a shared single-wire UART bus (`Serial2`) with read-back validation, register reset auto-recovery, and dynamic hybrid StealthChop/SpreadCycle transitions.
-* **Actuation State Machine:** Hardware-timed driver managing the Heschen firing solenoid ($60\text{ ms}$ pulse / $190\text{ ms}$ cooldown) with a hard autonomous firing cutoff of $2000\text{ ms}$.
-
-
-* **Safety & Manual Override:** Dedicated `processXboxOverride()` routine handling Bluetooth input from an Xbox Series X controller with fail-safe zeroing on disconnect, quadratic stick shaping, and a single-shot 'A' button to reset coordinate origin to $(0, 0)\text{ mrad}$.
+```text
+bombardeer/
+├── bombardeer.py                  # Gunicorn WSGI entrypoint & CLI runner
+├── config.yaml                    # Camera, optics, ballistics, control, wildlife & storage config
+├── MDV6-yolov9-c-1280.hef         # Compiled Hailo-8 MegaDetector v6 model (gitignored)
+├── static/                        # Multi-format favicons (ICO/SVG/PNG) & site.webmanifest
+├── systemd/
+│   └── bombardeer.service         # systemd unit (Type=notify, WatchdogSec=15, [::]:5000)
+├── docs/                          # Full hardware, protocol, ESP32 & Raspberry Pi documentation
+└── bombardeer_pkg/
+    ├── config.py                  # Typed YAML + environment loader
+    ├── state.py                   # SystemState (4 segregated lock planes) & CommandBus
+    ├── utils.py                   # CPU core affinity, sd_notify & audit snapshot writer
+    ├── control/                   # Parallax, horizon projection, drag ballistics, Kalman & 50 Hz servo
+    ├── hardware/                  # PiSP camera pipeline, HudEncoder, non-reset UART & MP4 recorder
+    ├── perception/                # ArUco detector, HailoNPUProc IPC & multi-tile MDv6 decoder/vetoes
+    └── web/                       # Flask Basic-Auth REST API, /static/* assets & 1280x720 MJPEG HUD
+```
 
 ---
 
-## Serial Communication Interface
+## Physical Build & Kinematic Summary
 
-Communication operates over UART at **921,600 baud, 8N1**, utilizing plain ASCII newline-terminated strings (`\n`).
-
-### Commands: Raspberry Pi -> ESP32
-
-| Command | Arguments | Unit | Description | Example |
-| --- | --- | --- | --- | --- |
-| `P` | `<pan> <tilt>` | `mrad` | **Ballistic Setpoint:** Absolute waypoint jump with 400 ms rate limit and 60 mrad delta lockout. | `P 280 -65` |
-| `V` | `<pan_s> <tilt_s>` | `mrad/s` | **Velocity Pursuit:** Continuous speed tracking vector (up to $\pm 850\text{ pan}$, $\pm 450\text{ tilt}$). | `V 320 -85` |
-| `X` | *none* | — | **Halt:** Commands immediate controlled deceleration to stop and hold position. | `X` |
-| `T` | `<state: 0/1>` | flag | **Trigger:** Commands the solenoid firing state machine (`1` = fire, `0` = disengage). | `T 1` |
-| `H` | *none* | — | **Home:** Stops motion and re-zeros current motor coordinates to $(0, 0\text{ mrad})$. | `H` |
-| `Q` | *none* | — | **Status Query:** Requests an immediate diagnostic telemetry packet. | `Q` |
-
-### Telemetry: ESP32 -> Raspberry Pi
-
-| Packet | Arguments | Unit | Description | Example |
-| --- | --- | --- | --- | --- |
-| `S` | `<time> <pan> <tilt> <firing> <moving>` | `us`, `mrad`, `mrad`, `flag`, `flag` | **Periodic State (20–50 Hz):** Broadcasts timestamp, axis angles, firing state, and movement flag. | `S 1840291 195 45 0 1` |
-| `R` | `<is_moving> <pan> <tilt>` | `flag`, `mrad`, `mrad` | **Query Response:** Transmitted immediately in response to `Q`. | `R 0 120 -45` |
+* **Pan Axis (`6.65:1` Timing Belt Reduction):** `246T / 37T` GT2 belt drive (`3.3863 steps/mrad` at `16×` microstepping), capable of slewing up to `~3,425 mrad/s` across a `±180°` (`±3,141 mrad`) envelope.
+* **Tilt Axis (`50:1` Anti-Backdrive Worm Drive):** Single-start `50T / 1T` worm gear (`25.4648 steps/mrad` at `16×` microstepping), self-locking against gravity with software travel clamps at `-420 mrad` and `+400 mrad`.
+* **Optical Baseline & Parallax Geometry:** The IMX708 Wide NoIR camera is mounted **`170 mm` left** and **`60 mm` below** the barrel centerline (`f = 540.4 px` in canonical `1280×720` space, `1.850 mrad/px`). Software dynamically converges pan and tilt angles for the fused target range (`3–75 m`) and compensates for projectile gravity drop and aerodynamic drag (`v0 = 85.0 m/s`, `k = 0.0128`).
+* **Firing Mechanism:** 24V Heschen push-pull solenoid (`60 ms` pulse / `190 ms` cooldown, `4.0 BPS` max, `2,000 ms` hardware cutoff) gated by optical freshness (`<= 220 ms`), aim deadband (`<= 40 mrad`), effective engagement range (`<= 40.0 m`), and barrel slew speed (`< 180 mrad/s`).
 
 ---
 
-## Hardware Specification & Kinematics
+## ESP32 vs. Raspberry Pi Responsibilities
 
-### Mechanical & Stepper Parameters
-
-* **Pan Stepper:** 1.8° step angle ($200\text{ steps/rev}$), $16\times$ microstepping $\rightarrow 3{,}200\text{ native steps/rev}$.
-* **Tilt Stepper:** 1.8° step angle ($200\text{ steps/rev}$), $16\times$ microstepping $\rightarrow 3{,}200\text{ native steps/rev}$.
-* **Gear Ratios:**
-* Pan: $246\text{T} / 37\text{T} \approx 6.6486:1$
-* Tilt: $50\text{T} / 1\text{T} = 50:1$ (worm drive)
-
-
-* **Speed Ceilings:**
-* Pan: $11{,}600\text{ steps/s}$ ($\approx 3{,}425\text{ mrad/s}$)
-* Tilt: $14{,}800\text{ steps/s}$ ($\approx 580\text{ mrad/s}$)
-
-
-* **Acceleration Ceilings:**
-* Pan: $13{,}500\text{ steps/s}^2$
-* Tilt: $50{,}000\text{ steps/s}^2$
-
-
-* **Travel Envelopes & Software Safety Clamps:**
-* Pan Envelope: Physical hard stops at $\pm 180.0^\circ$ ($\approx \pm 3{,}141\text{ mrad}$)
-* Tilt Envelope: Physical travel $\pm 22.5^\circ$ ($\approx \pm 392\text{ mrad}$); software velocity clamped at **`-420 mrad` (Min)** and **`+400 mrad` (Max)**.
-
-
-
-
-
-### Optical Calibration (RPi Camera Module 3 @ 1280x720 Native Capture)
-
-* **Active Sensor Resolution:** $1280 \times 720$ pixels
-
-
-* **Focal Length ($f_x, f_y$):** $540.4\text{ pixels}$
-
-* **Optical Scale Factor:** $1.850\text{ mrad/pixel}$ ($1000 / 540.4$)
-
-
-* **Optical Center:** $(c_x, c_y) = (640, 360)\text{ px}$
-
-* **Latency Compensation Offset:** Fixed $40\text{ ms}$ history interpolation window for sensor exposure and ISP DMA transfer.
-
-
+| Concern | Raspberry Pi 5 (`bombardeer_pkg/`) | ESP32 Firmware (`ESP32/`) |
+| :--- | :--- | :--- |
+| **Primary Role** | Perception, world-space tracking, ballistics, safety vetoes, web HUD, video archiving | Deterministic pulse generation, driver current/microstep management, hardware cutoffs |
+| **Control Loop Rate** | `14.4–30 Hz` vision pipeline + `50 Hz` (`20 ms`) motion servo | Hardware timer interrupts (`13.5k–50k steps/s²` trapezoidal ramps) + `20–50 Hz` telemetry |
+| **Coordinate Frame** | World-space & canonical `1280×720` image coordinates (`mrad`, `mrad/s`) | Mechanical step coordinates translated from incoming `mrad` / `mrad/s` packets |
+| **Safety & Overrides** | Person/vehicle zero-overlap veto, `BOMBARDEER_PASS` auth gate, range/slew firing gates | Tilt/pan step limits, `2,000 ms` solenoid hardware cutoff, Xbox Bluetooth manual override |
+| **Link & Persistence** | Clears `DTR`/`RTS` and disables `HUPCL` on `/dev/serial/by-id/` so restarts never reset MCU | Holds mechanical `(0, 0)` home across Pi service restarts; `'A'` button re-zeros origin |
 
 ---
 
-## 🕹️ Xbox Controller Manual Override
+## Operational Modes & Safety Model
 
-Manual input automatically overrides autonomous targeting, locking out serial velocity commands until $400\text{ ms}$ after stick release:
+The Web Console (`http://<pi-ip>:5000`) enforces a four-stage state machine and physical-style flip cover before live firing is permitted:
 
-* **Left Stick (Horizontal):** Pan axis continuous velocity jog (quadratic curve shaping).
-* **Left Stick (Vertical):** Tilt axis continuous velocity jog (quadratic curve shaping).
-* **Right Trigger (RT):** Manually trips the solenoid actuator state machine.
-* **'A' Button:** Single-shot command that immediately brings both axes to a controlled halt and re-zeroes coordinate tracking to $(0, 0)\text{ mrad}$.
+1. **`OFF` (OFF / SAFE):** Turret motors halted (`X`), solenoid disarmed (`T 0`), passive perception and HUD monitoring active.
+2. **`ON` (TRACKING / SAFE):** Closed-loop pursuit active (`P` / `V` commands), solenoid locked out (`T 0`).
+3. **`CALIBRATE` (1-SHOT):** Single-shot calibration/test mode (`PRIMED` -> fires one pulse on alignment, then locks until manually re-primed).
+4. **`ARMED` (ARMED / LIVE):** Autonomous live-fire mode. Requires:
+   * A non-default `BOMBARDEER_PASS` environment variable set in `/etc/systemd/system/bombardeer.service.d/override.conf` (otherwise `/api/mode` refuses `ARMED` with `HTTP 403`).
+   * Lifting the virtual safety cover in the UI and confirming `ARM LIVE` within `4.0 s`.
+   * Zero overlap with any detected `PERSON` (`>= 0.48`) or `VEHICLE` (`>= 0.35`) expanded by `24 px`.
+
+---
+
+## Documentation Index
+
+| Document | Scope |
+| :--- | :--- |
+| [`docs/HARDWARE_BUILD.md`](docs/HARDWARE_BUILD.md) | Complete Bill of Materials (BOM), mechanical assembly, wiring schematics, and power-up checks |
+| [`docs/SERIAL_PROTOCOL.md`](docs/SERIAL_PROTOCOL.md) | Shared `921,600` baud ASCII UART protocol (`P`, `V`, `X`, `T`, `H`, `Q`, `S`, `R`), units, and non-reset serial rules |
+| [`docs/ESP32_DESIGN.md`](docs/ESP32_DESIGN.md) | ESP32 firmware architecture, `FastAccelStepper` profiles, TMC2209 UART setup, solenoid state machine, and Xbox override |
+| [`docs/ESP32_DEPLOY_DEBUG.md`](docs/ESP32_DEPLOY_DEBUG.md) | PlatformIO build/flash instructions, USB serial testing, TMC2209 troubleshooting, and polarity checks |
+| [`docs/RPI_DESIGN.md`](docs/RPI_DESIGN.md) | Raspberry Pi 5 multi-core/multi-process architecture, lock segregation, Kalman filter, drag ballistics, and 50 Hz servo |
+| [`docs/RPI_DEPLOY_DEBUG.md`](docs/RPI_DEPLOY_DEBUG.md) | Pi 5 OS/PCIe Gen 3/HailoRT installation, Gunicorn + `systemd` deployment, Wi-Fi AP fallback, and package debugging |
+| [`docs/WILDLIFE_PERCEPTION.md`](docs/WILDLIFE_PERCEPTION.md) | PiSP `12 MP` Day / `3 MP` Dusk dual-stream capture, horizon-anchored multi-tile NPU scanning, and safety veto funnel |
 
 ---
 
 ## ⚠️ Safety Disclaimer
 
-This project is intended strictly for agricultural property management and wildlife deterrence. Ensure all hardware deployment complies with local ordinances regarding non-lethal wildlife management. Always verify hardware safety stops and clear line-of-sight before arming the turret.
+This project is intended strictly for agricultural property management and non-lethal wildlife deterrence. Ensure all hardware deployment complies with local laws and ordinances. Always verify mechanical endstops, configure a strong `BOMBARDEER_PASS` credential, and confirm a clear line of sight before arming the turret.

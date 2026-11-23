@@ -1,0 +1,77 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="100%" height="100%">
+  <defs>
+    <!-- Background Gradient -->
+    <radialGradient id="bgGrad" cx="50%" cy="50%" r="50%" fx="30%" fy="30%">
+      <stop offset="0%" stop-color="#1e2638" />
+      <stop offset="100%" stop-color="#0a0d14" />
+    </radialGradient>
+
+    <!-- Neon Turret Glow -->
+    <filter id="glow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="6" result="blur" />
+      <feMerge>
+        <feMergeNode in="blur" />
+        <feMergeNode in="SourceGraphic" />
+      </feMerge>
+    </filter>
+
+    <!-- Metallic Edge Ring -->
+    <linearGradient id="metalRing" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#00ffcc" />
+      <stop offset="50%" stop-color="#0077ff" />
+      <stop offset="100%" stop-color="#ff3366" />
+    </linearGradient>
+  </defs>
+
+  <!-- Base Icon Plate (Rounded Hex / App Icon Squircle) -->
+  <rect x="24" y="24" width="464" height="464" rx="100" fill="url(#bgGrad)" stroke="#222f3e" stroke-width="6" />
+
+  <!-- Outer HUD Ring / Compass Ticks -->
+  <circle cx="256" cy="256" r="200" fill="none" stroke="#253346" stroke-width="3" stroke-dasharray="6, 12" />
+  <circle cx="256" cy="256" r="175" fill="none" stroke="url(#metalRing)" stroke-width="4" opacity="0.85" filter="url(#glow)" />
+
+  <!-- Turret Caliper Crosshairs -->
+  <path d="M 256 36 L 256 95 M 256 417 L 256 476 M 36 256 L 95 256 M 417 256 L 476 256" 
+        stroke="#00ffcc" stroke-width="4" stroke-linecap="round" filter="url(#glow)" />
+
+  <!-- Inner Angle Bracket Reticles -->
+  <path d="M 125 155 L 125 125 L 155 125" fill="none" stroke="#00d2d3" stroke-width="4" stroke-linecap="round" />
+  <path d="M 387 155 L 387 125 L 357 125" fill="none" stroke="#00d2d3" stroke-width="4" stroke-linecap="round" />
+  <path d="M 125 357 L 125 387 L 155 387" fill="none" stroke="#00d2d3" stroke-width="4" stroke-linecap="round" />
+  <path d="M 387 357 L 387 387 L 357 387" fill="none" stroke="#00d2d3" stroke-width="4" stroke-linecap="round" />
+
+  <!-- Range Tick Sub-Rings -->
+  <circle cx="256" cy="256" r="120" fill="none" stroke="#1dd1a1" stroke-width="1.5" stroke-dasharray="4, 18" opacity="0.6" />
+
+  <!-- Stylized Deer Silhouette + Integrated Targeting Optics -->
+  <g fill="#00ffcc" filter="url(#glow)">
+    <!-- Antlers (Geometric / Low-Poly Tech Style) -->
+    <!-- Left Antler Structure -->
+    <path d="M 240 215 C 235 185 210 160 175 140 C 190 148 200 160 205 175 C 190 160 165 155 140 155 C 160 170 172 185 178 205 C 165 198 145 198 128 208 C 150 218 168 226 182 238 L 220 248 Z" />
+    
+    <!-- Right Antler Structure -->
+    <path d="M 272 215 C 277 185 302 160 337 140 C 322 148 312 160 307 175 C 322 160 347 155 372 155 C 352 170 340 185 334 205 C 347 198 367 198 384 208 C 362 218 344 226 330 238 L 292 248 Z" />
+
+    <!-- Deer Head & Ears -->
+    <!-- Left Ear -->
+    <path d="M 225 240 C 195 230 165 245 155 260 C 175 265 198 260 218 252 Z" />
+    <!-- Right Ear -->
+    <path d="M 287 240 C 317 230 347 245 357 260 C 337 265 314 260 294 252 Z" />
+
+    <!-- Head Contour -->
+    <path d="M 230 245 L 282 245 L 290 285 L 274 345 L 256 375 L 238 345 L 222 285 Z" fill="#0f1923" stroke="#00ffcc" stroke-width="3" />
+    
+    <!-- Muzzle & Optical Target Center -->
+    <polygon points="256,335 246,355 266,355" fill="#ff3366" />
+    <circle cx="256" cy="285" r="14" fill="#0a0f16" stroke="#ff3366" stroke-width="3" />
+    <circle cx="256" cy="285" r="5" fill="#ff3366" />
+    
+    <!-- Deer Eye Optical Sensors -->
+    <polygon points="236,280 246,284 238,288" fill="#00ffcc" />
+    <polygon points="276,280 266,284 274,288" fill="#00ffcc" />
+  </g>
+
+  <!-- Turret Project Label Overlay -->
+  <text x="256" y="442" text-anchor="middle" font-family="'Segoe UI', 'Ubuntu', 'DejaVu Sans', sans-serif" 
+        font-weight="900" font-size="28" fill="#e2e8f0" letter-spacing="8" opacity="0.9">BOMBARDEER</text>
+</svg>

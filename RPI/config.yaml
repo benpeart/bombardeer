@@ -1,0 +1,104 @@
+camera:
+  frame_width: 1280
+  frame_height: 720
+  display_width: 1280
+  display_height: 720
+  sensor_day_size: [4608, 2592]
+  sensor_dusk_size: [2304, 1296]
+  main_stream_is_rgb: true        # Picamera2 "BGR888" outputs RGB in memory -> avoids CPU BGR2RGB swap
+  manual_lens_position: 0.0       # 0.0 = infinity; tune to tree-line hyperfocal distance
+  target_fps: 30.0
+  hud_max_fps: 15.0
+  day_12mp_enter_lux: 60.0
+  day_12mp_enter_max_gain: 3.5
+  day_12mp_exit_lux: 35.0
+  day_12mp_exit_min_gain: 5.0
+  sensor_switch_dwell_sec: 60.0
+  sensor_boot_eval_sec: 5.0
+
+optics:
+  camera_offset_x_mm: -170.0      # Camera 170mm left of bore
+  camera_offset_y_mm: -60.0       # Camera 60mm below bore
+  tilt_calibration_trim_mrad: -8.3
+  focal_length_px: 540.4
+  camera_mount_height_m: 1.15
+  ground_slope_mrad: 0.0
+  min_valid_range_m: 3.0
+  max_valid_range_m: 75.0
+  max_engage_range_m: 40.0        # Refuse live fire beyond effective paintball accuracy envelope
+  default_fallback_range_m: 20.0
+  horizon_y_offset_720: 15.0
+  horizon_headroom_720: 90.0
+  horizon_far_headroom_720: 50.0
+  horizon_feet_margin_720: 45.0
+
+ballistics:
+  muzzle_velocity_m_s: 85.0
+  gravity_m_s2: 9.81
+  drag_k: 0.0128
+
+control:
+  ballistic_acquire_mrad: 120.0
+  ballistic_abort_mrad: 260.0
+  velocity_deadband_mrad: 4.0
+  fire_deadband_mrad: 40.0
+  calibrate_deadband_mrad: 15.0
+  max_fire_slew_speed_mrad_s: 180.0
+  motion_loop_interval_sec: 0.020
+  setpoint_min_interval_sec: 0.040
+  tilt_min_mrad: -420
+  tilt_max_mrad: 400
+  pan_min_mrad: -3141
+  pan_max_mrad: 3141
+  max_trigger_duration_sec: 2.0
+  trigger_cooldown_sec: 1.5
+  confirmation_frames: 4
+  confirmation_max_jump_px: 120.0
+  home_timeout_sec: 60.0
+  fire_data_freshness_sec: 0.220
+  coast_decay_onset_sec: 0.650
+  coast_max_horizon_sec: 1.800
+  coast_exp_decay_rate: 2.5
+  track_crop_hold_sec: 0.700
+
+wildlife:
+  infer_size: 1280
+  conf_thresh: 0.65
+  monochrome_conf_thresh: 0.62
+  iou_thresh: 0.45
+  person_veto_thresh: 0.48
+  vehicle_veto_thresh: 0.35
+  veto_padding_px: 24
+  class_margin: 0.25
+  max_animal_width_frac: 0.55
+  max_animal_area_frac: 0.40
+  max_animal_aspect_ratio: 1.65
+  max_non_animal_prob: 0.02
+  max_animal_height_m: 1.50
+  assumed_target_height_mm: 950.0
+  max_npu_restarts: 5
+
+serial:
+  baud_rate: 921600
+  heartbeat_timeout_sec: 2.0
+  reconnect_no_rx_sec: 5.0
+  max_consecutive_tx_errors: 3
+  ports:
+    - "/dev/serial/by-id/usb-Silicon_Labs_CP2102_USB_to_UART_Bridge_Controller_0001-if00-port0"
+    - "/dev/ttyUSB0"
+    - "/dev/ttyACM0"
+    - "/dev/ttyUSB1"
+
+storage:
+  record_pre_roll_sec: 2.0
+  record_post_roll_sec: 3.0
+  min_lock_frames_to_record: 3
+  max_recording_duration_sec: 30.0
+  min_free_space_gb: 5.0
+  max_recordings_storage_gb: 10.0
+  max_debug_snapshots: 200
+  audit_veto_cooldown_sec: 2.0
+
+web:
+  default_user: "admin"
+  default_pass: "bombardeer"

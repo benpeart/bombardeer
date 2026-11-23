@@ -1,0 +1,1 @@
+"""Flask Web Console, REST API, and health observability endpoints."""
