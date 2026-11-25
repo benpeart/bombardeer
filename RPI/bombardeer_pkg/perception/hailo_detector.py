@@ -263,7 +263,7 @@ class HailoWildlifeDetector(BaseTargetDetector):
                 "rejected_animals": list(self._latest_debug_info.get("rejected_animals", [])),
             }
 
-    def prepare_plan(self, sensor_w: int, sensor_h: int, tilt_mrad: float, track_box):
+    def prepare_plan(self, sensor_w: int, sensor_h: int, tilt_mrad: float, track_box, pan_mrad: float = 0.0):
         """
         Builds the exact multi-tile or tracking-crop plan and its minimal enclosing
         native ROI rectangle so VisionMain copies only required sensor pixels.
@@ -279,7 +279,7 @@ class HailoWildlifeDetector(BaseTargetDetector):
             track_active=track_active,
             track_box=track_box,
             cam=self.cfg.camera,
-            optics=self.cfg.optics,
+            optics=self.state.site_calibration.get_tiling_optics(self.cfg.optics, pan_mrad),
             wl=self.cfg.wildlife,
             force_scan=force_scan,
         )
@@ -329,7 +329,10 @@ class HailoWildlifeDetector(BaseTargetDetector):
                 continue
 
             if dets:
-                _, tilt_at_cap = self.state.get_turret_pos_at_time(eff_mono)
+                pan_at_cap, tilt_at_cap = self.state.get_turret_pos_at_time(eff_mono)
+                metric_optics, yard_top_mrad, roll_mrad, use_ground_range = (
+                    self.state.site_calibration.get_ground_plane_params(self.cfg.optics, pan_at_cap)
+                )
                 rejected = debug_info.setdefault("rejected_animals", [])
                 filtered = []
                 for d in dets:
@@ -338,19 +341,26 @@ class HailoWildlifeDetector(BaseTargetDetector):
                         rejected.append({"reason": f"MONO_CONF({d['score']:.2f})", "box": d["box"], "probs": (pa, pp, pv)})
                         continue
 
+                    raw_stadia_m = d.get("range_m", metric_optics.default_fallback_range_m)
                     ok, rej_reason, fused_range = evaluate_ground_plane(
                         box_xyxy=d["box"],
                         tilt_at_cap=tilt_at_cap,
-                        stadia_range_m=d.get("range_m", self.cfg.optics.default_fallback_range_m),
+                        stadia_range_m=raw_stadia_m,
                         max_animal_height_m=self.cfg.wildlife.max_animal_height_m,
                         cam=self.cfg.camera,
-                        optics=self.cfg.optics,
+                        optics=metric_optics,
+                        roll_mrad=roll_mrad,
+                        yard_top_mrad=yard_top_mrad,
+                        use_ground_range=use_ground_range,
                     )
                     if not ok:
                         rejected.append({"reason": rej_reason, "box": d["box"], "probs": (pa, pp, pv)})
                         continue
                     d["range_m"] = fused_range
                     filtered.append(d)
+                    self.state.site_calibration.observe_passive_wildlife(
+                        d["box"], tilt_at_cap, raw_stadia_m, eff_mono
+                    )
                 dets = filtered
 
             if was_tracking:

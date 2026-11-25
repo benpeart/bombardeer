@@ -16,39 +16,53 @@
         body {
             background: #0d1117; color: #c9d1d9;
             font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-            display: flex; flex-direction: column; align-items: center; justify-content: center;
-            min-height: 100vh; padding: 12px;
+            display: flex; flex-direction: column; align-items: center; justify-content: flex-start;
+            min-height: 100vh; padding: 6px 10px;
         }
         .hud-card {
-            background: #161b22; border: 1px solid #30363d; border-radius: 12px;
-            padding: 14px; box-shadow: 0 8px 24px rgba(0,0,0,0.6); text-align: center;
-            width: min(100%, {{ display_width + 30 }}px); display: flex; flex-direction: column; align-items: center;
+            background: #161b22; border: 1px solid #30363d; border-radius: 10px;
+            padding: 8px 10px; box-shadow: 0 8px 24px rgba(0,0,0,0.6); text-align: center;
+            width: min(100%, {{ display_width + 22 }}px); display: flex; flex-direction: column; align-items: center;
         }
-        .header-bar { display: flex; justify-content: space-between; align-items: center; width: 100%; margin-bottom: 10px; gap: 8px; flex-wrap: wrap; }
-        .brand-wrap { display: flex; align-items: center; gap: 8px; }
-        h1 { font-size: 1.05rem; letter-spacing: 0.05em; text-transform: uppercase; color: #39d353; }
-        .status-pill { font-size: 0.70rem; font-weight: 800; letter-spacing: 0.08em; padding: 3px 8px; border-radius: 12px; text-transform: uppercase; }
+        .header-bar {
+            display: flex; justify-content: space-between; align-items: center;
+            width: 100%; margin-bottom: 6px; gap: 8px; flex-wrap: wrap;
+        }
+        .brand-wrap { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+        .header-center {
+            display: flex; align-items: center; gap: 6px;
+            background: #0d1117; border: 1px solid #30363d; border-radius: 7px; padding: 3px 8px;
+        }
+        .header-actions { display: flex; align-items: center; gap: 6px; }
+        h1 { font-size: 0.96rem; letter-spacing: 0.05em; text-transform: uppercase; color: #39d353; }
+        .status-pill { font-size: 0.68rem; font-weight: 800; letter-spacing: 0.07em; padding: 2px 7px; border-radius: 10px; text-transform: uppercase; }
         .pill-off { background: #23863622; color: #3fb950; border: 1px solid #238636; }
         .pill-on { background: #1f6feb22; color: #58a6ff; border: 1px solid #1f6feb; }
         .pill-cal { background: #d2992222; color: #f0883e; border: 1px solid #d29922; }
         .pill-armed { background: #da363333; color: #f85149; border: 1px solid #da3633; animation: pulse-red 1.2s infinite; }
+        .pill-muted { background: #30363d55; color: #8b949e; border: 1px solid #484f58; }
         @keyframes pulse-red { 0%,100% { opacity: 0.85; } 50% { opacity: 1; } }
-        .detector-bar {
-            display: flex; align-items: center; justify-content: space-between; width: 100%;
-            background: #0d1117; border: 1px solid #30363d; border-radius: 8px; padding: 6px 10px; margin-bottom: 10px; gap: 8px;
-        }
-        .detector-label { font-size: 0.75rem; font-weight: 700; text-transform: uppercase; color: #8b949e; }
-        .detector-toggle-group { display: flex; gap: 6px; }
-        .btn-det { background: #21262d; color: #c9d1d9; border: 1px solid #30363d; border-radius: 6px; padding: 5px 12px; font-size: 0.76rem; font-weight: 700; cursor: pointer; }
+
+        .detector-label { font-size: 0.70rem; font-weight: 700; text-transform: uppercase; color: #8b949e; }
+        .detector-toggle-group { display: flex; gap: 5px; }
+        .btn-det { background: #21262d; color: #c9d1d9; border: 1px solid #30363d; border-radius: 5px; padding: 3px 9px; font-size: 0.72rem; font-weight: 700; cursor: pointer; }
         .btn-det.active { background: #8957e5; color: #fff; border-color: #a371f7; }
         .btn-det.disabled { opacity: 0.4; cursor: not-allowed; }
+
         .video-container {
-            position: relative; width: 100%; background: #000; border-radius: 8px; overflow: hidden;
+            position: relative; width: 100%; background: #000; border-radius: 7px; overflow: hidden;
             display: flex; align-items: center; justify-content: center; aspect-ratio: 16 / 9; border: 1px solid #30363d;
         }
         .video-container img { width: 100%; height: 100%; object-fit: contain; display: block; }
-        .controls-panel { width: 100%; display: grid; grid-template-columns: 1fr 1fr 1.3fr 1.5fr; gap: 8px; margin-top: 12px; }
-        .btn-base { border-radius: 8px; font-size: 0.82rem; font-weight: 700; cursor: pointer; min-height: 48px; border: 1px solid transparent; }
+        .verify-overlay-svg {
+            position: absolute; inset: 0; width: 100%; height: 100%;
+            pointer-events: none; z-index: 4; display: none;
+        }
+        .verify-overlay-svg.visible { display: block; }
+
+        .controls-panel { width: 100%; display: grid; grid-template-columns: 1fr 1fr 1.3fr 1.5fr; gap: 6px; margin-top: 7px; }
+        .btn-base { border-radius: 7px; font-size: 0.78rem; font-weight: 700; cursor: pointer; min-height: 36px; border: 1px solid transparent; }
+        .btn-base:disabled { opacity: 0.4; cursor: not-allowed; }
         .btn-off { background: #21262d; color: #3fb950; border-color: #23863666; }
         .btn-off.active { background: #238636; color: #fff; border-color: #2ea043; }
         .btn-on { background: #21262d; color: #58a6ff; border-color: #1f6feb66; }
@@ -56,26 +70,144 @@
         .btn-cal { background: #21262d; color: #f0883e; border-color: #d2992266; }
         .btn-cal.active { background: #d29922; color: #0d1117; border-color: #f0883e; }
         .btn-cal.locked { color: #8b949e; border-color: #30363d; }
-        .switch-bay { position: relative; perspective: 600px; min-height: 48px; }
+
+        .switch-bay { position: relative; perspective: 600px; min-height: 36px; }
         .safety-cover {
-            position: absolute; inset: 0; border-radius: 8px;
+            position: absolute; inset: 0; border-radius: 7px;
             background: repeating-linear-gradient(-45deg, #2d2206, #2d2206 10px, #d29922 10px, #d29922 20px);
             display: flex; align-items: center; justify-content: center; border: 2px solid #d29922;
             cursor: pointer; transform-origin: top center; transition: transform 0.28s, opacity 0.2s; z-index: 5;
         }
-        .cover-text { background: rgba(0,0,0,0.85); color: #f0883e; padding: 4px 8px; border-radius: 4px; font-size: 0.72rem; font-weight: 800; }
-        .safety-cover.disabled { opacity: 0.35; cursor: not-allowed; filter: grayscale(0.8); }
+        .cover-text { background: rgba(0,0,0,0.85); color: #f0883e; padding: 2px 7px; border-radius: 4px; font-size: 0.68rem; font-weight: 800; }
+        .safety-cover.disabled { opacity: 1; cursor: not-allowed; filter: grayscale(0.85) brightness(0.52); }
         .safety-cover.flipped { transform: rotateX(85deg) translateY(-8px); opacity: 0.15; pointer-events: none; }
         .armed-trigger {
-            width: 100%; height: 100%; border-radius: 8px; background: #490202; border: 2px dashed #f85149;
-            color: #ff7b72; font-weight: 800; font-size: 0.76rem; cursor: pointer; position: relative; overflow: hidden;
+            width: 100%; height: 100%; border-radius: 7px; background: #490202; border: 2px dashed #f85149;
+            color: #ff7b72; font-weight: 800; font-size: 0.74rem; cursor: pointer; position: relative; overflow: hidden;
         }
         .armed-trigger.live-armed { background: #da3633; color: #fff; border-style: solid; animation: pulse-red 1s infinite; }
-        .timeout-bar { position: absolute; bottom: 0; left: 0; height: 4px; background: #f85149; width: 0%; }
-        .btn-fullscreen { background: #21262d; color: #c9d1d9; border: 1px solid #30363d; border-radius: 6px; padding: 6px 12px; font-size: 0.82rem; font-weight: 600; cursor: pointer; }
-        .fs-kill-btn { position: absolute; top: 14px; left: 14px; background: rgba(35,134,54,0.9); border: 1px solid #3fb950; color: #fff; padding: 8px 14px; border-radius: 6px; font-weight: 800; cursor: pointer; z-index: 10; display: none; }
-        .video-container:fullscreen .fs-kill-btn { display: block; }
-        .meta { margin-top: 10px; font-size: 0.76rem; color: #8b949e; line-height: 1.4; }
+        .timeout-bar { position: absolute; bottom: 0; left: 0; height: 3px; background: #f85149; width: 0%; }
+
+        .btn-hdr {
+            background: #21262d; color: #c9d1d9; border: 1px solid #30363d; border-radius: 6px;
+            padding: 4px 10px; font-size: 0.74rem; font-weight: 600; cursor: pointer;
+        }
+        .fs-kill-btn {
+            position: absolute; top: 14px; left: 14px; background: rgba(35,134,54,0.92);
+            border: 1px solid #3fb950; color: #fff; padding: 8px 14px; border-radius: 6px;
+            font-weight: 800; cursor: pointer; z-index: 10; display: none;
+        }
+        .fs-verify-btn {
+            position: absolute; top: 14px; right: 14px; background: rgba(22,27,34,0.88);
+            border: 1px solid #58a6ff; color: #79c0ff; padding: 8px 12px; border-radius: 6px;
+            font-weight: 700; font-size: 0.78rem; cursor: pointer; z-index: 10; display: none;
+        }
+        .video-container:fullscreen .fs-kill-btn,
+        .video-container:fullscreen .fs-verify-btn { display: block; }
+
+        /* --- Site Calibration & Verification Panel --- */
+        .site-panel {
+            width: 100%; margin-top: 7px; background: #0d1117; border: 1px solid #30363d;
+            border-radius: 8px; padding: 6px 10px; text-align: left;
+        }
+        .site-header {
+            display: flex; align-items: center; justify-content: space-between; gap: 6px; flex-wrap: wrap;
+        }
+        .site-title-wrap { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
+        .site-title { font-size: 0.74rem; font-weight: 800; text-transform: uppercase; letter-spacing: 0.06em; color: #c9d1d9; }
+        .site-btn-row { display: flex; align-items: center; gap: 5px; flex-wrap: wrap; }
+
+        .btn-site {
+            background: #21262d; color: #c9d1d9; border: 1px solid #30363d; border-radius: 5px;
+            padding: 4px 9px; font-size: 0.72rem; font-weight: 700; cursor: pointer;
+        }
+        .btn-site:hover:not(:disabled) { background: #30363d; }
+        .btn-site:disabled { opacity: 0.4; cursor: not-allowed; }
+        .btn-site-walk { background: #1f6feb22; color: #58a6ff; border-color: #1f6feb88; }
+        .btn-site-walk.active { background: #d29922; color: #0d1117; border-color: #f0883e; }
+        .btn-site-finish { background: #238636; color: #fff; border-color: #2ea043; }
+        .btn-site-danger { color: #ff7b72; border-color: #da363366; }
+        .btn-site-verify.active { background: #388bfd33; color: #79c0ff; border-color: #58a6ff; }
+
+        .walk-banner {
+            margin-top: 7px; padding: 8px 10px; border-radius: 7px;
+            background: #d299221a; border: 1px solid #d29922; display: none;
+        }
+        .walk-banner.visible { display: block; }
+        .walk-banner-top {
+            display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap;
+            margin-bottom: 6px;
+        }
+        .walk-banner-msg { font-size: 0.74rem; font-weight: 700; color: #f0883e; }
+        .walk-bars { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+        .walk-metric-label { display: flex; justify-content: space-between; font-size: 0.70rem; color: #c9d1d9; margin-bottom: 3px; }
+        .progress-track { width: 100%; height: 7px; background: #21262d; border-radius: 4px; overflow: hidden; position: relative; }
+        .progress-fill { height: 100%; background: #3fb950; width: 0%; transition: width 0.25s; }
+        .progress-min-mark { position: absolute; top: 0; bottom: 0; width: 2px; background: #f0883e; }
+
+        .site-feedback {
+            margin-top: 6px; font-size: 0.72rem; color: #79c0ff; display: none;
+            background: #161b22; border-left: 3px solid #58a6ff; padding: 5px 9px; border-radius: 4px;
+        }
+        .site-feedback.visible { display: block; }
+        .site-feedback.error { color: #ff7b72; border-left-color: #f85149; }
+
+        .site-details { margin-top: 8px; display: none; border-top: 1px solid #21262d; padding-top: 8px; }
+        .site-details.open { display: block; }
+
+        .site-metrics-grid {
+            display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; margin-bottom: 8px;
+        }
+        .metric-card {
+            background: #161b22; border: 1px solid #30363d; border-radius: 7px; padding: 6px 9px;
+        }
+        .metric-label { font-size: 0.64rem; font-weight: 700; text-transform: uppercase; color: #8b949e; letter-spacing: 0.05em; }
+        .metric-value { font-size: 0.86rem; font-weight: 800; color: #e6edf3; margin-top: 1px; }
+        .metric-sub { font-size: 0.68rem; color: #8b949e; margin-top: 1px; }
+        .metric-warn { color: #f0883e; }
+        .metric-ok { color: #3fb950; }
+
+        .roll-gauge {
+            margin-top: 4px; height: 7px; background: #21262d; border-radius: 4px;
+            position: relative; border: 1px solid #30363d;
+        }
+        .roll-center-tick { position: absolute; left: 50%; top: -2px; bottom: -2px; width: 2px; background: #484f58; transform: translateX(-50%); }
+        .roll-bubble {
+            position: absolute; top: 1px; bottom: 1px; width: 10px; border-radius: 3px;
+            background: #3fb950; left: 50%; transform: translateX(-50%); transition: left 0.25s;
+        }
+
+        .profile-row {
+            display: grid; grid-template-columns: 1.6fr 1fr; gap: 8px; align-items: stretch;
+        }
+        .profile-box {
+            background: #161b22; border: 1px solid #30363d; border-radius: 7px; padding: 6px 9px;
+        }
+        .profile-box-head {
+            display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;
+        }
+        .profile-svg { width: 100%; height: 86px; display: block; background: #0d1117; border-radius: 5px; border: 1px solid #21262d; }
+
+        .op-height-box {
+            background: #161b22; border: 1px solid #30363d; border-radius: 7px; padding: 6px 9px;
+            display: flex; flex-direction: column; justify-content: space-between; gap: 5px;
+        }
+        .op-height-inputs { display: flex; align-items: center; gap: 5px; flex-wrap: wrap; }
+        .op-height-inputs input {
+            width: 48px; background: #0d1117; color: #e6edf3; border: 1px solid #30363d;
+            border-radius: 5px; padding: 3px 5px; font-size: 0.74rem; font-weight: 700; text-align: center;
+        }
+        .op-height-inputs span { font-size: 0.72rem; color: #8b949e; }
+        .legend-row { display: flex; gap: 8px; flex-wrap: wrap; font-size: 0.66rem; color: #8b949e; }
+        .legend-dot { display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 3px; vertical-align: middle; }
+
+        .meta { margin-top: 5px; font-size: 0.70rem; color: #8b949e; line-height: 1.3; }
+
+        @media (max-width: 780px) {
+            .site-metrics-grid { grid-template-columns: 1fr 1fr; }
+            .profile-row { grid-template-columns: 1fr; }
+            .walk-bars { grid-template-columns: 1fr; }
+        }
     </style>
 </head>
 <body>
@@ -85,19 +217,25 @@
             <h1>Bombardeer HUD</h1>
             <span id="modeBadge" class="status-pill pill-off">OFF / SAFE</span>
         </div>
-        <button class="btn-fullscreen" onclick="toggleMaximize()">⛶ Fullscreen</button>
-    </div>
-    <div class="detector-bar">
-        <span class="detector-label">Perception Engine:</span>
-        <div class="detector-toggle-group">
-            <button id="btnDetAruco" class="btn-det active" onclick="requestDetector('ARUCO')">ArUco Target</button>
-            <button id="btnDetWildlife" class="btn-det" onclick="requestDetector('WILDLIFE')">Wildlife NPU (Hailo-8)</button>
+        <div class="header-center">
+            <span class="detector-label">Perception:</span>
+            <div class="detector-toggle-group">
+                <button id="btnDetAruco" class="btn-det" onclick="requestDetector('ARUCO')">ArUco Target</button>
+                <button id="btnDetWildlife" class="btn-det active" onclick="requestDetector('WILDLIFE')">Wildlife NPU (Hailo-8)</button>
+            </div>
+        </div>
+        <div class="header-actions">
+            <button class="btn-hdr" onclick="toggleMaximize()">⛶ Fullscreen</button>
         </div>
     </div>
+
     <div class="video-container" id="videoBox" ondblclick="toggleMaximize()">
         <button class="fs-kill-btn" onclick="requestMode('OFF')">SAFE / DISARM</button>
+        <button id="btnFsVerify" class="fs-verify-btn" onclick="toggleVerifyOverlay()">Verify Grid: OFF</button>
         <img id="streamImg" src="/video_feed" alt="Live Targeting Feed">
+        <svg id="siteVerifyOverlay" class="verify-overlay-svg" viewBox="0 0 1280 720" preserveAspectRatio="xMidYMid meet"></svg>
     </div>
+
     <div class="controls-panel">
         <button id="btnOff" class="btn-base btn-off active" onclick="requestMode('OFF')">OFF</button>
         <button id="btnOn" class="btn-base btn-on" onclick="requestMode('ON')">TRACK</button>
@@ -112,15 +250,118 @@
             </div>
         </div>
     </div>
+
+    <!-- Site Self-Calibration & Visual Verification Panel -->
+    <div class="site-panel">
+        <div class="site-header">
+            <div class="site-title-wrap">
+                <span class="site-title">Site Calibration</span>
+                <span id="siteStatusBadge" class="status-pill pill-muted">LOADING...</span>
+            </div>
+            <div class="site-btn-row">
+                <button id="btnWalkStart" class="btn-site btn-site-walk" onclick="startWalkCalibration()">Walk Cal (5'9")</button>
+                <button id="btnWalkFinish" class="btn-site btn-site-finish" style="display:none;" onclick="finishWalkCalibration()">Finish Walk</button>
+                <button id="btnCalCancel" class="btn-site btn-site-danger" style="display:none;" onclick="cancelSiteCalibration()">Cancel</button>
+                <button id="btnSiteVerify" class="btn-site btn-site-verify" onclick="toggleVerifyOverlay()">Verify Grid</button>
+                <button id="btnSiteSweep" class="btn-site" onclick="triggerBootSweep()">Boot Sweep</button>
+                <button id="btnSiteReset" class="btn-site btn-site-danger" onclick="resetSiteCalibration()">Reset</button>
+                <button id="btnToggleDetails" class="btn-site" onclick="toggleSiteDetails()">Details ▾</button>
+            </div>
+        </div>
+
+        <div id="walkBanner" class="walk-banner">
+            <div class="walk-banner-top">
+                <span id="walkBannerMsg" class="walk-banner-msg">TURRET DISARMED &amp; LEVEL — Walk 5–25 m out into the yard and back.</span>
+                <span id="walkHeightTag" class="status-pill pill-cal">5'9" (1.75m)</span>
+            </div>
+            <div class="walk-bars">
+                <div>
+                    <div class="walk-metric-label"><span>Person Samples</span><span id="walkPtsText">0 / 16 (min 8)</span></div>
+                    <div class="progress-track">
+                        <div id="walkPtsBar" class="progress-fill"></div>
+                        <div id="walkPtsMinMark" class="progress-min-mark" style="left:50%;"></div>
+                    </div>
+                </div>
+                <div>
+                    <div class="walk-metric-label"><span>Depth Span</span><span id="walkSpanText">0.0 m / 5.5 m (min 4.0 m)</span></div>
+                    <div class="progress-track">
+                        <div id="walkSpanBar" class="progress-fill"></div>
+                        <div id="walkSpanMinMark" class="progress-min-mark" style="left:72.7%;"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div id="siteFeedback" class="site-feedback"></div>
+
+        <div id="siteDetails" class="site-details">
+            <div class="site-metrics-grid">
+                <div class="metric-card">
+                    <div class="metric-label">Mount Height</div>
+                    <div id="valHeight" class="metric-value">--</div>
+                    <div id="subHeight" class="metric-sub">Waiting for data</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-label">Ground Slope</div>
+                    <div id="valSlope" class="metric-value">--</div>
+                    <div id="subSlope" class="metric-sub">--</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-label">Mount Roll</div>
+                    <div id="valRoll" class="metric-value">--</div>
+                    <div class="roll-gauge">
+                        <div class="roll-center-tick"></div>
+                        <div id="rollBubble" class="roll-bubble"></div>
+                    </div>
+                    <div id="subRoll" class="metric-sub">--</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-label">Fit &amp; Sweep</div>
+                    <div id="valFit" class="metric-value">--</div>
+                    <div id="subFit" class="metric-sub">--</div>
+                </div>
+            </div>
+
+            <div class="profile-row">
+                <div class="profile-box">
+                    <div class="profile-box-head">
+                        <span class="metric-label">Pan Treeline Profile (Far Ground Edge vs. Pan)</span>
+                        <span id="profileCurPan" class="metric-sub">Pan: 0 mrad</span>
+                    </div>
+                    <svg id="treelineProfileSvg" class="profile-svg" viewBox="0 0 600 92" preserveAspectRatio="xMidYMid meet"></svg>
+                </div>
+                <div class="op-height-box">
+                    <div>
+                        <div class="metric-label" style="margin-bottom:4px;">Walk-Test Operator Height</div>
+                        <div class="op-height-inputs">
+                            <input id="opFeet" type="number" min="4" max="7" value="5" onchange="updateWalkBtnLabel()">
+                            <span>ft</span>
+                            <input id="opInches" type="number" min="0" max="11" step="0.5" value="9" onchange="updateWalkBtnLabel()">
+                            <span>in</span>
+                            <span id="opMetersPreview">(1.753 m)</span>
+                        </div>
+                    </div>
+                    <div class="legend-row">
+                        <span><i class="legend-dot" style="background:#f0883e;"></i>Far Deer Head (6'0")</span>
+                        <span><i class="legend-dot" style="background:#38bdf8;"></i>Far Ground Edge</span>
+                        <span><i class="legend-dot" style="background:#3fb950;"></i>Range Grid &amp; Scale</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <div class="meta">Deterministic 50Hz Motion | Horizon-Tiled 12MP Day / 3MP Dusk | Hailo-8 26 TOPS PCIe NPU</div>
 </div>
 <script>
-let currentMode = "OFF", isPrimed = false, currentDetector = "ARUCO", hailoAvailable = true, armedAllowed = false;
+let currentMode = "OFF", isPrimed = false, currentDetector = "WILDLIFE", hailoAvailable = true, armedAllowed = false;
+let calibrationActive = false, verifyOverlayOn = false, siteDetailsOpen = false;
+let lastSiteData = null;
 let coverOpen = false, coverTimer = null, timerStart = 0;
 const TIMEOUT_MS = 4000;
 
 function flipOpenCover() {
-    if (currentMode !== "ON" || !armedAllowed) return;
+    if (currentMode !== "ON" || !armedAllowed || calibrationActive) return;
     coverOpen = true;
     document.getElementById("safetyCover").classList.add("flipped");
     const bar = document.getElementById("timeoutBar");
@@ -138,26 +379,30 @@ function snapCoverClosed() {
     document.getElementById("safetyCover").classList.remove("flipped");
 }
 function confirmArmTrigger() {
-    if (currentMode === "ON" && coverOpen) { snapCoverClosed(); requestMode("ARMED"); }
+    if (currentMode === "ON" && coverOpen && !calibrationActive) { snapCoverClosed(); requestMode("ARMED"); }
     else if (currentMode === "ARMED") { snapCoverClosed(); requestMode("ON"); }
 }
 function postApi(payload) {
     fetch("/api/mode", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) })
         .then(r => r.json())
-        .then(d => { if (d.status === "ok") updateUIState(d); else if (d.message) alert(d.message); })
+        .then(d => { if (d.status === "ok") updateUIState(d); else if (d.message) showSiteFeedback(d.message, true); })
         .catch(err => console.error("API error:", err));
 }
 function handleCalibrateClick() {
+    if (calibrationActive) return;
     if (currentMode === "CALIBRATE") postApi({ reprime: true });
     else if (currentMode === "ON") requestMode("CALIBRATE");
 }
 function requestDetector(det) { postApi({ detector: det }); }
 function requestMode(mode) { postApi({ mode: mode }); }
+
 function updateUIState(d) {
+    const modeChanged = (d.mode !== currentMode);
     currentMode = d.mode; isPrimed = !!d.primed;
     if (d.detector) currentDetector = d.detector;
     if (typeof d.hailo_available === "boolean") hailoAvailable = d.hailo_available;
     if (typeof d.armed_allowed === "boolean") armedAllowed = d.armed_allowed;
+    if (typeof d.calibration_active === "boolean") calibrationActive = d.calibration_active;
 
     const badge = document.getElementById("modeBadge"), btnOff = document.getElementById("btnOff"),
           btnOn = document.getElementById("btnOn"), btnCal = document.getElementById("btnCal"),
@@ -170,9 +415,16 @@ function updateUIState(d) {
 
     btnOff.classList.remove("active"); btnOn.classList.remove("active");
     btnCal.classList.remove("active", "locked"); trigger.classList.remove("live-armed");
+    btnOn.disabled = calibrationActive;
+    btnCal.disabled = calibrationActive;
     badge.className = "status-pill";
 
-    if (currentMode === "OFF") {
+    if (calibrationActive) {
+        badge.textContent = "SITE CALIBRATING"; badge.classList.add("pill-cal"); btnOff.classList.add("active");
+        btnCal.textContent = "1-SHOT"; btnCal.classList.add("locked");
+        cover.classList.add("disabled"); coverLabel.textContent = "CAL ACTIVE"; triggerLabel.textContent = "ARM LIVE";
+        snapCoverClosed();
+    } else if (currentMode === "OFF") {
         badge.textContent = "OFF / SAFE"; badge.classList.add("pill-off"); btnOff.classList.add("active");
         btnCal.textContent = "1-SHOT"; btnCal.classList.add("locked");
         cover.classList.add("disabled"); coverLabel.textContent = "LOCKED"; triggerLabel.textContent = "ARM LIVE";
@@ -183,7 +435,7 @@ function updateUIState(d) {
         cover.classList.toggle("disabled", !armedAllowed);
         coverLabel.textContent = armedAllowed ? "LIFT TO ARM" : "SET PASS";
         triggerLabel.textContent = "ARM LIVE";
-        if (coverOpen) snapCoverClosed();
+        if (coverOpen && (modeChanged || !armedAllowed)) snapCoverClosed();
     } else if (currentMode === "CALIBRATE") {
         badge.textContent = isPrimed ? "CAL: PRIMED" : "CAL: LOCKED"; badge.classList.add("pill-cal");
         btnCal.classList.add("active"); btnCal.textContent = isPrimed ? "PRIMED" : "RE-PRIME";
@@ -194,8 +446,391 @@ function updateUIState(d) {
         cover.classList.add("flipped"); trigger.classList.add("live-armed"); triggerLabel.textContent = "DISARM";
     }
 }
-function syncMode() { fetch("/api/mode").then(r => r.json()).then(d => { if (d.status === "ok") updateUIState(d); }).catch(() => {}); }
-setInterval(syncMode, 1000); syncMode();
+
+/* --- Site Calibration & Visual Verification --- */
+function getOperatorHeightMeters() {
+    const ft = parseFloat(document.getElementById("opFeet").value) || 5;
+    const inch = parseFloat(document.getElementById("opInches").value) || 0;
+    return ((ft * 12) + inch) * 0.0254;
+}
+function updateWalkBtnLabel() {
+    const ft = parseInt(document.getElementById("opFeet").value, 10) || 5;
+    const inch = parseFloat(document.getElementById("opInches").value) || 0;
+    const m = getOperatorHeightMeters();
+    document.getElementById("opMetersPreview").textContent = `(${m.toFixed(3)} m)`;
+    document.getElementById("btnWalkStart").textContent = `Walk Cal (${ft}'${inch}")`;
+}
+function showSiteFeedback(msg, isError) {
+    const el = document.getElementById("siteFeedback");
+    el.textContent = msg;
+    el.classList.toggle("error", !!isError);
+    el.classList.add("visible");
+    clearTimeout(el._hideT);
+    el._hideT = setTimeout(() => el.classList.remove("visible"), 7000);
+}
+function postSiteCal(payload) {
+    fetch("/api/site_calibration", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+    })
+        .then(r => r.json())
+        .then(d => {
+            if (d.message) showSiteFeedback(d.message, !d.ok);
+            if (d.calibration) updateSiteCalUI(d);
+            syncMode();
+        })
+        .catch(err => showSiteFeedback("Site calibration request failed: " + err, true));
+}
+function startWalkCalibration() {
+    const h_m = getOperatorHeightMeters();
+    siteDetailsOpen = true;
+    document.getElementById("siteDetails").classList.add("open");
+    document.getElementById("btnToggleDetails").textContent = "Details ▴";
+    if (!verifyOverlayOn) toggleVerifyOverlay(true);
+    postSiteCal({ action: "walk_start", operator_height_m: h_m });
+}
+function finishWalkCalibration() { postSiteCal({ action: "walk_finish" }); }
+function cancelSiteCalibration() { postSiteCal({ action: "cancel" }); }
+function triggerBootSweep() {
+    siteDetailsOpen = true;
+    document.getElementById("siteDetails").classList.add("open");
+    document.getElementById("btnToggleDetails").textContent = "Details ▴";
+    postSiteCal({ action: "sweep" });
+}
+function resetSiteCalibration() {
+    if (!confirm("Reset saved site calibration and schedule a fresh daylight boot sweep?")) return;
+    postSiteCal({ action: "reset", trigger_sweep: true });
+}
+function toggleSiteDetails() {
+    siteDetailsOpen = !siteDetailsOpen;
+    document.getElementById("siteDetails").classList.toggle("open", siteDetailsOpen);
+    document.getElementById("btnToggleDetails").textContent = siteDetailsOpen ? "Details ▴" : "Details ▾";
+}
+function toggleVerifyOverlay(forceVal) {
+    verifyOverlayOn = (typeof forceVal === "boolean") ? forceVal : !verifyOverlayOn;
+    document.getElementById("siteVerifyOverlay").classList.toggle("visible", verifyOverlayOn);
+    document.getElementById("btnSiteVerify").classList.toggle("active", verifyOverlayOn);
+    document.getElementById("btnFsVerify").textContent = verifyOverlayOn ? "Verify Grid: ON" : "Verify Grid: OFF";
+    if (verifyOverlayOn && lastSiteData) renderVerifyOverlay(lastSiteData);
+}
+
+function updateSiteCalUI(d) {
+    lastSiteData = d;
+    const cal = d.calibration || {};
+    const opt = d.optics || {};
+    const thr = d.thresholds || {};
+    const tur = d.turret || { pan_mrad: 0, tilt_mrad: 0 };
+
+    calibrationActive = !!d.motion_owned;
+
+    const pill = document.getElementById("siteStatusBadge");
+    pill.className = "status-pill";
+    if (cal.walk_test_active) {
+        pill.textContent = "WALK-TEST ACTIVE"; pill.classList.add("pill-cal");
+    } else if (cal.sweep_state === "SWEEPING") {
+        pill.textContent = "BOOT SWEEPING"; pill.classList.add("pill-cal");
+    } else if (cal.metric_source === "WALK_TEST") {
+        pill.textContent = "LOCKED (WALK-TEST)"; pill.classList.add("pill-off");
+    } else if (cal.metric_source === "PASSIVE_STADIA") {
+        pill.textContent = "LOCKED (PASSIVE)"; pill.classList.add("pill-on");
+    } else if (cal.boot_sweep_completed) {
+        pill.textContent = "TREELINE ONLY (STADIA)"; pill.classList.add("pill-cal");
+    } else {
+        pill.textContent = "UNCALIBRATED"; pill.classList.add("pill-muted");
+    }
+
+    const walkActive = !!cal.walk_test_active;
+    const sweeping = cal.sweep_state === "SWEEPING";
+    document.getElementById("btnWalkStart").style.display = walkActive ? "none" : "inline-block";
+    document.getElementById("btnWalkStart").disabled = sweeping;
+    document.getElementById("btnWalkFinish").style.display = walkActive ? "inline-block" : "none";
+    document.getElementById("btnCalCancel").style.display = (walkActive || sweeping) ? "inline-block" : "none";
+    document.getElementById("btnSiteSweep").disabled = walkActive || sweeping;
+    document.getElementById("btnSiteReset").disabled = walkActive || sweeping;
+
+    const wb = document.getElementById("walkBanner");
+    wb.classList.toggle("visible", walkActive);
+    if (walkActive) {
+        const minPts = thr.walk_test_min_samples || 8;
+        const autoPts = thr.walk_test_auto_finish_samples || 16;
+        const minSpan = thr.walk_test_min_depth_span_m || 4.0;
+        const targetSpan = minSpan + 1.5;
+        const pts = cal.walk_test_samples || 0;
+        const span = cal.walk_test_depth_span_m || 0;
+        const opH = cal.operator_height_m || 1.7526;
+        const totalIn = opH / 0.0254;
+        const oFt = Math.floor(totalIn / 12);
+        const oIn = Math.round((totalIn - oFt * 12) * 10) / 10;
+
+        document.getElementById("walkHeightTag").textContent = `${oFt}'${oIn}" (${opH.toFixed(2)}m)`;
+        document.getElementById("walkPtsText").textContent = `${pts} / ${autoPts} (min ${minPts})`;
+        document.getElementById("walkSpanText").textContent = `${span.toFixed(1)} m / ${targetSpan.toFixed(1)} m (min ${minSpan.toFixed(1)} m)`;
+        document.getElementById("walkPtsBar").style.width = Math.min(100, (pts / autoPts) * 100) + "%";
+        document.getElementById("walkSpanBar").style.width = Math.min(100, (span / targetSpan) * 100) + "%";
+        document.getElementById("walkPtsMinMark").style.left = Math.min(100, (minPts / autoPts) * 100) + "%";
+        document.getElementById("walkSpanMinMark").style.left = Math.min(100, (minSpan / targetSpan) * 100) + "%";
+
+        const readyEarly = pts >= minPts && span >= minSpan;
+        document.getElementById("btnWalkFinish").disabled = !readyEarly;
+        document.getElementById("walkBannerMsg").textContent = readyEarly
+            ? "Enough samples collected! Keep walking to auto-lock or click Finish Walk now."
+            : "TURRET DISARMED & LEVEL — Walk upright 5–25 m out into view and back.";
+    }
+
+    if (cal.camera_mount_height_m != null) {
+        const ftH = (cal.camera_mount_height_m * 3.28084).toFixed(2);
+        document.getElementById("valHeight").textContent = `${cal.camera_mount_height_m.toFixed(2)} m (${ftH} ft)`;
+        document.getElementById("subHeight").textContent = cal.metric_source === "WALK_TEST" ? "Calibrated via Walk-Test" : "Converged via Passive Stadia";
+        document.getElementById("subHeight").className = "metric-sub metric-ok";
+    } else {
+        const fb = opt.fallback_height_m != null ? opt.fallback_height_m.toFixed(2) : "1.15";
+        document.getElementById("valHeight").textContent = `${fb} m (Fallback)`;
+        document.getElementById("subHeight").textContent = "Using stadia range until calibrated";
+        document.getElementById("subHeight").className = "metric-sub metric-warn";
+    }
+
+    if (cal.ground_slope_mrad != null) {
+        const degS = (cal.ground_slope_mrad * 180 / (1000 * Math.PI)).toFixed(2);
+        const dirS = Math.abs(cal.ground_slope_mrad) < 5 ? "Level yard" : (cal.ground_slope_mrad > 0 ? "Slopes downhill" : "Slopes uphill");
+        document.getElementById("valSlope").textContent = `${cal.ground_slope_mrad >= 0 ? "+" : ""}${cal.ground_slope_mrad.toFixed(1)} mrad`;
+        document.getElementById("subSlope").textContent = `${degS >= 0 ? "+" : ""}${degS}° · ${dirS}`;
+    } else {
+        document.getElementById("valSlope").textContent = "Unset";
+        document.getElementById("subSlope").textContent = "Run Walk Cal to fit slope";
+    }
+
+    const rollMrad = cal.roll_mrad || 0;
+    const rollDeg = cal.roll_deg || 0;
+    const rollWarn = thr.roll_warn_mrad || 44.0;
+    const rollBad = Math.abs(rollMrad) >= rollWarn;
+    document.getElementById("valRoll").textContent = `${rollDeg >= 0 ? "+" : ""}${rollDeg.toFixed(2)}°`;
+    const pctRoll = Math.max(8, Math.min(92, 50 + (rollDeg / 8.0) * 42));
+    const bubble = document.getElementById("rollBubble");
+    bubble.style.left = pctRoll + "%";
+    bubble.style.background = rollBad ? "#f0883e" : "#3fb950";
+    document.getElementById("subRoll").textContent = rollBad
+        ? `Mount tilted ${Math.abs(rollDeg).toFixed(1)}° ${rollDeg > 0 ? "right" : "left"}`
+        : "Mount level OK";
+    document.getElementById("subRoll").className = rollBad ? "metric-sub metric-warn" : "metric-sub metric-ok";
+
+    const stops = cal.yard_top_stops || 0;
+    if (cal.metric_source === "WALK_TEST") {
+        document.getElementById("valFit").textContent = `RMS ${cal.walk_test_residual_mrad.toFixed(1)} mrad`;
+        document.getElementById("subFit").textContent = `${cal.walk_test_samples} walk pts · ${stops} treeline stops`;
+    } else if (cal.metric_source === "PASSIVE_STADIA") {
+        document.getElementById("valFit").textContent = `${cal.passive_samples} passive pts`;
+        document.getElementById("subFit").textContent = `${stops} treeline stops mapped`;
+    } else {
+        const pMin = thr.passive_min_samples || 15;
+        document.getElementById("valFit").textContent = `${cal.passive_samples || 0}/${pMin} passive`;
+        document.getElementById("subFit").textContent = `${stops} treeline stops (${cal.sweep_state})`;
+    }
+
+    document.getElementById("profileCurPan").textContent = `Pan: ${tur.pan_mrad >= 0 ? "+" : ""}${tur.pan_mrad} mrad`;
+    renderTreelineChart(d);
+    if (verifyOverlayOn) renderVerifyOverlay(d);
+}
+
+function renderTreelineChart(d) {
+    const svg = document.getElementById("treelineProfileSvg");
+    const pts = d.yard_top_profile || [];
+    const curPan = (d.turret && d.turret.pan_mrad) || 0;
+    const W = 600, H = 92;
+    const panMin = -800, panMax = 800;
+    const yMinMrad = -180, yMaxMrad = 180;
+
+    const mapX = p => Math.max(18, Math.min(W - 18, ((p - panMin) / (panMax - panMin)) * (W - 36) + 18));
+    // More negative mrad = higher in image (top of chart); more positive = lower in image (bottom of chart)
+    const mapY = m => Math.max(18, Math.min(H - 18, ((m - yMinMrad) / (yMaxMrad - yMinMrad)) * (H - 36) + 18));
+
+    let out = "";
+    const y0 = mapY(0);
+    out += `<line x1="14" y1="${y0.toFixed(1)}" x2="${W - 14}" y2="${y0.toFixed(1)}" stroke="#30363d" stroke-dasharray="5 4" stroke-width="1"/>`;
+    out += `<text x="16" y="12" fill="#8b949e" font-size="10">↑ Higher in view (-mrad)</text>`;
+    out += `<text x="${W - 16}" y="12" text-anchor="end" fill="#6e7681" font-size="10">dashed = 0 mrad (level)</text>`;
+    out += `<text x="16" y="${H - 4}" fill="#8b949e" font-size="10">Left (-750)</text>`;
+    out += `<text x="${W / 2}" y="${H - 4}" text-anchor="middle" fill="#8b949e" font-size="10">Center (0)</text>`;
+    out += `<text x="${W - 16}" y="${H - 4}" text-anchor="end" fill="#8b949e" font-size="10">Right (+750)</text>`;
+
+    const cx = mapX(curPan);
+    out += `<line x1="${cx.toFixed(1)}" y1="14" x2="${cx.toFixed(1)}" y2="${H - 15}" stroke="#3fb950" stroke-width="1.5" stroke-dasharray="3 2"/>`;
+
+    if (pts.length > 0) {
+        const coords = pts.map(([p, v]) => [mapX(p), mapY(v), v]);
+        const polyPts = coords.map(c => `${c[0].toFixed(1)},${c[1].toFixed(1)}`).join(" ");
+        const areaPts = `${coords[0][0].toFixed(1)},${H - 15} ${polyPts} ${coords[coords.length - 1][0].toFixed(1)},${H - 15}`;
+        out += `<polygon points="${areaPts}" fill="#38bdf822"/>`;
+        out += `<polyline points="${polyPts}" fill="none" stroke="#38bdf8" stroke-width="2"/>`;
+        for (const [x, y] of coords) {
+            out += `<circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="3.5" fill="#79c0ff" stroke="#0d1117" stroke-width="1.2"/>`;
+        }
+    } else {
+        out += `<text x="${W / 2}" y="${H / 2 + 4}" text-anchor="middle" fill="#6e7681" font-size="11.5">No daylight treeline sweep yet (click Boot Sweep in daylight)</text>`;
+    }
+    svg.innerHTML = out;
+}
+
+function renderVerifyOverlay(d) {
+    const svg = document.getElementById("siteVerifyOverlay");
+    const opt = d.optics || {};
+    const cal = d.calibration || {};
+    const tur = d.turret || { pan_mrad: 0, tilt_mrad: 0 };
+
+    const W = opt.frame_width || 1280;
+    const H_PX = opt.frame_height || 720;
+    const ocX = (opt.optical_center && opt.optical_center[0]) || 640;
+    const ocY = (opt.optical_center && opt.optical_center[1]) || 360;
+    const f = opt.focal_length_px || 540.4;
+    const tilt = tur.tilt_mrad || 0;
+    const rollMrad = opt.roll_mrad || 0;
+    const tanRoll = Math.tan(rollMrad / 1000.0);
+
+    const hCam = opt.active_height_m || opt.fallback_height_m || 1.15;
+    const slopeMrad = opt.active_slope_mrad || 0;
+    const horOff = opt.active_horizon_y_offset_720 || 0;
+    const ytMrad = d.current_yard_top_mrad;
+    const farHeadMrad = (d.deer_far_head_mrad !== null && d.deer_far_head_mrad !== undefined)
+        ? d.deer_far_head_mrad
+        : d.deer_head_ceiling_mrad;
+
+    const linePts = (yCenter) => {
+        const yL = yCenter + (0 - ocX) * tanRoll;
+        const yR = yCenter + (W - ocX) * tanRoll;
+        return [yL, yR];
+    };
+
+    let out = "";
+
+    // 1. Computed Physical Far-Edge Deer Head Line (6'0" / 1.83 m standing at far ground edge)
+    if (farHeadMrad !== null && farHeadMrad !== undefined) {
+        const yDeerC = ocY + f * Math.tan((tilt + farHeadMrad) / 1000.0);
+        const [dL, dR] = linePts(yDeerC);
+        out += `<polygon points="0,0 ${W},0 ${W},${Math.max(0, dR).toFixed(1)} 0,${Math.max(0, dL).toFixed(1)}" fill="rgba(240,136,62,0.08)"/>`;
+        out += `<line x1="0" y1="${dL.toFixed(1)}" x2="${W}" y2="${dR.toFixed(1)}" stroke="#f0883e" stroke-width="2" stroke-dasharray="10 6"/>`;
+        const lblY = Math.max(54, Math.min(H_PX - 12, dL - 6));
+        out += `<text x="14" y="${lblY.toFixed(1)}" fill="#f0883e" font-size="13.5" font-weight="700" stroke="#000" stroke-width="3" paint-order="stroke">FAR DEER HEAD 6'0" (${farHeadMrad >= 0 ? "+" : ""}${farHeadMrad.toFixed(0)} mrad)</text>`;
+    }
+
+    // 2. Metric Ground-Plane Horizon & Scanned Far Ground Edge (right-edge labels kept >= 22px apart)
+    const yHorC = ocY + f * Math.tan((tilt + slopeMrad) / 1000.0) + horOff;
+    const [hL, hR] = linePts(yHorC);
+    const hasMetricHor = (hL > -40 && hL < H_PX + 40);
+    const hasFarEdge = (ytMrad !== null && ytMrad !== undefined);
+    let cL = 0, cR = 0;
+    if (hasFarEdge) {
+        const yCeilC = ocY + f * Math.tan((tilt + ytMrad) / 1000.0);
+        [cL, cR] = linePts(yCeilC);
+        out += `<line x1="0" y1="${cL.toFixed(1)}" x2="${W}" y2="${cR.toFixed(1)}" stroke="#38bdf8" stroke-width="2" stroke-dasharray="8 6"/>`;
+    }
+    if (hasMetricHor) {
+        out += `<line x1="0" y1="${hL.toFixed(1)}" x2="${W}" y2="${hR.toFixed(1)}" stroke="#d29922" stroke-opacity="0.75" stroke-width="1.5" stroke-dasharray="4 6"/>`;
+    }
+
+    // Position right-edge labels on opposite sides of their lines so they never collide
+    let lblHY = Math.max(46, Math.min(H_PX - 14, hR - 6));
+    let lblCY = Math.max(66, Math.min(H_PX - 12, cR + 16));
+    if (hasMetricHor && hasFarEdge) {
+        if (cR >= hR) {
+            // Normal case: far ground edge is below metric horizon
+            lblHY = Math.max(46, Math.min(H_PX - 36, hR - 6));
+            lblCY = Math.max(lblHY + 22, Math.min(H_PX - 12, cR + 16));
+        } else {
+            // Uphill case: far ground edge is above metric horizon
+            lblCY = Math.max(46, Math.min(H_PX - 36, cR - 6));
+            lblHY = Math.max(lblCY + 22, Math.min(H_PX - 12, hR + 16));
+        }
+    }
+    if (hasMetricHor) {
+        out += `<text x="${W - 14}" y="${lblHY.toFixed(1)}" text-anchor="end" fill="#d29922" font-size="12.5" font-weight="700" stroke="#000" stroke-width="3" paint-order="stroke">METRIC HORIZON (slope ${slopeMrad >= 0 ? "+" : ""}${slopeMrad.toFixed(0)} mrad)</text>`;
+    }
+    if (hasFarEdge) {
+        out += `<text x="${W - 14}" y="${lblCY.toFixed(1)}" text-anchor="end" fill="#38bdf8" font-size="13" font-weight="700" stroke="#000" stroke-width="3" paint-order="stroke">FAR GROUND EDGE (${ytMrad >= 0 ? "+" : ""}${ytMrad.toFixed(0)} mrad)</text>`;
+    }
+
+    // 4. Projected Ground-Plane Range Lines with anti-overlap label spacing + Reference Scale Brackets
+    const ranges = [5, 10, 15, 20, 30, 40];
+    const gridColor = d.use_ground_range ? "#3fb950" : "#8b949e";
+    let lastLabelY = 1e9;
+    let labelCol = 0;
+
+    for (const r of ranges) {
+        if (r <= hCam + 0.2) continue;
+        const netDep = Math.asin(Math.min(0.98, hCam / r));
+        const optDep = ((tilt + slopeMrad) / 1000.0) + netDep;
+        if (optDep >= 1.35 || optDep <= -1.35) continue;
+        const yC = ocY + f * Math.tan(optDep) + horOff;
+        if (yC < 30 || yC > H_PX - 20) continue;
+        const [rL, rR] = linePts(yC);
+        const ft = Math.round(r * 3.28084);
+        const yLineL = rL + 80 * tanRoll;
+        const yLineR = rR - 80 * tanRoll;
+        out += `<line x1="80" y1="${yLineL.toFixed(1)}" x2="${W - 80}" y2="${yLineR.toFixed(1)}" stroke="${gridColor}" stroke-opacity="0.6" stroke-width="1.5" stroke-dasharray="4 6"/>`;
+
+        // Stagger far-range labels horizontally if vertically crowded (< 18px apart)
+        const crowded = Math.abs(lastLabelY - yLineL) < 18;
+        const lblX = crowded ? (88 + ((labelCol % 2) * 105)) : 88;
+        if (!crowded || labelCol < 2) {
+            out += `<text x="${lblX}" y="${(yLineL - 4).toFixed(1)}" fill="${gridColor}" font-size="12.5" font-weight="700" stroke="#000" stroke-width="3" paint-order="stroke">${r}m (${ft}ft)</text>`;
+            lastLabelY = yLineL;
+            labelCol = crowded ? (labelCol + 1) : 1;
+        }
+
+        // Visual reference height brackets positioned cleanly away from right-edge labels
+        if (r === 10) {
+            const opH = cal.operator_height_m || 1.7526;
+            const pxH = (opH * f) / r;
+            const rx = 860;
+            const yFoot = yC + (rx - ocX) * tanRoll;
+            const yTop = yFoot - pxH;
+            if (yTop > 10 && yFoot < H_PX - 10) {
+                const yMid = (yTop + yFoot) / 2;
+                out += `<line x1="${rx}" y1="${yTop.toFixed(1)}" x2="${rx}" y2="${yFoot.toFixed(1)}" stroke="#f0883e" stroke-width="3"/>`;
+                out += `<line x1="${rx - 10}" y1="${yTop.toFixed(1)}" x2="${rx + 10}" y2="${yTop.toFixed(1)}" stroke="#f0883e" stroke-width="2.5"/>`;
+                out += `<line x1="${rx - 10}" y1="${yFoot.toFixed(1)}" x2="${rx + 10}" y2="${yFoot.toFixed(1)}" stroke="#f0883e" stroke-width="2.5"/>`;
+                out += `<rect x="${rx + 12}" y="${(yMid - 11).toFixed(1)}" width="96" height="22" rx="4" fill="rgba(13,17,23,0.82)" stroke="#f0883e" stroke-width="1"/>`;
+                out += `<text x="${rx + 60}" y="${(yMid + 4).toFixed(1)}" text-anchor="middle" fill="#f0883e" font-size="12.5" font-weight="700">5'9" @ 10m</text>`;
+            }
+        } else if (r === 20) {
+            const pxH = (1.0 * f) / r;
+            const rx = 310;
+            const yFoot = yC + (rx - ocX) * tanRoll;
+            const yTop = yFoot - pxH;
+            if (yTop > 10 && yFoot < H_PX - 10) {
+                const yMid = (yTop + yFoot) / 2;
+                out += `<line x1="${rx}" y1="${yTop.toFixed(1)}" x2="${rx}" y2="${yFoot.toFixed(1)}" stroke="#3fb950" stroke-width="3"/>`;
+                out += `<line x1="${rx - 8}" y1="${yTop.toFixed(1)}" x2="${rx + 8}" y2="${yTop.toFixed(1)}" stroke="#3fb950" stroke-width="2.5"/>`;
+                out += `<line x1="${rx - 8}" y1="${yFoot.toFixed(1)}" x2="${rx + 8}" y2="${yFoot.toFixed(1)}" stroke="#3fb950" stroke-width="2.5"/>`;
+                out += `<rect x="${rx + 10}" y="${(yMid - 11).toFixed(1)}" width="122" height="22" rx="4" fill="rgba(13,17,23,0.82)" stroke="#3fb950" stroke-width="1"/>`;
+                out += `<text x="${rx + 71}" y="${(yMid + 4).toFixed(1)}" text-anchor="middle" fill="#3fb950" font-size="12.5" font-weight="700">1.0m deer @ 20m</text>`;
+            }
+        }
+    }
+
+    // 5. Top-center calibration summary pill
+    const pillText = d.use_ground_range
+        ? `VERIFY GRID (${cal.metric_source}) · H=${hCam.toFixed(2)}m · Slope=${slopeMrad >= 0 ? "+" : ""}${slopeMrad.toFixed(0)}mrad · Roll=${(cal.roll_deg || 0).toFixed(1)}°`
+        : `VERIFY GRID (UNCALIBRATED FALLBACK H=${hCam.toFixed(2)}m) — Run Walk Cal to lock ground grid`;
+    const pillColor = d.use_ground_range ? "#3fb950" : "#f0883e";
+    out += `<rect x="315" y="10" width="650" height="26" rx="6" fill="rgba(13,17,23,0.82)" stroke="${pillColor}" stroke-width="1.5"/>`;
+    out += `<text x="640" y="28" text-anchor="middle" fill="${pillColor}" font-size="12.5" font-weight="700">${pillText}</text>`;
+
+    svg.innerHTML = out;
+}
+
+function syncMode() {
+    fetch("/api/mode").then(r => r.json()).then(d => { if (d.status === "ok") updateUIState(d); }).catch(() => {});
+}
+function syncSiteCal() {
+    fetch("/api/site_calibration").then(r => r.json()).then(d => { if (d.calibration) updateSiteCalUI(d); }).catch(() => {});
+}
+
+updateWalkBtnLabel();
+setInterval(syncMode, 1000);
+setInterval(syncSiteCal, 1000);
+syncMode();
+syncSiteCal();
+
 function toggleMaximize() {
     const box = document.getElementById("videoBox");
     if (!document.fullscreenElement) box.requestFullscreen?.().catch(() => {});

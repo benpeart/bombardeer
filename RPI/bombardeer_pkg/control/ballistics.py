@@ -72,10 +72,18 @@ def compute_target_kinematics(
     )
 
 
-def compute_horizon_y_720(tilt_mrad: float, cam: CameraConfig, optics: OpticsConfig) -> float:
-    """Computes horizon Y coordinate in canonical 1280x720 space for given turret tilt (mrad)."""
+def compute_horizon_y_720(
+    tilt_mrad: float,
+    cam: CameraConfig,
+    optics: OpticsConfig,
+    x_px: Optional[float] = None,
+    roll_mrad: float = 0.0,
+) -> float:
+    """Computes horizon Y coordinate in canonical 1280x720 space for given turret tilt and optional camera roll."""
     angle_rad = (float(tilt_mrad) + optics.ground_slope_mrad) / 1000.0
     y_hor = cam.optical_center[1] + (optics.focal_length_px * math.tan(angle_rad)) + optics.horizon_y_offset_720
+    if x_px is not None and abs(roll_mrad) > 1e-4:
+        y_hor += (float(x_px) - cam.optical_center[0]) * math.tan(float(roll_mrad) / 1000.0)
     return float(np.clip(y_hor, 0.0, float(cam.frame_height)))
 
 
@@ -156,21 +164,51 @@ def evaluate_ground_plane(
     max_animal_height_m: float,
     cam: CameraConfig,
     optics: OpticsConfig,
+    roll_mrad: float = 0.0,
+    yard_top_mrad: Optional[float] = None,
+    use_ground_range: bool = True,
 ) -> Tuple[bool, Optional[str], float]:
     """
-    Checks above-horizon feet veto, ground-plane physical height veto, and returns
+    Checks above-horizon/treeline feet veto, ground-plane physical height veto, and returns
     (accepted, reject_reason, fused_range_m).
+
+    - When yard_top_mrad is provided (from daylight boot sweep), it defines the visual
+      yard ceiling for ABOVE_HORIZON while optics.ground_slope_mrad defines the metric
+      ground plane for r_ground and HEIGHT.
+    - When use_ground_range is False (new site prior to walk-test or passive convergence),
+      ABOVE_HORIZON still protects against sky/treetop false positives while returning
+      stadia_range_m without risking false HEIGHT rejections from a stale mount height.
     """
-    _, by1, _, by2 = box_xyxy
+    bx1, by1, bx2, by2 = box_xyxy
     bh_px = float(max(1, by2 - by1))
+    x_center = 0.5 * float(bx1 + bx2)
     y_bottom = float(by2)
 
-    y_hor = compute_horizon_y_720(tilt_at_cap, cam, optics)
-    min_feet_y = y_hor - optics.horizon_feet_margin_720
+    roll_dy = (
+        (x_center - cam.optical_center[0]) * math.tan(float(roll_mrad) / 1000.0)
+        if abs(roll_mrad) > 1e-4
+        else 0.0
+    )
+
+    if yard_top_mrad is not None:
+        ceil_rad = (float(tilt_at_cap) + float(yard_top_mrad)) / 1000.0
+        y_ceiling = float(np.clip(
+            cam.optical_center[1] + (optics.focal_length_px * math.tan(ceil_rad)) + roll_dy,
+            0.0,
+            float(cam.frame_height),
+        ))
+    else:
+        y_ceiling = compute_horizon_y_720(tilt_at_cap, cam, optics, x_px=x_center, roll_mrad=roll_mrad)
+
+    min_feet_y = y_ceiling - optics.horizon_feet_margin_720
     if y_bottom < min_feet_y:
         return False, f"ABOVE_HORIZON(y2:{by2}<{min_feet_y:.0f})", stadia_range_m
 
-    opt_dep_mrad = math.atan2(y_bottom - cam.optical_center[1], optics.focal_length_px) * 1000.0
+    if not use_ground_range:
+        return True, None, float(np.clip(stadia_range_m, optics.min_valid_range_m, optics.max_valid_range_m))
+
+    y_bottom_unrolled = y_bottom - roll_dy
+    opt_dep_mrad = math.atan2(y_bottom_unrolled - cam.optical_center[1], optics.focal_length_px) * 1000.0
     net_dep_mrad = opt_dep_mrad - float(tilt_at_cap) - optics.ground_slope_mrad
     if net_dep_mrad >= 25.0 and y_bottom < (cam.frame_height - 8):
         r_ground = optics.camera_mount_height_m / math.sin(net_dep_mrad / 1000.0)
@@ -182,3 +220,54 @@ def evaluate_ground_plane(
         return True, None, clamped
 
     return True, None, stadia_range_m
+
+
+DEFAULT_MAX_DEER_HEIGHT_M = 6.0 * 12.0 * 0.0254  # 6'0" (1.8288 m): tall buck head-up + antlers
+
+
+def compute_deer_head_ceiling_mrad(
+    optics: OpticsConfig,
+    max_deer_height_m: float = DEFAULT_MAX_DEER_HEIGHT_M,
+    far_ground_mrad: Optional[float] = None,
+    terrain_margin_mrad: float = 14.0,
+) -> Tuple[float, float, float]:
+    """
+    Computes the highest elevation angle (in mrad, lower/more-negative = higher in image)
+    that a standing deer of physical height max_deer_height_m can reach anywhere between
+    optics.min_valid_range_m (closest) and the far yard edge.
+
+    Pinhole perspective law on a ground plane with slope s and camera height H_cam:
+      dep_head(Z) = s + atan((H_cam - H_deer) / Z)
+
+    - If H_cam < H_deer (camera lower than deer's head), a NEAR deer rises highest above
+      the metric horizon (at Z = min_valid_range_m), while a FAR deer barely clears it.
+    - If H_cam >= H_deer (elevated porch mount higher than a deer's head), a deer's head
+      stays BELOW the metric horizon at ALL ranges — closest at the far edge Z_far.
+
+    Returns (ceiling_mrad, far_head_mrad, near_head_mrad).
+    """
+    h_cam = max(0.35, float(optics.camera_mount_height_m))
+    h_deer = max(0.50, float(max_deer_height_m))
+    s_mrad = float(optics.ground_slope_mrad)
+    r_min = max(2.0, float(optics.min_valid_range_m))
+    r_max = max(r_min + 1.0, float(optics.max_valid_range_m))
+
+    # Estimate far ground-edge range from far_ground_mrad (fallback: max_engage_range_m)
+    r_far = float(np.clip(optics.max_engage_range_m, r_min, r_max))
+    if far_ground_mrad is not None:
+        net_far_dep_mrad = float(far_ground_mrad) - s_mrad
+        if net_far_dep_mrad >= 15.0:
+            r_est = h_cam / math.sin(min(1.2, net_far_dep_mrad / 1000.0))
+            r_far = float(np.clip(r_est, r_min, r_max))
+
+    dh = h_cam - h_deer
+    near_head_mrad = s_mrad + math.atan2(dh, r_min) * 1000.0
+    far_head_mrad = s_mrad + math.atan2(dh, r_far) * 1000.0
+    if far_ground_mrad is not None:
+        # Also ensure uphill far ground edges place the deer's head above the ground edge
+        far_head_from_edge = float(far_ground_mrad) - (math.atan2(h_deer, r_far) * 1000.0)
+        far_head_mrad = min(far_head_mrad, far_head_from_edge)
+
+    # Most-negative (highest in image) across [r_min, r_far], plus small terrain/bounding margin
+    ceiling_mrad = min(near_head_mrad, far_head_mrad) - float(terrain_margin_mrad)
+    return float(ceiling_mrad), float(far_head_mrad), float(near_head_mrad)

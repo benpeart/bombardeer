@@ -1,8 +1,10 @@
-"""Tests for non-droppable TurretCommandBus, SystemState latency/telemetry planes, Basic Auth, ARMED guard, and /api/health."""
+"""Tests for non-droppable TurretCommandBus, SystemState latency/telemetry planes, Basic Auth, ARMED guard, /api/health, and /api/site_calibration."""
 
 import base64
+import math
 
 from bombardeer_pkg.config import load_config
+from bombardeer_pkg.control.site_calibration import DEFAULT_OPERATOR_HEIGHT_M, SiteCalibrationManager
 from bombardeer_pkg.state import SystemState
 from bombardeer_pkg.web.app import create_app
 
@@ -65,6 +67,7 @@ def test_web_auth_and_armed_refused_with_default_password():
     client = create_app(cfg, state).test_client()
 
     assert client.get("/api/mode").status_code == 401
+    assert client.get("/api/site_calibration").status_code == 401
 
     hdrs = _auth_header(cfg.web.auth_user, cfg.web.auth_pass)
     r = client.get("/api/mode", headers=hdrs)
@@ -100,3 +103,78 @@ def test_web_armed_allowed_with_custom_password_and_health_endpoint():
     body = r_health.get_json()
     assert body["armed_allowed"] is True
     assert "turret" in body and "soc_temp_c" in body and "uptime_sec" in body
+    assert isinstance(body["site_calibration"], dict)
+
+
+def test_web_site_calibration_walk_trigger_safety_lockout_and_verification_payload(tmp_path):
+    cfg = load_config(env={"BOMBARDEER_USER": "ben", "BOMBARDEER_PASS": "CustomSecurePass!2026"})
+    cfg.base_dir = str(tmp_path)
+    state = SystemState(cfg)
+    state.site_calibration = SiteCalibrationManager(
+        cfg, cal_path=str(tmp_path / "site_calibration.json"), auto_boot_sweep=False
+    )
+    client = create_app(cfg, state).test_client()
+    hdrs = _auth_header("ben", "CustomSecurePass!2026")
+
+    # Root console HTML includes walk-cal controls and visual verification overlay
+    r_html = client.get("/", headers=hdrs)
+    assert r_html.status_code == 200
+    html = r_html.get_data(as_text=True)
+    assert "siteVerifyOverlay" in html
+    assert "treelineProfileSvg" in html
+    assert "/api/site_calibration" in html
+
+    # GET /api/site_calibration returns optics & thresholds needed for visual verification
+    r_get = client.get("/api/site_calibration", headers=hdrs)
+    assert r_get.status_code == 200
+    payload = r_get.get_json()
+    assert "calibration" in payload and "optics" in payload and "thresholds" in payload
+    assert payload["optics"]["focal_length_px"] == cfg.optics.focal_length_px
+
+    # Put turret in ON, then trigger 5'9" Walk Calibration -> must disarm to OFF & block re-arming (409)
+    assert client.post("/api/mode", json={"mode": "ON"}, headers=hdrs).status_code == 200
+    r_start = client.post("/api/site_calibration", json={"action": "walk_start"}, headers=hdrs)
+    assert r_start.status_code == 200
+    start_body = r_start.get_json()
+    assert start_body["ok"] is True
+    assert start_body["motion_owned"] is True
+    assert start_body["calibration"]["walk_test_active"] is True
+    assert abs(start_body["calibration"]["operator_height_m"] - DEFAULT_OPERATOR_HEIGHT_M) < 1e-4
+    assert state.get_turret_mode()[0] == "OFF"
+
+    # Attempting to enter ON while walk-test is active must be rejected (409)
+    r_blocked = client.post("/api/mode", json={"mode": "ON"}, headers=hdrs)
+    assert r_blocked.status_code == 409
+
+    # Feed synthetic 5'9" operator detections across 6m..22m and finish via API
+    true_h, true_slope = 2.05, 22.0
+    s = true_slope / 1000.0
+    for idx, z_w in enumerate([6.0, 8.5, 11.0, 14.0, 17.0, 20.0, 22.0, 15.0, 9.5]):
+        yf = cfg.camera.optical_center[1] + cfg.optics.focal_length_px * ((true_h + z_w * math.tan(s)) / z_w)
+        yh = cfg.camera.optical_center[1] + cfg.optics.focal_length_px * ((true_h + z_w * math.tan(s) - DEFAULT_OPERATOR_HEIGHT_M) / z_w)
+        bw = (yf - yh) * 0.32
+        box = [640.0 - 0.5 * bw, yh, 640.0 + 0.5 * bw, yf]
+        state.site_calibration.ingest_walk_test_detections(
+            [{"class": "PERSON", "score": 0.90, "box": box}],
+            tilt_at_cap=0.0,
+            eff_capture_mono=50.0 + idx * 0.5,
+            state=state,
+        )
+
+    r_fin = client.post("/api/site_calibration", json={"action": "walk_finish"}, headers=hdrs)
+    assert r_fin.status_code == 200
+    fin_body = r_fin.get_json()
+    assert fin_body["ok"] is True
+    assert fin_body["calibration"]["metric_source"] == "WALK_TEST"
+    assert abs(fin_body["calibration"]["camera_mount_height_m"] - true_h) < 0.05
+    assert abs(fin_body["calibration"]["ground_slope_mrad"] - true_slope) < 3.0
+    assert fin_body["use_ground_range"] is True
+
+    # Normal ON mode resumes cleanly once calibration finishes
+    assert client.post("/api/mode", json={"mode": "ON"}, headers=hdrs).status_code == 200
+
+    # OFF during an active sweep immediately cancels calibration
+    assert client.post("/api/site_calibration", json={"action": "sweep"}, headers=hdrs).status_code == 200
+    assert state.site_calibration.is_motion_owned() is True
+    assert client.post("/api/mode", json={"mode": "OFF"}, headers=hdrs).status_code == 200
+    assert state.site_calibration.is_motion_owned() is False

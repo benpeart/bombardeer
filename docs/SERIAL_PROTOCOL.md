@@ -28,17 +28,18 @@ Decoupling the wire protocol into angular milliradians keeps all kinematics, gea
 
 | Command | Format | Units | Rate / Priority | Description | Example |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **`P`** | `P <pan> <tilt>\n` | `mrad` (int32) | Max 1 per `400 ms`, min `60 mrad` delta | **Atomic Ballistic Setpoint:** Switches ESP32 to `MODE_POSITION` and executes a hardware-timed trapezoidal move to `<pan>, <tilt>` clamped to physical limits (`±3,141` pan, `±392` tilt). | `P 280 -65` |
-| **`V`** | `V <pan_s> <tilt_s>\n` | `mrad/s` (int32) | Up to `25 Hz` (`40 ms` min interval) | **Continuous Velocity Pursuit:** Switches ESP32 to `MODE_VELOCITY` and slews axes at `<pan_s>, <tilt_s>` (clamped by Pi to `±850` pan, `±450` tilt). | `V 320 -85` |
+| **`P`** | `P <pan> <tilt>\n` | `mrad` (int32) | Max 1 per `400 ms`, min `60 mrad` delta (also used by boot sweep & auto-home) | **Atomic Ballistic Setpoint:** Switches ESP32 to `MODE_POSITION` and executes a hardware-timed trapezoidal move to `<pan>, <tilt>` clamped to physical limits (`±3,141` pan, `±392` tilt). | `P 280 -65` |
+| **`V`** | `V <pan_s> <tilt_s>\n` | `mrad/s` (int32) | Up to `25 Hz` (`40 ms` min interval) | **Continuous Velocity Pursuit:** Switches ESP32 to `MODE_VELOCITY` and slews axes at `<pan_s>, <tilt_s>` (clamped by Pi to `±850 mrad/s` pan, `±300 mrad/s` tilt). | `V 320 -85` |
 | **`X`** | `X\n` | — | Immediate (High Priority) | **Emergency Halt:** Cuts `PIN_SOLENOID` `LOW` immediately, cancels `autoFireRequested`, zeroes velocity setpoints, and calls `forceStop()` on both axes. | `X` |
 | **`T`** | `T <0\|1>\n` | flag (`0` or `1`) | Immediate (High Priority) | **Autonomous Trigger Control:** `1` arms the solenoid pulse/cooldown state machine (subject to a `2,000 ms` hardware cutoff); `0` disarms firing after the active `60 ms` pulse finishes. | `T 1` |
 | **`H`** | `H\n` | — | On-demand | **Zero Home Coordinates:** Disarms solenoid, decelerates both axes to a stop (`1,500 ms` bounded wait), and sets current motor step positions to `(0, 0) mrad`. | `H` |
 | **`Y`** | `Y <pi_ms>\n` | `ms` (uint32) | Optional diagnostic | **Clock Sync Ping:** ESP32 immediately echoes `Y <pi_ms> <esp32_ms>\n` for round-trip latency measurement. | `Y 10482910` |
 
-### CommandBus Coalescing (`bombardeer_pkg/state.py`)
+### `TurretCommandBus` Priority & Coalescing (`bombardeer_pkg/state.py`)
 To ensure high-rate `25 Hz` `V` packets never queue up behind slow I/O or delay an emergency stop:
-* **`X` (Halt)** and **`T` (Trigger)** are stored in dedicated high-priority slots and drained ahead of motion commands.
-* **`P` (Setpoint)** and **`V` (Velocity)** overwrite any pending unsent motion command (`latest-wins` semantics) so the ESP32 always receives the freshest trajectory vector.
+* **`X` (`HALT`)** and **`T 0` (`TRIGGER OFF`)** can never be dropped: `request_halt()` sets `_halt_pending`, clears any pending motion command, and forces `TRIGGER 0`. While a `HALT` or unconsumed safety `TRIGGER 0` is pending, `request_trigger(1)` and new motion commands are ignored until `drain()` executes.
+* **`drain()`** atomically returns ordered commands `[HALT?, TRIGGER?, MOTION?]`.
+* **`P` (`SETPOINT`)** and **`V` (`VELOCITY`)** overwrite any pending unsent motion command (`latest-wins` semantics) so the ESP32 always receives the freshest trajectory vector.
 
 ---
 
@@ -50,9 +51,9 @@ To ensure high-rate `25 Hz` `V` packets never queue up behind slow I/O or delay 
 | **`Y`** | `Y <pi_ms> <esp32_ms>\n` | `ms`, `ms` | Immediate reply | **Time Sync Echo:** Returned in response to `Y <pi_ms>`. | `Y 10482910 1840312` |
 
 ### Telemetry Consumption on the Raspberry Pi
-1. `turret_serial_worker()` parses each `S` line and calls `state.update_telemetry(pan_mrad, tilt_mrad, is_moving, is_firing)`.
-2. `SystemState` updates instantaneous telemetry and appends `(time.monotonic(), pan_mrad, tilt_mrad)` to a 60-sample (`~3.0 s`) circular `telemetry_history` deque.
-3. When `VisionMain` confirms a detection captured at mid-exposure timestamp $t_{\text{capture}}$, `state.get_turret_pos_at_time(t_capture)` linearly interpolates `(pan_mrad, tilt_mrad)` from `telemetry_history` so turret motion during the `110–345 ms` NPU inference window introduces zero angular error.
+1. `turret_serial_worker()` parses each `S` line and calls `state.update_turret_telemetry(pan_mrad, tilt_mrad, is_moving, rx_mono)` and `state.set_firing_state(is_firing)`.
+2. `SystemState` updates instantaneous telemetry and appends `(rx_mono, pan_mrad, tilt_mrad)` to a **300-sample** circular `_telemetry_history` deque (`15 s` at `20 Hz`, `3–6 s` at `50–100 Hz`), ensuring deep lookback even during multi-pass `350 ms` `SCAN-12MP` cycles.
+3. When `VisionMain` or `HailoWildlifeDetector` processes a detection captured at mid-exposure timestamp $t_{\text{capture}}$, `state.get_turret_pos_at_time(t_capture)` linearly interpolates `(pan_mrad, tilt_mrad)` from `_telemetry_history` so turret motion during the `110–350 ms` NPU inference window introduces zero angular error.
 
 ---
 

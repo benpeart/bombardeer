@@ -33,17 +33,17 @@ At boot (`setup()`), `SHARED_ENABLE_PIN` (`GPIO 19`) is held `HIGH` (drivers dis
 
 ## 3. Motion Execution Engine (`MODE_POSITION` vs. `MODE_VELOCITY`)
 
-### 3.1Kinematic Limits & Acceleration Profiles
+### 3.1 Kinematic Limits & Acceleration Profiles
 
 | Parameter | Pan Axis | Tilt Axis | Notes |
 | :--- | :---: | :---: | :--- |
-| **Max Speed (`MAXSPEEDHZ`)** | `11,600 Hz` (`~3,425 mrad/s`) | `14,800 Hz` (`~580 mrad/s`) | Benchmarked `80%` ceiling |
+| **Max Speed (`MAXSPEEDHZ`)** | `11,600 Hz` (`~3,425 mrad/s`) | `14,800 Hz` (`~580 mrad/s`) | Benchmarked `80%` ceiling (Pi velocity loop caps to `±850` / `±300 mrad/s`) |
 | **Min Speed (`MINSPEEDHZ`)** | `15 Hz` (`~4.4 mrad/s`) | `15 Hz` (`~0.59 mrad/s`) | Below threshold -> clean `stopMove()` |
 | **Acceleration** | `13,500 steps/s²` | `50,000 steps/s²` | Trapezoidal velocity profile |
 | **Software Travel Limits** | `±180.0°` (`±3,141 mrad`) | `±22.5°` (`±392 mrad`) | Enforced in both `P` and `V` modes |
 
 ### 3.2 Dual-Mode Actuation
-* **Absolute Waypoint Mode (`commandAbsolutePositionMrad()` — `P` command):** Sets `currentMotionMode = MODE_POSITION`, programs `MAXSPEEDHZ`, clamps target steps to `[MIN_STEPS, MAX_STEPS]`, and issues `stepper->moveTo(targetSteps)`.
+* **Absolute Waypoint Mode (`commandAbsolutePositionMrad()` — `P` command):** Sets `currentMotionMode = MODE_POSITION`, programs `MAXSPEEDHZ`, clamps target steps to `[MIN_STEPS, MAX_STEPS]`, and issues `stepper->moveTo(targetSteps)`. Used for large ballistic slews, auto-homing, and the Raspberry Pi's 7-stop daylight site calibration sweep.
 * **Continuous Velocity Slew Mode (`applyVelocityActuation()` — `V` command):** Runs every `loop()` iteration when `currentMotionMode == MODE_VELOCITY`:
   * Zeroes commanded speed immediately if the axis has reached or exceeded `MIN_STEPS` / `MAX_STEPS` in the direction of travel.
   * Applies a **`40 Hz` speed hysteresis** (`VELOCITY_SPEED_HYSTERESIS_HZ`) on upward speed ramps (while allowing immediate downward deceleration or direction reversals) so `FastAccelStepper` ramp planning is never thrashed by minor 1–2 Hz quantization jitter.
@@ -76,5 +76,5 @@ At boot (`setup()`), `SHARED_ENABLE_PIN` (`GPIO 19`) is held `HIGH` (drivers dis
    * Left stick horizontal (`joyLHori`, `DEADZONE_RADIUS = 0.30`) -> inverted Pan velocity (`-rawPan`) with quadratic curve (`powf(normPct, 2.0f)`) and `300 Hz` joystick hysteresis for fine low-speed aiming.
    * Left stick vertical (`joyLVert`, `DEADZONE_RADIUS = 0.30`) -> Tilt velocity (`rawTilt`) with quadratic curve shaping.
    * Right trigger (`trigRT > 0.15`) -> holds `autoFireRequested = true` while squeezed (releasing immediately cuts `autoFireRequested = false`).
-   * **`'A'` Button (Single-Shot Edge):** Calls `forceStopAndNewPosition(0)` on both steppers to zero the mechanical `(0, 0) mrad` home coordinate on demand.
+   * **`'A'` Button (Single-Shot Edge):** Calls `forceStopAndNewPosition(0)` on both steppers to zero the mechanical `(0, 0) mrad` home coordinate on demand (ideal for leveling the turret before running the Raspberry Pi's site boot sweep and Walk-Test).
 2. **Release Lockout (`400 ms`):** When manual inputs return to neutral, `manualOverrideActive` remains `true` for `MANUAL_OVERRIDE_TIMEOUT_MS` (`400 ms`) while draining stale serial bytes (`Serial.read()`) so queued Pi commands cannot jerk the turret immediately after stick release.

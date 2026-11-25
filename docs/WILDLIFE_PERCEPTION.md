@@ -1,6 +1,6 @@
 # Wildlife Perception Engine Design Specification
 
-This document details the computer vision and neural inference architecture used by **Bombardeer** to detect deer and other target wildlife across a wide outdoor yard at ranges up to `75 m` while rejecting false positives and enforcing hard human/vehicle safety vetoes.
+This document details the computer vision and neural inference architecture used by **Bombardeer** to detect deer and other target wildlife across a wide outdoor yard at ranges up to `75 m` while eliminating asynchronous latency races, adapting automatically to each site's far ground edge, and enforcing hard human/vehicle safety vetoes.
 
 ---
 
@@ -11,7 +11,7 @@ MegaDetector v6 (`MDV6-yolov9-c-1280.hef`) takes a square **`1280×1280×3` UINT
 1. **43.75% Wasted NPU Compute:** Letterboxing a `16:9` image into `1:1` fills the top and bottom `280 px` bars with gray padding (`114`), burning nearly half of every inference pass on empty pixels.
 2. **Sub-Threshold Target Resolution:** A deer standing `40–60 m` away at the treeline occupies only `~40–60 px` of height in a `1280×720` frame—falling near or below YOLOv9's stride-8 feature floor, especially against complex branch textures.
 
-**Solution:** Capture native sensor resolution (`12 MP` in daylight, `3 MP` at dusk/night), anchor crop windows to the **tilt-compensated ground horizon**, and pack overlapping native-resolution tiles directly into the `1280×1280` NPU tensor.
+**Solution:** Capture native sensor resolution (`12 MP` in daylight, `3 MP` at dusk/night), anchor crop windows to the **pan-indexed, tilt-compensated far ground edge / horizon**, and pack overlapping native-resolution tiles directly into the `1280×1280` NPU tensor.
 
 ---
 
@@ -23,10 +23,10 @@ MegaDetector v6 (`MDV6-yolov9-c-1280.hef`) takes a square **`1280×1280×3` UINT
   * **`DAY_12MP` (`4608×2592`, `14.4 FPS`, `buffer_count=4`):** Unbinned full-sensor readout for maximum distant treeline detail.
   * **`DUSK_3MP` (`2304×1296`, `30.0 FPS`, `buffer_count=6`):** `2×2` binned readout for higher pixel SNR and faster frame cadence in low light or ArUco calibration mode.
   * Using `BGR888` on PiSP outputs RGB bytes directly in memory (`main_stream_is_rgb: true`), eliminating a full-frame CPU `BGR2RGB` conversion on every inference pass.
-* **`lores` Stream (`1280×720` `RGB888`):** Hardware-downscaled by the ISP for ArUco fiducial tracking, `VideoWriter` event archiving, audit snapshots, and the `1280×720` Web HUD. All detection coordinates from `12 MP` or `3 MP` tiles are normalized back into this single canonical `1280×720` coordinate space.
+* **`lores` Stream (`1280×720` `RGB888`):** Hardware-downscaled by the ISP for ArUco fiducial tracking, `VideoWriter` event archiving, timestamp-matched audit snapshots (`npu_lores_history`, `maxlen=12`), daylight boot-sweep analysis, and the `1280×720` Web HUD. All detection coordinates from `12 MP` or `3 MP` tiles normalize into this single canonical `1280×720` coordinate space.
 
 ### 2.1 Dual Hysteresis Lighting Controllers
-Evaluated at `~1 Hz` (blocked whenever a target is locked, confirming, or recording):
+Evaluated at `~1 Hz` (blocked whenever a target is locked, confirming, recording, NPU inference is in flight, or site calibration owns turret motion):
 
 1. **ISP Daylight HDR ↔ Low-Light Monochrome:**
    * **Enter B&W (`is_monochrome = True`):** `Lux < 25.0` or `AnalogueGain > 6.0` -> sets `HdrMode=0`, `Saturation=0.0`, `Contrast=1.15`, `Sharpness=0.90`, `ExposureValue=+0.25`.
@@ -38,32 +38,36 @@ Evaluated at `~1 Hz` (blocked whenever a target is locked, confirming, or record
 
 ---
 
-## 3. Isolated Hailo-8 Subprocess & SharedMemory IPC
+## 3. Isolated Hailo-8 Subprocess, Single-in-Flight IPC & Fencing
 
-`HailoWildlifeDetector` (`bombardeer_pkg/perception/hailo_detector.py`) isolates all HailoRT PCIe calls in a forked child process (`HailoNPUProc`, pinned to **Core 2**) communicating with `VisionMain` (**Core 0**) over a pre-allocated **`34.2 MiB` POSIX `SharedMemory`** block (`4608 × 2592 × 3` bytes max) and lock-free `multiprocessing.Value` state flags:
+`HailoWildlifeDetector` (`bombardeer_pkg/perception/hailo_detector.py`) isolates all HailoRT PCIe calls in a **spawned** child process (`HailoNPUProcess` in `hailo_worker.py`, pinned to **Core 2**) communicating with `VisionMain` (**Cores 0–2**) over a pre-allocated **`34.2 MiB` POSIX `SharedMemory`** block (`4608 × 2592 × 3` bytes max) and three unidirectional `multiprocessing.Pipe` channels (`_req_tx`, `_ack_rx`, `_res_rx`):
 
-1. `VisionMain` checks `is_ready_for_frame()` (`shm_state == 0`), queries `MDV6Decoder1280.prepare_plan()` for the minimal bounding ROI needed for the next sweep, copies only that ROI out of `MappedArray` into `roi_scratch`, and writes it into `SharedMemory` (`shm_state = 1`).
-2. `HailoNPUProc` wakes on `frame_event`, slices/packs the tiles on Core 2, runs 1 or 3 synchronous Hailo-8 `InferVStreams` passes, decodes and merges all detections, stores the result in `SharedMemory`, and sets `shm_state = 2`.
-3. `VisionMain` harvests the completed batch (`shm_state == 2 -> 0`) tagged with its original mid-exposure `capture_mono` timestamp.
-
-Because `SharedMemory` is sized for the worst-case `12 MP` frame, switching between `3 MP` and `12 MP` requires zero IPC reallocation or NPU restarts.
+1. **Strict Single-in-Flight Discipline (Zero Queue Staleness):**
+   * `is_ready_for_frame()` drains `_ack_rx` and `_res_rx` immediately and returns `True` **only when `(not _shm_busy) and (_in_flight_jobs == 0)`**.
+   * Even though the worker acknowledges the SHM copy immediately before running `350 ms` of NPU inference, `VisionMain` will not enqueue a second frame into the pipe behind an active pass—eliminating `~280 ms` of hidden IPC queueing delay while wasting zero camera frames on completion.
+2. **Per-Job Capture Metadata:**
+   * Each submitted job records `(capture_mono, is_monochrome)` in `_pending_jobs` (`deque(maxlen=8)`), so mid-inference ISP color/B&W transitions never apply the wrong confidence threshold when the batch returns.
+   * Before the first real NPU batch completes, `detect()` returns `eff_mono = 0.0` so `VisionMain` never fires phantom `is_new_batch` events.
+3. **Epoch Fencing & Fault Supervisor:**
+   * `is_idle()` and `discard_older_than(cutoff_mono)` fence sensor switches, detector switches, serial reconnects, and supervisor restarts so pre-switch NPU results can never leak into a new mode.
+   * `check_supervisor()` monitors both process exit and `> 5.0 s` stalls across `_shm_busy or _in_flight_jobs > 0` (catching hangs *after* SHM copy ACK), immediately disarming `ARMED`/`CALIBRATE` -> `ON` + `TRIGGER 0` and restarting the worker with exponential backoff (`2 s` base, capped at `30 s`).
 
 ---
 
-## 4. Horizon-Anchored Multi-Tile Scanning (`MDV6Decoder1280`)
+## 4. Horizon- & Far-Ground-Edge-Anchored Multi-Tile Scanning (`tiling.py`, `mdv6_decoder.py`)
 
-`MDV6Decoder1280` (`bombardeer_pkg/perception/mdv6_decoder.py`) anchors every scan sweep to the dynamic ground horizon (`compute_horizon_y_720(tilt_mrad)` + `horizon_y_offset_720`), bounded upward by `horizon_headroom_720` (`105 px` in 720p space) and downward by `horizon_far_headroom_720` (`50 px`):
+`HailoWildlifeDetector.prepare_plan()` passes `state.site_calibration.get_tiling_optics(cfg.optics, pan_cap)` into `build_pass_plan()` (`bombardeer_pkg/perception/tiling.py`). When a daylight boot sweep has completed, the tile band automatically tracks the pan-indexed far ground edge (`yard_top_profile`) across the entire azimuth sweep; otherwise it falls back to `compute_horizon_y_720(tilt_cap)` + `horizon_y_offset_720`:
 
 | Mode | Native Frame | NPU Passes & `1280×1280` Tile Layout | Effective Zoom | Typical Cadence |
 | :--- | :--- | :--- | :--- | :--- |
-| **`SCAN-3MP`** | `2304×1296` | **1 pass:** Two `1280×620` native crops (`x=0` and `x=1024`, `256 px` horizontal overlap) stacked vertically with a `40 px` gray (`114`) divider | **1.8×** across full width | **~9.0 Hz** (`~110 ms`) |
-| **`SCAN-12MP`** | `4608×2592` | **3 passes on 1 frozen frame:**<br>• **Pass 0 (Far Left/Center-Left):** `x=0` and `x=1110` (`1280×620` 1:1 native tiles)<br>• **Pass 1 (Far Center-Right/Right):** `x=2220` and `x=3328` (`1280×620` 1:1 native tiles, `~170 px` overlap)<br>• **Pass 2 (Mid/Near Foreground):** Two `2560×1240` tiles (`x=0` and `x=2048`, `512 px` overlap) downscaled 2:1 to `1280×620` | **3.6×** far band / **1.8×** mid-near band | **~2.9–4.0 Hz** (`~342 ms`) |
-| **`TRK-1:1` / `TRK-ZOOM`** | `4608×2592` or `2304×1296` | **1 pass:** Single square crop (`1280×1280` up to `min(W, H)`, `~2.8×` target box padding) centered on Kalman-projected target coordinates | **Up to 3.6×** (100% tensor fill) | **~9.0 Hz** (`~110 ms`) |
+| **`SCAN-3MP`** | `2304×1296` | **1 pass:** Two `1280×620` native crops (`x=0` and `x=1024`, `256 px` horizontal overlap) stacked vertically with a `40 px` gray (`114`) divider | **1.8×** across full width | **~7.4–9.0 Hz** (`~110 ms`) |
+| **`SCAN-12MP`** | `4608×2592` | **3 passes on 1 frozen frame:**<br>• **Pass 0 (Far Left/Center-Left):** `x=0` and `x=1110` (`1280×620` 1:1 native tiles)<br>• **Pass 1 (Far Center-Right/Right):** `x=2220` and `x=3328` (`1280×620` 1:1 native tiles, `~170 px` overlap)<br>• **Pass 2 (Mid/Near Foreground):** Two `2560×1240` tiles (`x=0` and `x=2048`, `512 px` overlap) downscaled 2:1 to `1280×620` | **3.6×** far band / **1.8×** mid-near band | **~2.4–4.0 Hz** (`~342 ms`) |
+| **`TRK-1:1` / `TRK-ZOOM`** | `4608×2592` or `2304×1296` | **1 pass:** Single square crop (`1280×1280` up to `min(W, H)`, `~2.8×` target box padding) centered on Kalman-projected target coordinates at exact `capture_mono` pose | **Up to 3.6×** (100% tensor fill) | **~7.4–9.0 Hz** (`~110 ms`) |
 
 ### 4.1 Seam-Clipping Suppression & Unified NMS
-* **Seam Guard:** When an animal stands across the boundary between two adjacent tiles, one tile sees a clipped partial fragment while its overlapping neighbor sees the full body. `MDV6Decoder1280` drops small animal boxes touching an internal tile seam whenever an overlapping neighbor contains a larger animal detection. **Person and vehicle veto boxes are never seam-dropped.**
+* **Seam Guard:** When an animal stands across the boundary between two adjacent tiles, `MDV6Decoder1280` drops small animal boxes touching an internal tile seam whenever an overlapping neighbor contains a larger animal detection. **Person and vehicle veto boxes are never seam-dropped.**
 * **Unified Merging:** All tiles from a 1-pass or 3-pass sweep are remapped into canonical `1280×720` coordinates and merged via class-aware Non-Maximum Suppression (`iou_thresh: 0.45`).
-* **Tracking Crop Fallback:** `TRK-1:1` holds for `700 ms` (`track_crop_hold_sec`) after the last detection; if `2` consecutive `TRK-1:1` passes miss, `force_scan` immediately triggers a full `SCAN-12MP` or `SCAN-3MP` horizon sweep.
+* **Tracking Crop Fallback:** `TRK-1:1` holds for `max(track_crop_hold_sec, npu_lat_sec + 0.35)` after the last detection; if `2` consecutive `TRK-1:1` passes miss, `force_scan` immediately triggers a full `SCAN-12MP` or `SCAN-3MP` sweep.
 
 ---
 
@@ -72,33 +76,40 @@ Because `SharedMemory` is sized for the worst-case `12 MP` frame, switching betw
 MegaDetector v6 outputs three classes: **`0: animal`**, **`1: person`**, and **`2: vehicle`**. Every candidate box passes through five sequential gates before `VisionMain` can confirm a target:
 
 ```text
-Raw MDv6 Boxes (Canonical 1280x720)
+Raw MDv6 Boxes (Canonical 1280x720, tagged with eff_capture_mono)
         │
         ├──► Class 1 (Person >= 0.48) or Class 2 (Vehicle >= 0.35)
         │         └──► Added to veto_boxes[] (expanded by veto_padding_px = 24 px)
-        │              • Immediately aborts active target lock + commands T 0 if overlapping
+        │              • During active Walk-Test: pre-filtered standing PERSON boxes (bh/bw >= 1.30,
+        │                unclipped, ignoring horizontal barrel artifacts) feed SiteCalibrationManager
+        │              • During tracking: checks overlap against BOTH the active target box projected
+        │                into eff_capture_mono pose AND best_cand["box"]; aborts lock + commands T 0
         │
         └──► Class 0 (Animal)
                   │
                   ├─ 1. Confidence & Dominance Gate
-                  │     • score >= 0.65 (HDR) or >= 0.62 (Monochrome)
-                  │     • beats person & vehicle scores by >= 0.25 (class_margin)
-                  │     • person_prob < 0.02 and vehicle_prob < 0.02 (max_non_animal_prob)
+                  │     • score >= conf_thresh (HDR) or >= monochrome_conf_thresh (per-job B&W flag)
+                  │     • beats person & vehicle scores by >= class_margin (0.25)
+                  │     • person_prob and vehicle_prob < max_non_animal_prob (0.02)
                   │
                   ├─ 2. Geometric & Aspect Ratio Gate
                   │     • width <= 55% frame (max_animal_width_frac)
                   │     • area  <= 40% frame (max_animal_area_frac)
                   │     • height / width <= 1.65 (rejects narrow upright human/post silhouettes)
                   │
-                  ├─ 3. Horizon & Ground-Plane Physical Gate
-                  │     • Feet (y2) must not sit > 45 px above horizon (horizon_feet_margin_720)
-                  │     • If depression >= 25 mrad: trigonometric height must be <= 1.50 m
-                  │     • Fused range = 70% ground-plane + 30% stadia (clamped 3.0–75.0 m)
+                  ├─ 3. Roll-Compensated Far Ground Edge & Ground-Plane Physical Gate
+                  │     • Feet (y2) must not sit > horizon_feet_margin_720 above scanned far ground edge
+                  │     • When metric height/slope calibrated (WALK_TEST or PASSIVE_STADIA):
+                  │         - If net depression >= 25 mrad: height must be <= max_animal_height_m
+                  │         - Fused range = 70% ground-plane + 30% stadia (clamped 3.0–75.0 m)
+                  │     • When uncalibrated on a new site (use_ground_range = False):
+                  │         - Uses stadia_range_m directly & feeds passive ground-plane convergence
                   │
                   ├─ 4. Zero-Overlap Safety Veto Gate
                   │     • Rejected if box overlaps any padded person/vehicle veto box
                   │
-                  └─ 5. Temporal Confirmation Gate (VisionMain)
-                        • Requires 4 consecutive coherent batches (center jump <= 120 px)
-                        • Saves ACQUIRE audit JPEG & hands lock to TargetKalmanFilter
+                  └─ 5. World-Space Confirmation & Nearest-Neighbor Lock (VisionMain)
+                        • Confirmation streak gates in world mrad scaled by dt & calibrated TargetKinematics
+                        • Locked tracking picks nearest candidate to (predicted, stationary) projections
+                        • Saves timestamp-matched ACQUIRE/VETO audit JPEG from npu_lores_history
 ```

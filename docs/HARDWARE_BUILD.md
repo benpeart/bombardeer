@@ -33,7 +33,7 @@ This guide covers the complete Bill of Materials (BOM), mechanical drive ratios,
 
 | Subsystem | Specification | Notes |
 | :--- | :--- | :--- |
-| **Pan Reduction (`6.6486:1`)** | `246T` printed ring gear + `37T` motor pinion + GT2 closed-loop belt | OpenSCAD `pan_timing_gears.scad`; `3.3863 steps/mrad` at `16×` microstepping |
+| **Pan Reduction (`6.6486:1`)** | `246T` printed ring gear + `37T` motor pinion + GT2 closed-loop belt | OpenSCAD `pan_timing_gears.scad`; `3.3861 steps/mrad` at `16×` microstepping |
 | **Tilt Reduction (`50:1`)** | `50T` worm wheel + `1T` single-start worm gear | OpenSCAD `tilt_gears.scad`; self-locking against gravity (`25.4648 steps/mrad`) |
 | **Main Azimuth Bearing** | Lazy Susan / slewing ring bearing (`150–200 mm` OD) | Supports upper turret carriage and isolates axial/radial loads from motor shaft |
 | **Cable Management** | Drag chain / flexible spiral wrap with service loop | Prevents CSI ribbon and motor harnesses from snagging across `±180°` pan sweep |
@@ -42,14 +42,16 @@ This guide covers the complete Bill of Materials (BOM), mechanical drive ratios,
 
 ## 2. Camera-to-Bore Mounting Geometry
 
-The ballistics and parallax solver (`bombardeer_pkg/control/ballistics.py` and `config.yaml`) expects the IMX708 camera optical center to be rigidly mounted at fixed offsets relative to the barrel bore centerline:
+The ballistics and parallax solver (`bombardeer_pkg/control/ballistics.py` and `config.yaml`) separates **hardware-fixed turret offsets** from **deployment-specific site geometry**:
 
-* **Horizontal Offset (`camera_offset_x_mm`):** **`-170.0 mm`** (`170 mm` to the **left** of the bore when looking downrange).
-* **Vertical Offset (`camera_offset_y_mm`):** **`-60.0 mm`** (`60 mm` **below** the bore centerline).
-* **Mount Height (`camera_mount_height_m`):** **`1.15 m`** above level ground (used by the trigonometric ground-plane range estimator).
-* **Sensor Orientation:** Mounted inverted (`hflip=True, vflip=True` applied in `_build_camera_config()`), with manual focus locked to tree-line hyperfocal infinity (`manual_lens_position: 0.0`).
+* **Hardware-Fixed Offsets (set once per mechanical build in `config.yaml`):**
+  * **Horizontal Offset (`camera_offset_x_mm`):** **`-170.0 mm`** (`170 mm` to the **left** of the bore when looking downrange).
+  * **Vertical Offset (`camera_offset_y_mm`):** **`-60.0 mm`** (`60 mm` **below** the bore centerline).
+  * **Sensor Orientation:** Mounted inverted (`hflip=True, vflip=True` applied in `_build_camera_config()`), with manual focus locked to tree-line hyperfocal infinity (`manual_lens_position: 0.0`).
+* **Site-Specific Geometry (Auto-Calibrated on Deployment):**
+  * **Mount Height (`camera_mount_height_m`), Yard Slope (`ground_slope_mrad`), Camera Roll (`roll_mrad`), and Treeline Ceiling (`yard_top_profile`):** Automatically discovered per deployment by `SiteCalibrationManager` via the daylight boot sweep + **Walk to Calibrate** (`5'9"` operator walk-test) or passive stadia-to-ground convergence, and persisted in `site_calibration.json`. `optics.camera_mount_height_m` (default `1.15 m`) in `config.yaml` serves only as a fallback default. See [`RPI_DEPLOY_DEBUG.md`](RPI_DEPLOY_DEBUG.md) Section 6 for calibration steps.
 
-> **Note:** If your physical bracket places the camera at different offsets or mount height, update `optics.camera_offset_x_mm`, `optics.camera_offset_y_mm`, and `optics.camera_mount_height_m` in `config.yaml` before running `1-SHOT` calibration.
+> **Note:** If you rebuild the camera bracket with different horizontal/vertical offsets relative to the barrel, update `optics.camera_offset_x_mm` and `optics.camera_offset_y_mm` in `config.yaml` before running `1-SHOT` (`CALIBRATE`) verification.
 
 ---
 
@@ -86,7 +88,7 @@ ESP32 GPIO 17 (TX2) ────[ 1 kΩ ]─────────┤         
                                     Addr = 0b00             Addr = 0b01
 ```
 
-* **Logic Voltage (`VIO`):** Connect `VIO` on both TMC2209 boards to **`3.3V`** (never `5V`), matching the ESP32's `3.3V` GPIO logic levels.
+* **Logic Voltage (`VIO`):** Connect `VIO` on both TMC2209 boards to **`3.3V`** (never `5V`), matching the ESP32's `3.3V` GPIO logic levels (required for reliable UART communication, especially on TMC2209 V2 carrier boards).
 * **Motor Power (`VM`):** Connect `VM` and motor ground to the `24V` supply with a `100 µF` (`35V+`) electrolytic decoupling capacitor mounted close to each driver's `VM`/`GND` pins.
 
 ---
@@ -103,3 +105,4 @@ ESP32 GPIO 17 (TX2) ────[ 1 kΩ ]─────────┤         
 3. **Install Mechanical Hard Stops & Home Alignment:**
    * Assemble the `246T/37T` pan timing ring and `50:1` tilt worm drive, verifying smooth travel across `±180°` pan and `±22.5°` tilt without cable binding.
    * Level the barrel horizontally (`0 mrad` tilt) and point downrange (`0 mrad` pan), then send `H` (or press `'A'` on the Xbox controller) to latch `(0, 0) mrad`.
+   * Once placed in a new yard location, let the daylight boot sweep finish and run the `5'9"` **Walk to Calibrate** routine in [`RPI_DEPLOY_DEBUG.md`](RPI_DEPLOY_DEBUG.md).

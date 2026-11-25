@@ -9,6 +9,7 @@ from typing import List, Optional, Tuple
 
 from bombardeer_pkg.config import BombardeerConfig
 from bombardeer_pkg.control.kalman import TargetKalmanFilter
+from bombardeer_pkg.control.site_calibration import SiteCalibrationManager
 
 log = logging.getLogger("Bombardeer")
 
@@ -93,6 +94,7 @@ class SystemState:
         self.command_bus = TurretCommandBus()
         self.target_filter = TargetKalmanFilter(accel_noise_mrad_s2=150.0, measurement_noise=35.0)
         self.wildlife_detector = None
+        self.site_calibration = SiteCalibrationManager(cfg)
 
         # Lock 0: Engagement mode & active detector
         self._mode_lock = threading.Lock()
@@ -270,6 +272,7 @@ class SystemState:
         now_mono = time.monotonic()
         snap["active_alert"] = snap["last_alert"] if now_mono < snap["alert_until_mono"] else None
         snap["uptime_sec"] = round(now_mono - self.start_mono, 1)
+        snap["site_calibration"] = self.site_calibration.get_status_dict()
         return snap
 
     def get_npu_latency_sec(self) -> float:

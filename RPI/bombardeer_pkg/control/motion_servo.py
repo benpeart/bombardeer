@@ -63,6 +63,24 @@ def motion_servoing_worker(cfg: BombardeerConfig, state: SystemState):
         current_pan, current_tilt, hw_moving, _ = state.get_instantaneous_telemetry()
         serial_ok = state.is_serial_connected()
 
+        if state.site_calibration.is_motion_owned():
+            if last_sent_trigger_state != 0:
+                bus.request_trigger(0, timestamp_mono=now)
+                last_sent_trigger_state = 0
+            if is_actively_tracking_velocity:
+                bus.request_velocity(0, 0)
+                is_actively_tracking_velocity = False
+            last_v_pan = 0
+            last_v_tilt = 0
+            last_fire_gate_ok_mono = -1e9
+            is_homing = False
+            last_target_mono = now
+            kf.reset()
+            sleep_time = ctrl.motion_loop_interval_sec - (time.monotonic() - loop_start)
+            if sleep_time > 0.001:
+                state.shutdown_event.wait(timeout=sleep_time)
+            continue
+
         if mode == "OFF":
             if last_mode_seen != "OFF":
                 bus.request_halt()

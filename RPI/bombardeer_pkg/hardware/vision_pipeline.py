@@ -9,6 +9,7 @@ VisionRuntime orchestrator + Core-0 VisionMain loop + Core-1 HudEncoder thread.
 """
 
 from collections import deque
+from dataclasses import replace
 import gc
 import logging
 import math
@@ -26,6 +27,7 @@ from picamera2 import MappedArray, Picamera2
 from bombardeer_pkg.config import BombardeerConfig
 from bombardeer_pkg.control.ballistics import (
     compute_drag_ballistics,
+    compute_deer_head_ceiling_mrad,
     compute_horizon_y_720,
     compute_target_kinematics,
     image_px_to_world_mrad,
@@ -178,10 +180,17 @@ def _hud_encoder_worker(cfg: BombardeerConfig, state: SystemState, hud_queue: qu
         effective_coast_horizon = max(ctrl.coast_max_horizon_sec, npu_lat_sec + 1.0)
         rng_m = local_target.get("range_m", optics.default_fallback_range_m) if local_target else optics.default_fallback_range_m
 
-        hor_y = int(round(compute_horizon_y_720(t_mrad, cam, optics) * sy))
-        if 0 < hor_y < cam.display_height:
-            for hx in range(0, cam.display_width, 16):
-                cv2.line(annotated, (hx, hor_y), (min(cam.display_width, hx + 8), hor_y), (120, 110, 40), 1)
+        metric_optics, yard_top_mrad, roll_mrad, _ = state.site_calibration.get_ground_plane_params(optics, p_mrad)
+        _, far_deer_head_mrad, _ = compute_deer_head_ceiling_mrad(metric_optics, far_ground_mrad=yard_top_mrad)
+        deer_ceil_optics = replace(metric_optics, ground_slope_mrad=far_deer_head_mrad, horizon_y_offset_720=0.0)
+        for hx in range(0, cam.display_width, 16):
+            hx_720 = hx / sx if sx > 0 else float(hx)
+            hy_metric = int(round(compute_horizon_y_720(t_mrad, cam, metric_optics, x_px=hx_720, roll_mrad=roll_mrad) * sy))
+            if 0 < hy_metric < cam.display_height:
+                cv2.line(annotated, (hx, hy_metric), (min(cam.display_width, hx + 8), hy_metric), (120, 110, 40), 1)
+            hy_deer = int(round(compute_horizon_y_720(t_mrad, cam, deer_ceil_optics, x_px=hx_720, roll_mrad=roll_mrad) * sy))
+            if 0 < hy_deer < cam.display_height and abs(hy_deer - hy_metric) >= 4:
+                cv2.line(annotated, (hx, hy_deer), (min(cam.display_width, hx + 6), hy_deer), (40, 140, 180), 1)
 
         cv2.drawMarker(annotated, (oc_x, oc_y), (0, 255, 255), cv2.MARKER_CROSS, 16, 1)
 
@@ -311,7 +320,7 @@ def _hud_encoder_worker(cfg: BombardeerConfig, state: SystemState, hud_queue: qu
             cv2.LINE_AA,
         )
 
-        alert_msg = health.get("active_alert")
+        alert_msg = state.site_calibration.get_hud_banner() or health.get("active_alert")
         if alert_msg:
             ay2 = max(26, sy1 - 6)
             ay1 = max(0, ay2 - 26)
@@ -376,7 +385,7 @@ class VisionRuntime:
         kf = state.target_filter
         rate_log = RateLimitedLogger(interval_sec=5.0)
 
-        set_os_thread_name("VisionMain", cpu_cores=[0])
+        set_os_thread_name("VisionMain", cpu_cores=[0, 1, 2])
         detectors = {
             "ARUCO": ArucoTargetDetector(cfg),
             "WILDLIFE": self.wildlife_detector,
@@ -501,7 +510,7 @@ class VisionRuntime:
                             )
 
                         plan_bundle = self.wildlife_detector.prepare_plan(
-                            sensor_size[0], sensor_size[1], tilt_cap, active_track_box
+                            sensor_size[0], sensor_size[1], tilt_cap, active_track_box, pan_mrad=pan_cap
                         )
                         rx0, ry0, rw, rh = plan_bundle[2]
                         with MappedArray(req_frame, "main") as m:
@@ -527,7 +536,25 @@ class VisionRuntime:
                             pass
                         req_frame = None
 
-                cur_pan_mrad, cur_tilt_mrad, _, _ = state.get_instantaneous_telemetry()
+                cur_pan_mrad, cur_tilt_mrad, cur_hw_moving, _ = state.get_instantaneous_telemetry()
+                cur_mode_loop, _ = state.get_turret_mode()
+                safe_for_sweep = (
+                    cur_mode_loop in ("OFF", "ON")
+                    and (state.get_primary_target() is None)
+                    and (tentative_streak == 0)
+                    and (not is_recording)
+                )
+                state.site_calibration.step_boot_sweep(
+                    frame_lores=frame_lores,
+                    lux=float(metadata.get("Lux", 50.0)),
+                    is_monochrome=is_monochrome,
+                    pan_cap=cur_pan_mrad,
+                    tilt_cap=cur_tilt_mrad,
+                    hw_moving=cur_hw_moving,
+                    state=state,
+                    mono_now=mono_now,
+                    safe_for_sweep=safe_for_sweep,
+                )
                 if need_native and frame_roi is not None:
                     npu_lores_history.append((capture_mono, frame_lores.copy()))
                 if mono_now - last_watchdog_mono >= 2.0:
@@ -562,6 +589,7 @@ class VisionRuntime:
                         and (tentative_streak == 0)
                         and (not is_recording)
                         and npu_idle
+                        and (not state.site_calibration.is_motion_owned())
                     )
 
                     if (lux < 25.0 or gain > 6.0) and not is_monochrome and not has_tgt:
@@ -740,7 +768,8 @@ class VisionRuntime:
                                 last_state[0], last_state[1], pan_batch, tilt_batch, prim_rng, cam, optics
                             )
                             dt_gap = max(0.0, eff_capture_mono - last_state[2])
-                            kin_gap = compute_target_kinematics(prim_rng, optics)
+                            kin_optics_b, _, _, _ = state.site_calibration.get_ground_plane_params(optics, pan_batch)
+                            kin_gap = compute_target_kinematics(prim_rng, kin_optics_b)
                             kin_gate_px = ((kin_gap.max_v_pan_mrad_s * dt_gap) + kin_gap.max_step_margin_pan_mrad) / max(0.5, optics.mrad_per_pixel)
                             assoc_gate_px = max(float(ctrl.confirmation_max_jump_px), min(280.0, kin_gate_px))
 
@@ -751,6 +780,17 @@ class VisionRuntime:
                     if active_detector.name == "WILDLIFE":
                         veto_boxes = debug_info.get("veto_boxes", [])
                         rejected = debug_info.get("rejected_animals", [])
+                        if state.site_calibration.is_walk_test_active():
+                            state.site_calibration.ingest_walk_test_detections(
+                                veto_boxes, tilt_batch, eff_capture_mono, state=state
+                            )
+                            best_cand = None
+                            tentative_target = None
+                            tentative_streak = 0
+                        elif state.site_calibration.is_motion_owned():
+                            best_cand = None
+                            tentative_target = None
+                            tentative_streak = 0
                         if cur_primary is not None and veto_boxes:
                             hit, veto_obj = MDV6Decoder1280.check_veto_overlap(
                                 active_box_at_batch, veto_boxes, pad=cfg.wildlife.veto_padding_px
@@ -787,7 +827,8 @@ class VisionRuntime:
                             )
                             if tentative_target is not None:
                                 dt_tent = max(0.05, eff_capture_mono - tentative_target["capture_mono"])
-                                kin_tent = compute_target_kinematics(cand_rng, optics)
+                                kin_optics_t, _, _, _ = state.site_calibration.get_ground_plane_params(optics, pan_batch)
+                                kin_tent = compute_target_kinematics(cand_rng, kin_optics_t)
                                 max_pan_jump = max(
                                     ctrl.confirmation_max_jump_px * optics.mrad_per_pixel,
                                     (kin_tent.max_v_pan_mrad_s * dt_tent) + kin_tent.max_step_margin_pan_mrad,
@@ -834,11 +875,11 @@ class VisionRuntime:
                         verified["center"][0], verified["center"][1],
                         pan_v, tilt_v, last_valid_range_m, cam, optics
                     )
-                    kin = (
-                        compute_target_kinematics(last_valid_range_m, optics)
-                        if active_detector.name == "WILDLIFE"
-                        else None
-                    )
+                    if active_detector.name == "WILDLIFE":
+                        kin_optics_v, _, _, _ = state.site_calibration.get_ground_plane_params(optics, pan_v)
+                        kin = compute_target_kinematics(last_valid_range_m, kin_optics_v)
+                    else:
+                        kin = None
                     kf.update_measurement(raw_w_pan, raw_w_tilt, eff_capture_mono, kinematics=kin)
                     state.set_primary_target({
                         "center": verified["center"],

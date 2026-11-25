@@ -78,7 +78,7 @@ Before connecting the ESP32 to the Raspberry Pi service, verify all motion and t
 3. Within `5–10 seconds`, the Xbox logo turns solid white, indicating BLE connection.
 4. **Verify Manual Override:**
    * Move the **Left Stick** -> pan and tilt axes slew smoothly with quadratic speed response.
-   * Press **'A'** -> current turret position zeroes to `0 0` in the `S` telemetry stream.
+   * Press **'A'** -> current turret position zeroes to `0 0` in the `S` telemetry stream (use this to level the turret before triggering the Raspberry Pi's daylight boot sweep and Walk-Test in [`RPI_DEPLOY_DEBUG.md`](RPI_DEPLOY_DEBUG.md)).
    * Pull **Right Trigger (RT)** -> solenoid pulses at `4.0 BPS` (`60 ms` on / `190 ms` off) while held and stops immediately on release.
 
 ---
@@ -87,8 +87,8 @@ Before connecting the ESP32 to the Raspberry Pi service, verify all motion and t
 
 | Symptom | Likely Cause | Fix |
 | :--- | :--- | :--- |
-| **`[TMC2209] ERROR: PAN/TILT axis connection failed!`** | Missing `3.3V` on `VIO`, missing `1 kΩ` resistor on `TX2 (GPIO 17)`, or swapped `MS1`/`MS2` pins | Verify `VIO = 3.3V`, check continuity from `GPIO 16` and `GPIO 17 -> 1 kΩ` to `PDN_UART` on both drivers, and confirm `PAN` (`MS1=0, MS2=0`) vs `TILT` (`MS1=1, MS2=0`). |
-| **`[TMC2209] ERROR: register read-back failed!`** | TMC2209 V2 board with `PDN_UART` routed to a different pin header, or `VM` (`24V`) absent | On certain BigTreeTech TMC2209 V2 boards, verify which header pin connects to the TMC2209 `PDN_UART` IC pin (pin 14) and ensure `24V` `VM` is energized. |
+| **`[TMC2209] ERROR: PAN/TILT axis connection failed!`** | Missing `3.3V` on `VIO`, missing `1 kΩ` resistor on `TX2 (GPIO 17)`, or swapped `MS1`/`MS2` pins | Verify `VIO = 3.3V` (strictly required on TMC2209 V2 hardware), check continuity from `GPIO 16` and `GPIO 17 -> 1 kΩ` to `PDN_UART` on both drivers, and confirm `PAN` (`MS1=0, MS2=0`) vs `TILT` (`MS1=1, MS2=0`). |
+| **`[TMC2209] ERROR: register read-back failed!`** | TMC2209 V2 board with `PDN_UART` routed to a different pin header, `VIO` not at `3.3V`, or `VM` (`24V`) absent | On BigTreeTech TMC2209 V2 boards, verify `VIO` is powered from `3.3V`, verify which header pin connects to the TMC2209 `PDN_UART` IC pin (pin 14), and ensure `24V` `VM` is energized. |
 | **Motors hum or vibrate without rotating** | Stepper coil pairs crossed (`A1/B1` swapped) or `SHARED_ENABLE_PIN (GPIO 19)` floating | Power off `24V`, verify coil continuity with a multimeter (`A1-A2` pair, `B1-B2` pair), and check `GPIO 19` is `LOW` after setup. |
 | **ESP32 reboots every time `bombardeer.service` restarts** | Custom serial adapter asserting `DTR`/`RTS` or older kernel `HUPCL` behavior | Confirm CP2102 adapter is used and verify `turret_serial_worker()` in `bombardeer_pkg/hardware/serial_link.py` is up to date. |
 | **Xbox controller connects then immediately disconnects** | Outdated Xbox controller firmware (BLE pairing incompatibility) | Update the Xbox Series X/S controller firmware via the Xbox Accessories app on Windows/Xbox, then re-pair. |
