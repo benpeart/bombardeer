@@ -1,11 +1,75 @@
-"""Pure mathematical functions for horizon geometry, parallax, drag ballistics, and projections."""
+"""Pure mathematical functions for horizon geometry, parallax, drag ballistics, projections, and target kinematics."""
 
+from dataclasses import dataclass
 import math
 from typing import Optional, Tuple
 
 import numpy as np
 
 from bombardeer_pkg.config import BallisticsConfig, CameraConfig, OpticsConfig
+
+
+@dataclass(frozen=True)
+class TargetKinematics:
+    """Range- and optics-derived angular kinematic bounds for a live deer."""
+
+    max_v_pan_mrad_s: float
+    max_v_tilt_mrad_s: float
+    accel_pan_mrad_s2: float
+    accel_tilt_mrad_s2: float
+    meas_var_pan: float
+    meas_var_tilt: float
+    max_step_margin_pan_mrad: float
+    max_step_margin_tilt_mrad: float
+
+
+def compute_target_kinematics(
+    range_m: float,
+    optics: OpticsConfig,
+    max_deer_speed_m_s: float = 10.0,
+    max_deer_accel_m_s2: float = 3.0,
+    max_vertical_speed_m_s: float = 1.0,
+    max_vertical_accel_m_s2: float = 0.6,
+    bbox_jitter_pan_px: float = 3.0,
+    bbox_jitter_tilt_px: float = 4.0,
+    hw_max_v_pan_mrad_s: float = 850.0,
+    hw_max_v_tilt_mrad_s: float = 450.0,
+) -> TargetKinematics:
+    """
+    Derives world-space angular velocity/acceleration limits and measurement
+    variances from live deer speeds, target range, and camera optics.
+    """
+    r = float(np.clip(range_m, max(1.0, optics.min_valid_range_m), optics.max_valid_range_m))
+    h = max(0.5, float(optics.camera_mount_height_m))
+    mrad_per_px = float(optics.mrad_per_pixel)
+
+    # Pan: lateral running speed & acceleration projected at range r
+    max_v_pan = min(hw_max_v_pan_mrad_s, (1000.0 * max_deer_speed_m_s) / r)
+    accel_pan = float(np.clip((1000.0 * max_deer_accel_m_s2) / r, 25.0, 400.0))
+
+    # Tilt: ground-plane radial motion (H*v/r^2) + modest vertical bounding (vz/r)
+    ground_v_tilt = (1000.0 * h * max_deer_speed_m_s) / (r * r)
+    bound_v_tilt = (1000.0 * max_vertical_speed_m_s) / r
+    max_v_tilt = min(hw_max_v_tilt_mrad_s, ground_v_tilt + bound_v_tilt)
+
+    ground_a_tilt = (1000.0 * h * max_deer_accel_m_s2) / (r * r)
+    bound_a_tilt = (1000.0 * max_vertical_accel_m_s2) / r
+    accel_tilt = float(np.clip(ground_a_tilt + bound_a_tilt, 15.0, 120.0))
+
+    # Measurement variance from pixel box-center uncertainty and lens mrad/px
+    sigma_pan = max(1.5, bbox_jitter_pan_px * mrad_per_px)
+    sigma_tilt = max(2.0, bbox_jitter_tilt_px * mrad_per_px)
+
+    return TargetKinematics(
+        max_v_pan_mrad_s=max_v_pan,
+        max_v_tilt_mrad_s=max_v_tilt,
+        accel_pan_mrad_s2=accel_pan,
+        accel_tilt_mrad_s2=accel_tilt,
+        meas_var_pan=sigma_pan * sigma_pan,
+        meas_var_tilt=sigma_tilt * sigma_tilt,
+        max_step_margin_pan_mrad=3.0 * sigma_pan,
+        max_step_margin_tilt_mrad=3.0 * sigma_tilt,
+    )
 
 
 def compute_horizon_y_720(tilt_mrad: float, cam: CameraConfig, optics: OpticsConfig) -> float:

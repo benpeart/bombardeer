@@ -3,6 +3,7 @@
 import numpy as np
 
 from bombardeer_pkg.config import load_config
+from bombardeer_pkg.control.ballistics import image_px_to_world_mrad, project_world_to_image_px
 from bombardeer_pkg.perception.mdv6_decoder import MDV6Decoder1280
 from bombardeer_pkg.perception.tiling import (
     build_pass_plan,
@@ -98,3 +99,29 @@ def test_decoder_vetoes_and_synthetic_decode_pass():
     a_acc = {"boxes": [], "scores": [], "probs": []}
     dec.decode_pass(raw, slots, sensor_w=2304, sensor_h=1296, veto_acc=v_acc, anim_acc=a_acc)
     assert len(a_acc["boxes"]) == 1
+
+
+def test_projected_active_box_catches_veto_overlap_after_turret_slew():
+    """
+    During a 350ms NPU cycle, turret pan slews shift pixel coordinates.
+    Projecting the locked world target into the new batch's pose catches an
+    overlapping person that the stale pre-slew pixel box would miss.
+    """
+    cfg = load_config(env={})
+    rng = 20.0
+    # At t0 (pan=0, tilt=0), deer is centered at (640, 400)
+    stale_box = [615, 380, 665, 420]
+    w_pan, w_tilt = image_px_to_world_mrad(640.0, 400.0, 0.0, 0.0, rng, cfg.camera, cfg.optics)
+
+    # By t1 (350ms later), turret panned +180 mrad left -> deer shifts right in image (~+98px)
+    px_t1, py_t1 = project_world_to_image_px(w_pan, w_tilt, 180.0, 0.0, rng, cfg.camera, cfg.optics)
+    projected_box = [px_t1 - 25.0, py_t1 - 20.0, px_t1 + 25.0, py_t1 + 20.0]
+
+    # Person stands right next to the deer in t1's image coordinates
+    person_veto = [{"class": "PERSON", "score": 0.85, "box": [px_t1 - 15.0, py_t1 - 50.0, px_t1 + 20.0, py_t1 + 25.0]}]
+
+    stale_hit, _ = MDV6Decoder1280.check_veto_overlap(stale_box, person_veto, pad=cfg.wildlife.veto_padding_px)
+    proj_hit, veto_obj = MDV6Decoder1280.check_veto_overlap(projected_box, person_veto, pad=cfg.wildlife.veto_padding_px)
+
+    assert not stale_hit
+    assert proj_hit and veto_obj["class"] == "PERSON"

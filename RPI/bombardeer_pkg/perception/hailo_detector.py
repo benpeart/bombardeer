@@ -1,9 +1,11 @@
 """
 Process-isolated Hailo-8 wildlife detector with spawn IPC, exact minimal-ROI
-planning, supervisor auto-restart, and ground-plane/horizon safety vetoes.
+planning, strict single-in-flight freshness, per-job capture metadata, supervisor
+auto-restart, and ground-plane/horizon safety vetoes.
 """
 
 import atexit
+from collections import deque
 import logging
 import multiprocessing as mp
 import os
@@ -59,6 +61,9 @@ class HailoWildlifeDetector(BaseTargetDetector):
         self._avail_flag = None
         self._stop_flag = None
         self._shm_busy = False
+        self._in_flight_jobs = 0
+        self._pending_jobs = deque(maxlen=8)  # (capture_mono, is_monochrome)
+        self._min_valid_capture_mono = 0.0
         self._shm_sent_mono = 0.0
         self._restart_count = 0
         self._next_restart_mono = 0.0
@@ -92,6 +97,8 @@ class HailoWildlifeDetector(BaseTargetDetector):
         self._avail_flag = ctx.Value("i", 0, lock=False)
         self._stop_flag = ctx.Value("i", 0, lock=False)
         self._shm_busy = False
+        self._in_flight_jobs = 0
+        self._pending_jobs.clear()
 
         self._proc = ctx.Process(
             target=hailo_worker_main,
@@ -130,6 +137,8 @@ class HailoWildlifeDetector(BaseTargetDetector):
             log.warning(f"[HAILO] Worker cleanup warning: {exc}")
         self._proc = None
         self._shm_busy = False
+        self._in_flight_jobs = 0
+        self._pending_jobs.clear()
 
     def shutdown(self):
         self._cleanup_worker()
@@ -142,11 +151,11 @@ class HailoWildlifeDetector(BaseTargetDetector):
             self._shm = None
 
     def check_supervisor(self):
-        """Restarts HailoNPUProc on crash or >5s stall; disarms live fire on fault."""
+        """Restarts HailoNPUProc on crash or >5s stall (SHM copy OR NPU inference); disarms live fire."""
         if self._shm is None or self._proc is None:
             return
         now = time.monotonic()
-        stalled = self._shm_busy and ((now - self._shm_sent_mono) > 5.0)
+        stalled = (self._shm_busy or self._in_flight_jobs > 0) and ((now - self._shm_sent_mono) > 5.0)
         dead = not self._proc.is_alive()
         if not dead and not stalled:
             return
@@ -163,6 +172,7 @@ class HailoWildlifeDetector(BaseTargetDetector):
             self.state.set_turret_mode("ON")
             self.state.command_bus.request_trigger(0)
 
+        self._min_valid_capture_mono = now
         self._cleanup_worker()
         if self._restart_count < self.cfg.wildlife.max_npu_restarts:
             self._restart_count += 1
@@ -192,24 +202,47 @@ class HailoWildlifeDetector(BaseTargetDetector):
         self.state.update_health(hailo_available=ok)
         return ok
 
-    def is_ready_for_frame(self) -> bool:
-        if not self.is_available:
-            return False
+    def _poll_ack(self):
         while self._ack_rx is not None and self._ack_rx.poll():
             try:
                 self._ack_rx.recv()
                 self._shm_busy = False
             except (EOFError, OSError):
                 break
-        return not self._shm_busy
+
+    def is_idle(self) -> bool:
+        """True only when no SHM transfer or NPU inference job is currently in flight."""
+        if not self.is_available:
+            return True
+        self._poll_ack()
+        self._drain_results()
+        return (not self._shm_busy) and (self._in_flight_jobs == 0)
+
+    def is_ready_for_frame(self) -> bool:
+        """
+        Enforces strict single-in-flight job discipline so frames never sit stale in
+        the IPC pipe for ~280 ms waiting behind an active 350 ms SCAN-12MP pass.
+        """
+        if not self.is_available:
+            return False
+        self._poll_ack()
+        self._drain_results()
+        return (not self._shm_busy) and (self._in_flight_jobs == 0)
+
+    def discard_older_than(self, cutoff_mono: float):
+        """Fences off any in-flight NPU job captured before a sensor/detector switch."""
+        self._min_valid_capture_mono = max(self._min_valid_capture_mono, float(cutoff_mono))
+        self._track_miss_streak = 0
+        with self._lock:
+            self._latest_detections = []
+            self._latest_debug_info = {"veto_boxes": [], "rejected_animals": []}
+            self._latest_capture_mono = 0.0
 
     def set_active(self, active: bool):
         self._active = active
         if not active:
-            self._track_miss_streak = 0
+            self.discard_older_than(time.monotonic())
             with self._lock:
-                self._latest_detections = []
-                self._latest_debug_info = {"veto_boxes": [], "rejected_animals": []}
                 self._npu_fps = 0.0
                 self._npu_scan_mode = "IDLE"
             self.state.update_health(npu_fps=0.0, npu_scan_mode="IDLE")
@@ -253,7 +286,20 @@ class HailoWildlifeDetector(BaseTargetDetector):
         roi_bounds = compute_plan_roi_bounds(pass_plan)
         return mode_tag, pass_plan, roi_bounds, track_active, force_scan
 
-    def _drain_results(self, is_monochrome: bool):
+    def _pop_job_is_monochrome(self, eff_mono: float, fallback_is_mono: bool) -> bool:
+        """Retrieves the exact ISP monochrome state recorded when eff_mono was submitted."""
+        while self._pending_jobs:
+            ts, mono_flag = self._pending_jobs[0]
+            if ts < (eff_mono - 0.02):
+                self._pending_jobs.popleft()
+                continue
+            if abs(ts - eff_mono) <= 0.02:
+                self._pending_jobs.popleft()
+                return mono_flag
+            break
+        return fallback_is_mono
+
+    def _drain_results(self, fallback_is_monochrome: bool = False):
         if self._res_rx is None:
             return
         while self._res_rx.poll():
@@ -275,13 +321,20 @@ class HailoWildlifeDetector(BaseTargetDetector):
                 self._rate_log.error("decode_err", f"[HAILO] Result error: {exc}\n{traceback.format_exc()}")
                 break
 
+            self._in_flight_jobs = max(0, self._in_flight_jobs - 1)
+            job_is_mono = self._pop_job_is_monochrome(eff_mono, fallback_is_monochrome)
+
+            # Discard stale results from before a sensor/detector switch or supervisor restart
+            if (not self._active) or (eff_mono < self._min_valid_capture_mono):
+                continue
+
             if dets:
                 _, tilt_at_cap = self.state.get_turret_pos_at_time(eff_mono)
                 rejected = debug_info.setdefault("rejected_animals", [])
                 filtered = []
                 for d in dets:
                     pa, pp, pv = d.get("probs", (d["score"], 0.0, 0.0))
-                    if is_monochrome and d["score"] < self.cfg.wildlife.monochrome_conf_thresh:
+                    if job_is_mono and d["score"] < self.cfg.wildlife.monochrome_conf_thresh:
                         rejected.append({"reason": f"MONO_CONF({d['score']:.2f})", "box": d["box"], "probs": (pa, pp, pv)})
                         continue
 
@@ -328,9 +381,9 @@ class HailoWildlifeDetector(BaseTargetDetector):
     ):
         self.check_supervisor()
         if not self.is_available:
-            return [], capture_mono_time
+            return [], 0.0
 
-        self._drain_results(is_monochrome)
+        self._drain_results(fallback_is_monochrome=is_monochrome)
 
         if frame_roi is not None and self.is_ready_for_frame():
             roi_h, roi_w = frame_roi.shape[:2]
@@ -357,11 +410,13 @@ class HailoWildlifeDetector(BaseTargetDetector):
                         was_force_scan,
                     ))
                     self._shm_busy = True
+                    self._in_flight_jobs += 1
+                    self._pending_jobs.append((float(capture_mono_time), bool(is_monochrome)))
                     self._shm_sent_mono = time.monotonic()
                 except (BrokenPipeError, OSError) as exc:
                     self._rate_log.error("pipe_send", f"[HAILO] Submit error: {exc}")
 
         with self._lock:
             dets = list(self._latest_detections)
-            eff_mono = self._latest_capture_mono if self._latest_capture_mono > 0.0 else capture_mono_time
+            eff_mono = self._latest_capture_mono
         return dets, eff_mono

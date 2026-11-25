@@ -91,7 +91,7 @@ class SystemState:
         self.start_mono = time.monotonic()
         self.shutdown_event = threading.Event()
         self.command_bus = TurretCommandBus()
-        self.target_filter = TargetKalmanFilter(accel_noise_mrad_s2=150.0, measurement_noise=10.0)
+        self.target_filter = TargetKalmanFilter(accel_noise_mrad_s2=150.0, measurement_noise=35.0)
         self.wildlife_detector = None
 
         # Lock 0: Engagement mode & active detector
@@ -105,7 +105,7 @@ class SystemState:
         self._latest_jpeg: Optional[bytes] = None
         self._active_web_clients = 0
 
-        # Lock 2: High-speed ESP32 hardware telemetry
+        # Lock 2: High-speed ESP32 hardware telemetry (300 samples = 3-6s at 50-100 Hz)
         self._telemetry_lock = threading.Lock()
         self._turret_telemetry = {
             "pan_mrad": 0,
@@ -113,7 +113,7 @@ class SystemState:
             "is_moving": False,
             "is_firing": False,
         }
-        self._telemetry_history = deque(maxlen=60)
+        self._telemetry_history = deque(maxlen=300)
 
         # Lock 3: Target & health plane
         self._target_lock = threading.Lock()
@@ -271,6 +271,13 @@ class SystemState:
         snap["active_alert"] = snap["last_alert"] if now_mono < snap["alert_until_mono"] else None
         snap["uptime_sec"] = round(now_mono - self.start_mono, 1)
         return snap
+
+    def get_npu_latency_sec(self) -> float:
+        """Returns active NPU inference latency in seconds (0.0 when running CPU ArUco)."""
+        if self.get_active_detector_type() != "WILDLIFE":
+            return 0.0
+        with self._target_lock:
+            return max(0.0, float(self._system_health.get("npu_latency_ms", 0.0)) / 1000.0)
 
     def is_serial_connected(self) -> bool:
         with self._target_lock:

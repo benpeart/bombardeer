@@ -12,13 +12,22 @@ from bombardeer_pkg.utils import set_os_thread_name
 log = logging.getLogger("Bombardeer")
 
 
-def _compute_axis_velocity(err_mrad: float, tgt_v: float, deadband: float) -> int:
+def _compute_axis_velocity(
+    err_mrad: float,
+    tgt_v: float,
+    deadband: float,
+    kp_small: float = 1.3,
+    kp_large: float = 2.0,
+    kv_small: float = 0.65,
+    kv_large: float = 0.85,
+    latency_scale: float = 1.0,
+) -> int:
     mag = abs(err_mrad)
     if mag < deadband:
         return 0
     if mag <= 25.0:
-        return int(round(err_mrad * 1.4 + 0.8 * tgt_v))
-    return int(round(err_mrad * 2.8 + 1.0 * tgt_v))
+        return int(round(err_mrad * (kp_small * latency_scale) + (kv_small * latency_scale) * tgt_v))
+    return int(round(err_mrad * (kp_large * latency_scale) + (kv_large * latency_scale) * tgt_v))
 
 
 def motion_servoing_worker(cfg: BombardeerConfig, state: SystemState):
@@ -79,11 +88,18 @@ def motion_servoing_worker(cfg: BombardeerConfig, state: SystemState):
         last_mode_seen = mode
 
         if serial_ok:
+            npu_lat_sec = state.get_npu_latency_sec()
+            lat_allowance_sec = max(0.160, npu_lat_sec + 0.080)
+            effective_coast_horizon = max(ctrl.coast_max_horizon_sec, npu_lat_sec + 1.0)
+            effective_decay_onset = max(ctrl.coast_decay_onset_sec, npu_lat_sec + 0.25)
+
             target_active = False
+            capture_age = 1e9
             time_since_seen = 1e9
             if target_data is not None:
+                capture_age = max(0.0, now - target_data.get("capture_mono", target_data["last_seen_mono"]))
                 time_since_seen = max(0.0, now - target_data["last_seen_mono"])
-                if time_since_seen <= ctrl.coast_max_horizon_sec:
+                if capture_age <= effective_coast_horizon:
                     target_active = True
 
             if target_active:
@@ -118,15 +134,15 @@ def motion_servoing_worker(cfg: BombardeerConfig, state: SystemState):
                         state.get_measured_turret_speed_mrad_s(),
                     )
 
-                    # Use capture-time age (never result-arrival time) and enforce max engagement range
-                    capture_age = max(0.0, now - target_data.get("capture_mono", target_data["last_seen_mono"]))
+                    # Latency-aware capture freshness gate (supports both ~110ms TRK-1:1 and ~350ms SCAN-12MP)
                     in_engage_range = (optics.min_valid_range_m <= current_range_m <= optics.max_engage_range_m)
                     fire_deadband = ctrl.calibrate_deadband_mrad if mode == "CALIBRATE" else ctrl.fire_deadband_mrad
+                    max_arrival_gap = max(ctrl.fire_data_freshness_sec, npu_lat_sec + 0.120)
 
                     production_fire_gate = (
                         in_engage_range
-                        and capture_age <= (ctrl.fire_data_freshness_sec + 0.160)
-                        and time_since_seen <= ctrl.fire_data_freshness_sec
+                        and capture_age <= (ctrl.fire_data_freshness_sec + lat_allowance_sec)
+                        and time_since_seen <= max_arrival_gap
                         and radial_error_mrad <= fire_deadband
                         and turret_speed_mag < ctrl.max_fire_slew_speed_mrad_s
                     )
@@ -183,18 +199,39 @@ def motion_servoing_worker(cfg: BombardeerConfig, state: SystemState):
                         if time_since_tx >= ctrl.setpoint_min_interval_sec:
                             last_setpoint_mono = now
 
-                            raw_v_pan = _compute_axis_velocity(realtime_err_pan, tgt_v_pan, ctrl.velocity_deadband_mrad)
-                            raw_v_tilt = _compute_axis_velocity(realtime_err_tilt, tgt_v_tilt, ctrl.velocity_deadband_mrad)
+                            # Scale loop gain down smoothly as NPU latency exceeds 160 ms to preserve phase margin
+                            latency_scale = max(0.65, min(1.0, 1.0 - 1.5 * max(0.0, npu_lat_sec - 0.160)))
 
-                            if time_since_seen > ctrl.coast_decay_onset_sec:
+                            raw_v_pan = _compute_axis_velocity(
+                                realtime_err_pan,
+                                tgt_v_pan,
+                                ctrl.velocity_deadband_mrad,
+                                kp_small=1.30,
+                                kp_large=2.00,
+                                kv_small=0.65,
+                                kv_large=0.85,
+                                latency_scale=latency_scale,
+                            )
+                            raw_v_tilt = _compute_axis_velocity(
+                                realtime_err_tilt,
+                                tgt_v_tilt,
+                                ctrl.velocity_deadband_mrad,
+                                kp_small=1.05,
+                                kp_large=1.45,
+                                kv_small=0.40,
+                                kv_large=0.55,
+                                latency_scale=latency_scale,
+                            )
+
+                            if capture_age > effective_decay_onset:
                                 decay_factor = math.exp(
-                                    -ctrl.coast_exp_decay_rate * (time_since_seen - ctrl.coast_decay_onset_sec)
+                                    -ctrl.coast_exp_decay_rate * (capture_age - effective_decay_onset)
                                 )
                                 raw_v_pan = int(round(raw_v_pan * decay_factor))
                                 raw_v_tilt = int(round(raw_v_tilt * decay_factor))
 
                             v_pan_cmd = max(-850, min(850, raw_v_pan))
-                            v_tilt_cmd = max(-450, min(450, raw_v_tilt))
+                            v_tilt_cmd = max(-300, min(300, raw_v_tilt))
 
                             if current_tilt >= ctrl.tilt_max_mrad and v_tilt_cmd > 0:
                                 v_tilt_cmd = 0
@@ -229,7 +266,7 @@ def motion_servoing_worker(cfg: BombardeerConfig, state: SystemState):
                     last_sent_p_pan = 99999
                     last_sent_p_tilt = 99999
                     kf.reset()
-                    log.info(f"[{mode}] Target horizon expired (>{ctrl.coast_max_horizon_sec:.1f}s). Standing by.")
+                    log.info(f"[{mode}] Target horizon expired (>{effective_coast_horizon:.1f}s). Standing by.")
 
                 idle_duration = now - last_target_mono
                 if idle_duration >= ctrl.home_timeout_sec:

@@ -1,4 +1,4 @@
-"""Tests for non-droppable TurretCommandBus, Basic Auth, ARMED password guard, and /api/health."""
+"""Tests for non-droppable TurretCommandBus, SystemState latency/telemetry planes, Basic Auth, ARMED guard, and /api/health."""
 
 import base64
 
@@ -35,6 +35,30 @@ def test_command_bus_halt_clears_motion_and_blocks_trigger_on():
     assert cmds2 == [{"cmd": "VELOCITY", "pan_s": 42, "tilt_s": -42}]
 
 
+def test_state_defaults_to_wildlife_and_retains_deep_telemetry_history():
+    """Prevents boot-time CPU spike from ARUCO default and ensures 350ms-1.5s pose lookback."""
+    cfg = load_config(env={})
+    state = SystemState(cfg)
+
+    assert state.get_active_detector_type() == "WILDLIFE"
+
+    # Simulate 2.0 seconds of 100 Hz ESP32 telemetry (200 samples > old maxlen=60)
+    t0 = 500.0
+    for i in range(200):
+        state.update_turret_telemetry(pan=i * 4, tilt=-i, moving=True, rx_mono=t0 + i * 0.01)
+
+    # Interpolate a capture pose from 1.20 seconds ago (120 samples back)
+    pan_past, tilt_past = state.get_turret_pos_at_time(t0 + 0.805)
+    assert pan_past == 322
+    assert tilt_past in (-80, -81)
+
+    # NPU latency helper reflects active WILDLIFE latency and zeroes out in ARUCO mode
+    state.update_health(npu_latency_ms=345.0)
+    assert abs(state.get_npu_latency_sec() - 0.345) < 1e-6
+    state.set_active_detector_type("ARUCO")
+    assert state.get_npu_latency_sec() == 0.0
+
+
 def test_web_auth_and_armed_refused_with_default_password():
     cfg = load_config(env={})
     state = SystemState(cfg)
@@ -44,7 +68,10 @@ def test_web_auth_and_armed_refused_with_default_password():
 
     hdrs = _auth_header(cfg.web.auth_user, cfg.web.auth_pass)
     r = client.get("/api/mode", headers=hdrs)
-    assert r.status_code == 200 and r.get_json()["armed_allowed"] is False
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body["armed_allowed"] is False
+    assert body["detector"] == "WILDLIFE"
 
     assert client.post("/api/mode", json={"mode": "ON"}, headers=hdrs).status_code == 200
     r_arm = client.post("/api/mode", json={"mode": "ARMED"}, headers=hdrs)

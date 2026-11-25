@@ -31,7 +31,9 @@ def test_load_yaml_and_custom_env_enables_armed(tmp_path):
         "  horizon_y_offset_720: 18.0\n"
         "  max_engage_range_m: 38.0\n"
         "camera:\n"
-        "  sensor_day_size: [4608, 2592]\n",
+        "  sensor_day_size: [4608, 2592]\n"
+        "wildlife:\n"
+        "  max_animal_height_m: 2.0\n",
         encoding="utf-8",
     )
     cfg = load_config(
@@ -42,6 +44,7 @@ def test_load_yaml_and_custom_env_enables_armed(tmp_path):
     assert cfg.optics.horizon_y_offset_720 == 18.0
     assert cfg.optics.max_engage_range_m == 38.0
     assert cfg.camera.sensor_day_size == (4608, 2592)
+    assert cfg.wildlife.max_animal_height_m == 2.0
     assert cfg.web.auth_user == "operator"
     assert cfg.web.auth_pass == "StrongYardPass!99"
     assert cfg.web.armed_allowed is True
