@@ -98,7 +98,7 @@ class SystemState:
         self._mode_lock = threading.Lock()
         self._turret_mode = "OFF"
         self._calibrate_primed = False
-        self._active_detector_type = "ARUCO"
+        self._active_detector_type = "WILDLIFE"
 
         # Lock 1: Web streaming buffer & viewer count
         self._frame_lock = threading.Lock()

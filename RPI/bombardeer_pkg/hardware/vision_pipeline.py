@@ -7,6 +7,7 @@ VisionRuntime orchestrator + Core-0 VisionMain loop + Core-1 HudEncoder thread.
 - Drives systemd watchdog (sd_notify) and monotonic Day/Dusk sensor switching.
 """
 
+from collections import deque
 import gc
 import logging
 import math
@@ -101,6 +102,39 @@ def _estimate_capture_mono(metadata: dict, arrival_mono: float) -> float:
         except Exception:
             pass
     return arrival_mono - 0.020 - (0.5 * exp_s)
+
+
+def _select_target_candidate(detections, cur_primary, ref_xy, max_jump_px: float):
+    """Pick the nearest detection to the locked target to prevent jumping between multiple deer."""
+    if not detections:
+        return None
+    if cur_primary is None:
+        return detections[0]
+
+    rx, ry = ref_xy if ref_xy is not None else cur_primary["center"]
+    best = None
+    best_dist = float("inf")
+    for cand in detections:
+        cx, cy = cand["center"]
+        dist = math.hypot(cx - rx, cy - ry)
+        if dist <= max_jump_px and dist < best_dist:
+            best_dist = dist
+            best = cand
+    return best
+
+
+def _clamp_kalman_velocity(kf, max_v_pan_mrad_s: float = 350.0, max_v_tilt_mrad_s: float = 200.0):
+    """Clamp 4-state Kalman velocity [pan, tilt, v_pan, v_tilt] to prevent coast runaway."""
+    x = getattr(kf, "x", None)
+    if x is None:
+        return
+    try:
+        flat = x.reshape(-1)
+        if flat.size >= 4:
+            flat[2] = float(np.clip(flat[2], -max_v_pan_mrad_s, max_v_pan_mrad_s))
+            flat[3] = float(np.clip(flat[3], -max_v_tilt_mrad_s, max_v_tilt_mrad_s))
+    except Exception:
+        pass
 
 
 def _hud_encoder_worker(cfg: BombardeerConfig, state: SystemState, hud_queue: queue.Queue):
@@ -206,14 +240,46 @@ def _hud_encoder_worker(cfg: BombardeerConfig, state: SystemState, hud_queue: qu
             else f"{cam_tag} DET:ARUCO"
         )
         status = f"FPS:{sensor_fps:.1f} | {det_tel} | P:{p_mrad} T:{t_mrad} | {'SER:OK' if ser_ok else 'SER:DISC'}"
-        cv2.putText(annotated, status, (8, cam.display_height - 12),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.34, (0, 255, 0) if ser_ok else (0, 0, 255), 1, cv2.LINE_AA)
+        st_font = cv2.FONT_HERSHEY_SIMPLEX
+        st_scale = 0.56
+        st_thick = 2
+        pad_x, pad_y = 10, 7
+        (tw, th), baseline = cv2.getTextSize(status, st_font, st_scale, st_thick)
+        sx1 = 10
+        sy2 = cam.display_height - 10
+        sy1 = max(0, sy2 - th - baseline - pad_y * 2)
+        sx2 = min(cam.display_width - 10, sx1 + tw + pad_x * 2)
+        roi = annotated[sy1:sy2, sx1:sx2]
+        bg = np.full_like(roi, (22, 17, 13))
+        cv2.addWeighted(bg, 0.72, roi, 0.28, 0.0, dst=roi)
+        cv2.rectangle(annotated, (sx1, sy1), (sx2, sy2), (61, 54, 48), 1)
+        st_color = (160, 255, 160) if ser_ok else (110, 110, 255)
+        cv2.putText(
+            annotated,
+            status,
+            (sx1 + pad_x, sy2 - pad_y - baseline),
+            st_font,
+            st_scale,
+            st_color,
+            st_thick,
+            cv2.LINE_AA,
+        )
 
         alert_msg = health.get("active_alert")
         if alert_msg:
-            cv2.rectangle(annotated, (0, cam.display_height - 45), (cam.display_width, cam.display_height - 20), (0, 0, 180), -1)
-            cv2.putText(annotated, alert_msg, (12, cam.display_height - 28),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
+            ay2 = max(26, sy1 - 6)
+            ay1 = max(0, ay2 - 26)
+            cv2.rectangle(annotated, (0, ay1), (cam.display_width, ay2), (0, 0, 180), -1)
+            cv2.putText(
+                annotated,
+                alert_msg,
+                (12, ay2 - 8),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.50,
+                (255, 255, 255),
+                1,
+                cv2.LINE_AA,
+            )
 
         ok, buf = cv2.imencode(".jpg", annotated, [int(cv2.IMWRITE_JPEG_QUALITY), 75])
         if ok:
@@ -324,6 +390,7 @@ class VisionRuntime:
         pre_roll_idx = 0
         pre_roll_count = 0
         roi_scratch = None
+        npu_lores_history = deque(maxlen=6)
 
         try:
             while not state.shutdown_event.is_set():
@@ -392,6 +459,8 @@ class VisionRuntime:
                         req_frame = None
 
                 capture_mono = _estimate_capture_mono(metadata, time.monotonic())
+                if need_native and frame_roi is not None:
+                    npu_lores_history.append((capture_mono, frame_lores.copy()))
                 if mono_now - last_watchdog_mono >= 2.0:
                     last_watchdog_mono = mono_now
                     sd_notify("WATCHDOG=1")
@@ -467,6 +536,7 @@ class VisionRuntime:
                                 frame_roi = None
                                 frame_lores = None
                                 roi_scratch = None
+                                npu_lores_history.clear()
                                 picam2.stop()
                                 gc.collect()
                                 picam2.configure(_build_camera_config(picam2, cfg, desired_mode, is_monochrome, last_ev))
@@ -528,11 +598,38 @@ class VisionRuntime:
 
                 debug_info = active_detector.get_last_debug_info()
                 is_new_batch = eff_capture_mono != last_processed_capture_mono
-                best_cand = detections[0] if detections else None
+                cur_primary = state.get_primary_target()
+                if cur_primary is not None and (mono_now - cur_primary["last_seen_mono"] >= ctrl.coast_max_horizon_sec):
+                    state.clear_primary_target()
+                    kf.reset()
+                    cur_primary = None
+
+                ref_xy = None
+                if cur_primary is not None:
+                    pred_cap = kf.predict_state(eff_capture_mono)
+                    if pred_cap is not None:
+                        pan_ref, tilt_ref = state.get_turret_pos_at_time(eff_capture_mono)
+                        ref_xy = project_world_to_image_px(
+                            pred_cap[0], pred_cap[1], pan_ref, tilt_ref,
+                            cur_primary.get("range_m", last_valid_range_m), cam, optics
+                        )
+                    else:
+                        ref_xy = cur_primary["center"]
+
+                best_cand = _select_target_candidate(detections, cur_primary, ref_xy, ctrl.confirmation_max_jump_px)
                 verified = None
 
                 if is_new_batch:
                     last_processed_capture_mono = eff_capture_mono
+                    audit_frame = frame_lores
+                    if active_detector.name == "WILDLIFE" and npu_lores_history:
+                        best_ts, best_frm = min(
+                            npu_lores_history,
+                            key=lambda item: abs(item[0] - eff_capture_mono),
+                        )
+                        if abs(best_ts - eff_capture_mono) <= 0.05:
+                            audit_frame = best_frm
+
                     if active_detector.name == "WILDLIFE":
                         veto_boxes = debug_info.get("veto_boxes", [])
                         rejected = debug_info.get("rejected_animals", [])
@@ -551,11 +648,11 @@ class VisionRuntime:
                                 state.command_bus.request_trigger(0)
                                 if mono_now - last_veto_audit_mono >= st.audit_veto_cooldown_sec:
                                     last_veto_audit_mono = mono_now
-                                    save_audit_snapshot(frame_lores, "VETO_ACTIVE", [], debug_info, cfg.debug_snapshot_dir, st.max_debug_snapshots)
+                                    save_audit_snapshot(audit_frame, "VETO_ACTIVE", [], debug_info, cfg.debug_snapshot_dir, st.max_debug_snapshots)
 
                         if rejected and (mono_now - last_veto_audit_mono >= st.audit_veto_cooldown_sec):
                             last_veto_audit_mono = mono_now
-                            save_audit_snapshot(frame_lores, "VETO", detections, debug_info, cfg.debug_snapshot_dir, st.max_debug_snapshots)
+                            save_audit_snapshot(audit_frame, "VETO", detections, debug_info, cfg.debug_snapshot_dir, st.max_debug_snapshots)
 
                     if best_cand is not None:
                         if state.get_primary_target() is not None:
@@ -576,7 +673,7 @@ class VisionRuntime:
                                         f"[ACQUIRE:WILDLIFE] Locked ({sensor_mode}) | Box:{best_cand['box']} "
                                         f"| Range:{best_cand['range_m']:.1f}m"
                                     )
-                                    save_audit_snapshot(frame_lores, "ACQUIRE", detections, debug_info, cfg.debug_snapshot_dir, st.max_debug_snapshots)
+                                    save_audit_snapshot(audit_frame, "ACQUIRE", detections, debug_info, cfg.debug_snapshot_dir, st.max_debug_snapshots)
                         else:
                             tentative_target = best_cand
                             tentative_streak = 1
@@ -593,6 +690,7 @@ class VisionRuntime:
                         pan_cap, tilt_cap, last_valid_range_m, cam, optics
                     )
                     kf.update_measurement(raw_w_pan, raw_w_tilt, eff_capture_mono)
+                    _clamp_kalman_velocity(kf)
                     state.set_primary_target({
                         "center": verified["center"],
                         "box": verified["box"],
