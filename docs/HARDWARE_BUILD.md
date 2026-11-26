@@ -49,7 +49,7 @@ The ballistics and parallax solver (`bombardeer_pkg/control/ballistics.py` and `
   * **Vertical Offset (`camera_offset_y_mm`):** **`-60.0 mm`** (`60 mm` **below** the bore centerline).
   * **Sensor Orientation:** Mounted inverted (`hflip=True, vflip=True` applied in `_build_camera_config()`), with manual focus locked to tree-line hyperfocal infinity (`manual_lens_position: 0.0`).
 * **Site-Specific Geometry (Auto-Calibrated on Deployment):**
-  * **Mount Height (`camera_mount_height_m`), Yard Slope (`ground_slope_mrad`), Camera Roll (`roll_mrad`), and Treeline Ceiling (`yard_top_profile`):** Automatically discovered per deployment by `SiteCalibrationManager` via the daylight boot sweep + **Walk to Calibrate** (`5'9"` operator walk-test) or passive stadia-to-ground convergence, and persisted in `site_calibration.json`. `optics.camera_mount_height_m` (default `1.15 m`) in `config.yaml` serves only as a fallback default. See [`RPI_DEPLOY_DEBUG.md`](RPI_DEPLOY_DEBUG.md) Section 6 for calibration steps.
+  * **Mount Height (`camera_mount_height_m`), Yard Slope (`ground_slope_mrad`), Camera Roll (`roll_mrad`), and Far Ground Edge (`yard_top_profile`):** Automatically discovered per deployment by `SiteCalibrationManager` via the daylight boot sweep + **Walk to Calibrate** (`5'9"` operator walk-test) or passive stadia-to-ground convergence, and persisted in `site_calibration.json`. `optics.camera_mount_height_m` (default `1.15 m`) in `config.yaml` serves only as a fallback default. See [`RPI_DEPLOY_DEBUG.md`](RPI_DEPLOY_DEBUG.md) Section 6 for calibration steps.
 
 > **Note:** If you rebuild the camera bracket with different horizontal/vertical offsets relative to the barrel, update `optics.camera_offset_x_mm` and `optics.camera_offset_y_mm` in `config.yaml` before running `1-SHOT` (`CALIBRATE`) verification.
 
@@ -99,7 +99,7 @@ ESP32 GPIO 17 (TX2) ────[ 1 kΩ ]─────────┤         
    * Leave the GT2 pan belt off and disengage the tilt worm gear during initial firmware flashing.
    * Power the ESP32 over USB (`5V`) first and confirm `[TMC2209] PAN OK` and `[TMC2209] TILT OK` in the debug serial log before energizing the `24V` rail.
 2. **Verify Axis Polarity:**
-   * Positive Pan (`+mrad`) must rotate the turret **clockwise (right)** when viewed from above, matching `camera_offset_x_mm = -170.0` and image `+X` right.
+   * Positive Pan (`+mrad`) must rotate the turret **counter-clockwise (left)** when viewed from above (right-handed convention matching `dx = -(cx - optical_center[0])`, `camera_offset_x_mm = -170.0`, and ESP32 `-rawPan` stick mapping).
    * Positive Tilt (`+mrad`) must elevate the barrel **upward**, matching image `-Y` up.
    * If either axis moves opposite to convention, power down `24V` and reverse one stepper coil pair (`A1/A2`) or invert `setDirectionPin(..., true)` in `ESP32/src/main.cpp`.
 3. **Install Mechanical Hard Stops & Home Alignment:**

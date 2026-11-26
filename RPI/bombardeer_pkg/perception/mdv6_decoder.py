@@ -2,7 +2,7 @@
 
 import logging
 import math
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
@@ -19,11 +19,24 @@ class MDV6Decoder1280:
         1: person
         2: vehicle
     Vectorized across slots and anchors; maps all tile/crop detections into canonical
-    1280x720 coordinates before unified full-frame NMS and safety vetoes.
+    1280x720 coordinates before barrel-mask suppression, unified full-frame NMS,
+    and scene-wide person/vehicle safety vetoes.
     """
 
     CLASS_LAYERS = ("MDV6-yolov9-c/conv100", "MDV6-yolov9-c/conv122", "MDV6-yolov9-c/conv144")
     BOX_LAYERS = ("MDV6-yolov9-c/conv98", "MDV6-yolov9-c/conv121", "MDV6-yolov9-c/conv143")
+
+    # Fixed upper-right barrel & receiver shroud polygon in canonical 1280x720 space
+    # (~16 px safety margin around the rigidly mounted paintball barrel and shroud).
+    DEFAULT_BARREL_POLYGON_720: Tuple[Tuple[int, int], ...] = (
+        (860, 232),   # upper-left of muzzle tip
+        (1280, 86),   # upper-right above receiver
+        (1280, 322),  # lower-right below receiver shroud
+        (1215, 290),  # lower corner of receiver shroud
+        (1190, 238),  # underside where barrel meets shroud
+        (860, 304),   # lower-left of muzzle tip
+    )
+    DEFAULT_BARREL_MASK_OVERLAP_THRESH: float = 0.55
 
     def __init__(
         self,
@@ -44,6 +57,14 @@ class MDV6Decoder1280:
         self.logit_thresh = -math.log((1.0 / wl.conf_thresh) - 1.0)
         self.person_logit_thresh = -math.log((1.0 / wl.person_veto_thresh) - 1.0)
         self.vehicle_logit_thresh = -math.log((1.0 / wl.vehicle_veto_thresh) - 1.0)
+
+        self.barrel_overlap_thresh = float(
+            getattr(wl, "barrel_mask_overlap_thresh", self.DEFAULT_BARREL_MASK_OVERLAP_THRESH)
+        )
+        raw_poly = getattr(wl, "barrel_mask_polygon_720", None)
+        self._barrel_integral = self._build_barrel_integral(
+            self.DEFAULT_BARREL_POLYGON_720 if raw_poly is None else raw_poly
+        )
 
         self.head_anchors = []
         for stride in self.strides:
@@ -76,6 +97,43 @@ class MDV6Decoder1280:
         else:
             self.use_uint8_fastpath = False
 
+    def _build_barrel_integral(self, polygon_720: Sequence[Sequence[float]]) -> Optional[np.ndarray]:
+        """Precomputes an integral mask of the fixed barrel region for O(1) box-overlap checks."""
+        if not polygon_720 or len(polygon_720) < 3:
+            return None
+        fw = int(self.cam.frame_width)
+        fh = int(self.cam.frame_height)
+        sx = float(fw) / 1280.0
+        sy = float(fh) / 720.0
+        pts = np.array(
+            [[int(round(float(x) * sx)), int(round(float(y) * sy))] for x, y in polygon_720],
+            dtype=np.int32,
+        )
+        mask = np.zeros((fh, fw), dtype=np.uint8)
+        cv2.fillPoly(mask, [pts], 1)
+        return cv2.integral(mask)
+
+    def barrel_overlap_fraction(self, box_xyxy: Sequence[float]) -> float:
+        """Returns fraction [0.0, 1.0] of box_xyxy's area covered by the fixed barrel mask."""
+        if self._barrel_integral is None:
+            return 0.0
+        fw = int(self.cam.frame_width)
+        fh = int(self.cam.frame_height)
+        x1 = max(0, min(fw, int(round(float(box_xyxy[0])))))
+        y1 = max(0, min(fh, int(round(float(box_xyxy[1])))))
+        x2 = max(0, min(fw, int(round(float(box_xyxy[2])))))
+        y2 = max(0, min(fh, int(round(float(box_xyxy[3])))))
+        area = (x2 - x1) * (y2 - y1)
+        if area <= 0:
+            return 0.0
+        integ = self._barrel_integral
+        covered = int(integ[y2, x2] - integ[y1, x2] - integ[y2, x1] + integ[y1, x1])
+        return float(covered) / float(area)
+
+    def is_in_barrel_mask(self, box_xyxy: Sequence[float]) -> bool:
+        """True if the candidate box predominantly sits on the rigidly mounted upper-right barrel."""
+        return self.barrel_overlap_fraction(box_xyxy) >= self.barrel_overlap_thresh
+
     def _init_quant_tables(self, qp_map: Dict[str, Tuple[float, float]]):
         self.quant_params = dict(qp_map)
         for name, (scale, zp) in qp_map.items():
@@ -89,15 +147,6 @@ class MDV6Decoder1280:
     def _softmax(x: np.ndarray, axis: int = -1) -> np.ndarray:
         e_x = np.exp(x - np.max(x, axis=axis, keepdims=True))
         return e_x / np.sum(e_x, axis=axis, keepdims=True)
-
-    @staticmethod
-    def check_veto_overlap(anim_box, veto_boxes, pad: int = 24):
-        ax1, ay1, ax2, ay2 = anim_box
-        for v in veto_boxes:
-            vx1, vy1, vx2, vy2 = v["box"]
-            if (ax1 < vx2 + pad) and (ax2 > vx1 - pad) and (ay1 < vy2 + pad) and (ay2 > vy1 - pad):
-                return True, v
-        return False, None
 
     def decode_pass(self, raw_outputs: dict, slots: List[dict], sensor_w: int, sensor_h: int, veto_acc: dict, anim_acc: dict):
         cand_probs_list = []
@@ -209,7 +258,7 @@ class MDV6Decoder1280:
             p_pers = probs[canon_ok, 1]
             p_veh = probs[canon_ok, 2]
 
-            # Person & Vehicle vetoes (never seam-dropped)
+            # Person & Vehicle vetoes (never seam-dropped; barrel-mask filtered before NMS)
             for idx_p in np.flatnonzero(p_pers >= self.wl.person_veto_thresh):
                 veto_acc["boxes"].append([int(cx1[idx_p]), int(cy1[idx_p]), int(cbw[idx_p]), int(cbh[idx_p])])
                 veto_acc["scores"].append(float(p_pers[idx_p]))
@@ -242,82 +291,116 @@ class MDV6Decoder1280:
     def finalize_sweep(self, veto_acc: dict, anim_acc: dict) -> Tuple[List[dict], dict]:
         debug_info = {"veto_boxes": [], "rejected_animals": []}
 
+        # Filter out fixed upper-right barrel false detections BEFORE NMS so a barrel
+        # artifact never triggers a scene-wide veto or suppresses a real nearby person.
         veto_boxes = []
         if veto_acc["boxes"]:
-            v_idx = cv2.dnn.NMSBoxes(
-                veto_acc["boxes"],
-                veto_acc["scores"],
-                min(self.wl.person_veto_thresh, self.wl.vehicle_veto_thresh),
-                0.45,
-            )
-            if len(v_idx) > 0:
-                for vi in v_idx.flatten():
-                    vx, vy, vw, vh = veto_acc["boxes"][vi]
-                    v_cls, v_score = veto_acc["meta"][vi]
-                    veto_boxes.append({"class": v_cls, "score": v_score, "box": [vx, vy, vx + vw, vy + vh]})
+            kept_v_boxes = []
+            kept_v_scores = []
+            kept_v_meta = []
+            for box_xywh, score, meta in zip(veto_acc["boxes"], veto_acc["scores"], veto_acc["meta"]):
+                vx, vy, vw, vh = box_xywh
+                if self.is_in_barrel_mask((vx, vy, vx + vw, vy + vh)):
+                    continue
+                kept_v_boxes.append(box_xywh)
+                kept_v_scores.append(score)
+                kept_v_meta.append(meta)
+
+            if kept_v_boxes:
+                v_idx = cv2.dnn.NMSBoxes(
+                    kept_v_boxes,
+                    kept_v_scores,
+                    min(self.wl.person_veto_thresh, self.wl.vehicle_veto_thresh),
+                    0.45,
+                )
+                if len(v_idx) > 0:
+                    for vi in v_idx.flatten():
+                        vx, vy, vw, vh = kept_v_boxes[vi]
+                        v_cls, v_score = kept_v_meta[vi]
+                        veto_boxes.append({"class": v_cls, "score": v_score, "box": [vx, vy, vx + vw, vy + vh]})
 
         debug_info["veto_boxes"] = veto_boxes
         if not anim_acc["boxes"]:
             return [], debug_info
 
-        indices = cv2.dnn.NMSBoxes(anim_acc["boxes"], anim_acc["scores"], self.wl.conf_thresh, self.wl.iou_thresh)
+        kept_a_boxes = []
+        kept_a_scores = []
+        kept_a_probs = []
+        for box_xywh, score, probs in zip(anim_acc["boxes"], anim_acc["scores"], anim_acc["probs"]):
+            bx, by, bw, bh = box_xywh
+            if self.is_in_barrel_mask((bx, by, bx + bw, by + bh)):
+                continue
+            kept_a_boxes.append(box_xywh)
+            kept_a_scores.append(score)
+            kept_a_probs.append(probs)
+
+        if not kept_a_boxes:
+            return [], debug_info
+
+        indices = cv2.dnn.NMSBoxes(kept_a_boxes, kept_a_scores, self.wl.conf_thresh, self.wl.iou_thresh)
+        if len(indices) == 0:
+            return [], debug_info
+
+        # Scene-wide safety veto: if ANY non-barrel person or vehicle is detected anywhere
+        # in the frame, reject all animal detections in this sweep.
+        if veto_boxes:
+            top_veto = max(veto_boxes, key=lambda v: float(v.get("score", 0.0)))
+            v_cls = top_veto["class"]
+            v_score = float(top_veto["score"])
+            for idx in indices.flatten():
+                bx, by, bw, bh = kept_a_boxes[idx]
+                debug_info["rejected_animals"].append({
+                    "reason": f"SCENE_VETO:{v_cls}({v_score:.2f})",
+                    "box": [bx, by, bx + bw, by + bh],
+                    "probs": kept_a_probs[idx],
+                })
+            return [], debug_info
 
         detections = []
         frame_area = float(self.cam.frame_width * self.cam.frame_height)
 
-        if len(indices) > 0:
-            for idx in indices.flatten():
-                bx, by, bw, bh = anim_acc["boxes"][idx]
-                box_xyxy = [bx, by, bx + bw, by + bh]
-                p_anim, p_pers, p_veh = anim_acc["probs"][idx]
-                area = float(bw * bh)
+        for idx in indices.flatten():
+            bx, by, bw, bh = kept_a_boxes[idx]
+            box_xyxy = [bx, by, bx + bw, by + bh]
+            p_anim, p_pers, p_veh = kept_a_probs[idx]
+            area = float(bw * bh)
 
-                if (bw / self.cam.frame_width) > self.wl.max_animal_width_frac or (area / frame_area) > self.wl.max_animal_area_frac:
-                    debug_info["rejected_animals"].append({"reason": "SIZE_LIMIT", "box": box_xyxy, "probs": (p_anim, p_pers, p_veh)})
-                    continue
+            if (bw / self.cam.frame_width) > self.wl.max_animal_width_frac or (area / frame_area) > self.wl.max_animal_area_frac:
+                debug_info["rejected_animals"].append({"reason": "SIZE_LIMIT", "box": box_xyxy, "probs": (p_anim, p_pers, p_veh)})
+                continue
 
-                if p_pers >= self.wl.max_non_animal_prob or p_veh >= self.wl.max_non_animal_prob:
-                    debug_info["rejected_animals"].append({
-                        "reason": f"NON_ANIMAL_PROB(P:{p_pers:.2f},V:{p_veh:.2f})",
-                        "box": box_xyxy,
-                        "probs": (p_anim, p_pers, p_veh),
-                    })
-                    continue
-
-                aspect_ratio = float(bh) / max(1.0, float(bw))
-                if aspect_ratio > self.wl.max_animal_aspect_ratio:
-                    debug_info["rejected_animals"].append({
-                        "reason": f"ASPECT_RATIO({aspect_ratio:.2f})",
-                        "box": box_xyxy,
-                        "probs": (p_anim, p_pers, p_veh),
-                    })
-                    continue
-
-                is_vetoed, veto_hit = self.check_veto_overlap(box_xyxy, veto_boxes, pad=self.wl.veto_padding_px)
-                if is_vetoed:
-                    debug_info["rejected_animals"].append({
-                        "reason": f"OVERLAP_{veto_hit['class']}({veto_hit['score']:.2f})",
-                        "box": box_xyxy,
-                        "probs": (p_anim, p_pers, p_veh),
-                    })
-                    continue
-
-                cx = bx + (bw / 2.0)
-                cy = by + (bh * 0.60)
-                est_range_m = (self.wl.assumed_target_height_mm * self.optics.focal_length_px) / (max(5.0, float(bh)) * 1000.0)
-                clamped_range_m = float(np.clip(est_range_m, self.optics.min_valid_range_m, self.optics.max_valid_range_m))
-
-                detections.append({
+            if p_pers >= self.wl.max_non_animal_prob or p_veh >= self.wl.max_non_animal_prob:
+                debug_info["rejected_animals"].append({
+                    "reason": f"NON_ANIMAL_PROB(P:{p_pers:.2f},V:{p_veh:.2f})",
                     "box": box_xyxy,
-                    "center": (cx, cy),
-                    "score": p_anim,
                     "probs": (p_anim, p_pers, p_veh),
-                    "area": area,
-                    "range_m": clamped_range_m,
-                    "id": 1,
-                    "label": f"ANIMAL {p_anim * 100:.0f}%",
                 })
+                continue
 
-            detections.sort(key=lambda d: (d["score"], d["area"]), reverse=True)
+            aspect_ratio = float(bh) / max(1.0, float(bw))
+            if aspect_ratio > self.wl.max_animal_aspect_ratio:
+                debug_info["rejected_animals"].append({
+                    "reason": f"ASPECT_RATIO({aspect_ratio:.2f})",
+                    "box": box_xyxy,
+                    "probs": (p_anim, p_pers, p_veh),
+                })
+                continue
 
+            cx = bx + (bw / 2.0)
+            cy = by + (bh * 0.60)
+            est_range_m = (self.wl.assumed_target_height_mm * self.optics.focal_length_px) / (max(5.0, float(bh)) * 1000.0)
+            clamped_range_m = float(np.clip(est_range_m, self.optics.min_valid_range_m, self.optics.max_valid_range_m))
+
+            detections.append({
+                "box": box_xyxy,
+                "center": (cx, cy),
+                "score": p_anim,
+                "probs": (p_anim, p_pers, p_veh),
+                "area": area,
+                "range_m": clamped_range_m,
+                "id": 1,
+                "label": f"ANIMAL {p_anim * 100:.0f}%",
+            })
+
+        detections.sort(key=lambda d: (d["score"], d["area"]), reverse=True)
         return detections, debug_info

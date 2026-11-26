@@ -1,9 +1,8 @@
-"""Tests for horizon tiling, minimal ROI slicing, tensor packing, and MDV6 safety vetoes."""
+"""Tests for horizon tiling, minimal ROI slicing, tensor packing, barrel masking, and scene-wide MDV6 safety vetoes."""
 
 import numpy as np
 
 from bombardeer_pkg.config import load_config
-from bombardeer_pkg.control.ballistics import image_px_to_world_mrad, project_world_to_image_px
 from bombardeer_pkg.perception.mdv6_decoder import MDV6Decoder1280
 from bombardeer_pkg.perception.tiling import (
     build_pass_plan,
@@ -56,25 +55,29 @@ def test_tracking_crop_plan():
     assert slot["src_w"] == slot["src_h"] >= 1280
 
 
-def test_decoder_vetoes_and_synthetic_decode_pass():
+def test_decoder_scene_wide_vetoes_and_synthetic_decode_pass():
     cfg = load_config(env={})
     dec = MDV6Decoder1280(cfg.camera, cfg.optics, cfg.wildlife, hef=None)
 
-    # 1. Person overlap veto blocks overlapping animal
-    veto_acc = {"boxes": [[200, 300, 60, 120]], "scores": [0.40], "meta": [("PERSON", 0.40)]}
-    anim_acc = {"boxes": [[210, 340, 50, 40]], "scores": [0.92], "probs": [(0.92, 0.005, 0.001)]}
+    # Dead rectangle-overlap helper must be completely removed
+    assert not hasattr(MDV6Decoder1280, "check_veto_overlap")
+
+    # 1. Scene-wide person veto rejects animal even on opposite side of frame (zero overlap)
+    veto_acc = {"boxes": [[100, 320, 60, 140]], "scores": [0.72], "meta": [("PERSON", 0.72)]}
+    anim_acc = {"boxes": [[680, 380, 60, 45]], "scores": [0.92], "probs": [(0.92, 0.005, 0.001)]}
     dets, dbg = dec.finalize_sweep(veto_acc, anim_acc)
     assert dets == []
-    assert any("OVERLAP_PERSON" in r["reason"] for r in dbg["rejected_animals"])
+    assert len(dbg["veto_boxes"]) == 1 and dbg["veto_boxes"][0]["class"] == "PERSON"
+    assert any("SCENE_VETO:PERSON(0.72)" in r["reason"] for r in dbg["rejected_animals"])
 
-    # 2. Standing-human aspect ratio (>1.65) rejected
+    # 2. Standing-human aspect ratio (>1.65) rejected when scene is clear
     veto_acc = {"boxes": [], "scores": [], "meta": []}
     anim_acc = {"boxes": [[500, 300, 30, 80]], "scores": [0.90], "probs": [(0.90, 0.001, 0.001)]}
     dets, dbg = dec.finalize_sweep(veto_acc, anim_acc)
     assert dets == []
     assert any("ASPECT_RATIO" in r["reason"] for r in dbg["rejected_animals"])
 
-    # 3. Clean deer candidate accepted
+    # 3. Clean deer candidate accepted when no person/vehicle is present
     anim_acc = {"boxes": [[500, 380, 60, 45]], "scores": [0.88], "probs": [(0.88, 0.001, 0.001)]}
     dets, _ = dec.finalize_sweep(veto_acc, anim_acc)
     assert len(dets) == 1 and dets[0]["box"] == [500, 380, 560, 425]
@@ -101,27 +104,62 @@ def test_decoder_vetoes_and_synthetic_decode_pass():
     assert len(a_acc["boxes"]) == 1
 
 
-def test_projected_active_box_catches_veto_overlap_after_turret_slew():
+def test_barrel_mask_suppresses_barrel_false_person_without_blocking_animals():
     """
-    During a 350ms NPU cycle, turret pan slews shift pixel coordinates.
-    Projecting the locked world target into the new batch's pose catches an
-    overlapping person that the stale pre-slew pixel box would miss.
+    When the turret tilts down and the scan strip includes the fixed upper-right
+    paintball barrel, a false PERSON/VEHICLE detection on the barrel must be
+    masked out so it does NOT trigger a scene-wide veto and reject yard deer.
     """
     cfg = load_config(env={})
-    rng = 20.0
-    # At t0 (pan=0, tilt=0), deer is centered at (640, 400)
-    stale_box = [615, 380, 665, 420]
-    w_pan, w_tilt = image_px_to_world_mrad(640.0, 400.0, 0.0, 0.0, rng, cfg.camera, cfg.optics)
+    dec = MDV6Decoder1280(cfg.camera, cfg.optics, cfg.wildlife, hef=None)
 
-    # By t1 (350ms later), turret panned +180 mrad left -> deer shifts right in image (~+98px)
-    px_t1, py_t1 = project_world_to_image_px(w_pan, w_tilt, 180.0, 0.0, rng, cfg.camera, cfg.optics)
-    projected_box = [px_t1 - 25.0, py_t1 - 20.0, px_t1 + 25.0, py_t1 + 20.0]
+    # Exact field-observed barrel-tip VETO:PERSON [877, 239, 973, 287] and receiver shroud box
+    assert dec.is_in_barrel_mask([877, 239, 973, 287])
+    assert dec.is_in_barrel_mask([980, 175, 1150, 255])
+    assert dec.is_in_barrel_mask([1190, 115, 1279, 305])
 
-    # Person stands right next to the deer in t1's image coordinates
-    person_veto = [{"class": "PERSON", "score": 0.85, "box": [px_t1 - 15.0, py_t1 - 50.0, px_t1 + 20.0, py_t1 + 25.0]}]
+    veto_acc = {
+        "boxes": [[877, 239, 96, 48], [1190, 115, 89, 190]],
+        "scores": [0.57, 0.62],
+        "meta": [("PERSON", 0.57), ("VEHICLE", 0.62)],
+    }
+    anim_acc = {
+        "boxes": [[500, 380, 60, 45], [880, 242, 90, 44]],  # real deer + false barrel animal
+        "scores": [0.89, 0.85],
+        "probs": [(0.89, 0.001, 0.001), (0.85, 0.001, 0.001)],
+    }
+    dets, dbg = dec.finalize_sweep(veto_acc, anim_acc)
 
-    stale_hit, _ = MDV6Decoder1280.check_veto_overlap(stale_box, person_veto, pad=cfg.wildlife.veto_padding_px)
-    proj_hit, veto_obj = MDV6Decoder1280.check_veto_overlap(projected_box, person_veto, pad=cfg.wildlife.veto_padding_px)
+    # Barrel artifacts suppressed -> real deer accepted, zero false vetoes emitted
+    assert dbg["veto_boxes"] == []
+    assert len(dets) == 1
+    assert dets[0]["box"] == [500, 380, 560, 425]
 
-    assert not stale_hit
-    assert proj_hit and veto_obj["class"] == "PERSON"
+
+def test_barrel_mask_still_vetoes_real_person_walking_below_barrel():
+    """A real person standing in the yard beneath/behind the barrel tip must still trigger SCENE_VETO."""
+    cfg = load_config(env={})
+    dec = MDV6Decoder1280(cfg.camera, cfg.optics, cfg.wildlife, hef=None)
+
+    # Person extends from y=260 (head touching barrel tip) down to y=480 (feet on yard)
+    real_person_xywh = [890, 260, 70, 220]
+    assert not dec.is_in_barrel_mask([890, 260, 960, 480])
+
+    # Include a higher-scoring barrel false positive overlapping the person's head to verify
+    # pre-NMS barrel filtering prevents the barrel artifact from suppressing the real person.
+    veto_acc = {
+        "boxes": [[877, 239, 96, 48], real_person_xywh],
+        "scores": [0.95, 0.78],
+        "meta": [("PERSON", 0.95), ("PERSON", 0.78)],
+    }
+    anim_acc = {
+        "boxes": [[300, 410, 70, 50]],
+        "scores": [0.91],
+        "probs": [(0.91, 0.001, 0.001)],
+    }
+    dets, dbg = dec.finalize_sweep(veto_acc, anim_acc)
+
+    assert dets == []
+    assert len(dbg["veto_boxes"]) == 1
+    assert dbg["veto_boxes"][0]["box"] == [890, 260, 960, 480]
+    assert any("SCENE_VETO:PERSON(0.78)" in r["reason"] for r in dbg["rejected_animals"])

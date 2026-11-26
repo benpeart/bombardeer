@@ -241,7 +241,7 @@ def compute_deer_head_ceiling_mrad(
 
     - If H_cam < H_deer (camera lower than deer's head), a NEAR deer rises highest above
       the metric horizon (at Z = min_valid_range_m), while a FAR deer barely clears it.
-    - If H_cam >= H_deer (elevated porch mount higher than a deer's head), a deer's head
+    - If H_cam >= H_deer (elevated mount higher than a deer's head), a deer's head
       stays BELOW the metric horizon at ALL ranges — closest at the far edge Z_far.
 
     Returns (ceiling_mrad, far_head_mrad, near_head_mrad).

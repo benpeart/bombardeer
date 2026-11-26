@@ -1,0 +1,23 @@
+python -m compileall -q bombardeer_pkg
+python -m pytest
+sudo systemctl restart bombardeer.service
+
+; Deploy all files to RPI
+scp -rp -P 22022 bombardeer.py config.yaml pytest.ini bombardeer_pkg static tests ben@bombardeer.dpeartfamily.duckdns.org:~/bombardeer/
+
+; Run on RPI
+cd ~/bombardeer
+find bombardeer_pkg tests -name __pycache__ -exec rm -rf {} +
+python -m compileall -q bombardeer_pkg 
+python -m pytest
+sudo systemctl restart bombardeer.service
+
+
+scp -rp -P 22022 bombardeer_pkg\ ben@bombardeer.dpeartfamily.duckdns.org:~/bombardeer/bombardeer_pkg/
+scp -rp -P 22022 tests\*.py ben@bombardeer.dpeartfamily.duckdns.org:~/bombardeer/tests/
+
+scp -rp -P 22022 bombardeer_pkg\ ben@bombardeer.dpeartfamily.duckdns.org:~/bombardeer/
+
+scp -p -P 22022 bombardeer.py ben@bombardeer.dpeartfamily.duckdns.org:~/bombardeer/
+scp -p -P 22022 config.yaml ben@bombardeer.dpeartfamily.duckdns.org:~/bombardeer/
+scp -p -P 22022 pytest.ini ben@bombardeer.dpeartfamily.duckdns.org:~/bombardeer/

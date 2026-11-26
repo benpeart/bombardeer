@@ -1,10 +1,10 @@
 """
-VisionRuntime orchestrator + Core-0 VisionMain loop + Core-1 HudEncoder thread.
+VisionRuntime orchestrator + Cores 0-2 VisionMain loop + Core-1 HudEncoder thread.
 - Spawns HailoNPUProc BEFORE starting worker threads (deadlock-free spawn).
 - MappedArray minimal-ROI capture into a reusable scratch buffer (zero per-frame allocs, DMA-safe).
 - PiSP hardware BGR888 (RGB in memory) skips CPU BGR2RGB conversion.
-- Projects Kalman world state back into exact capture_mono image coordinates for TRK-1:1 crops,
-  safety vetoes, tentative confirmation, and real-time HUD overlays.
+- Enforces scene-wide person/vehicle safety vetoes and projects Kalman world state into
+  exact capture_mono image coordinates for TRK-1:1 crops, tentative confirmation, and live HUD overlays.
 - Drives systemd watchdog (sd_notify) and fenced monotonic Day/Dusk sensor switching.
 """
 
@@ -38,7 +38,6 @@ from bombardeer_pkg.hardware.recorder import ensure_storage_headroom, video_reco
 from bombardeer_pkg.hardware.serial_link import turret_serial_worker
 from bombardeer_pkg.perception.aruco import ArucoTargetDetector
 from bombardeer_pkg.perception.hailo_detector import HailoWildlifeDetector
-from bombardeer_pkg.perception.mdv6_decoder import MDV6Decoder1280
 from bombardeer_pkg.state import SystemState
 from bombardeer_pkg.utils import (
     RateLimitedLogger,
@@ -146,6 +145,27 @@ def _select_target_candidate(detections, cur_primary, ref_points, max_jump_px: f
             best_dist = dist
             best = cand
     return best
+
+
+def _apply_scene_wide_veto(state: SystemState, kf, cur_primary, veto_boxes):
+    """
+    Scene-wide safety veto: if ANY person or vehicle is detected anywhere in the
+    frame, abort any active target lock, reset Kalman state, and disarm trigger.
+    Returns (aborted_active_lock, top_veto_obj).
+    """
+    if not veto_boxes:
+        return False, None
+    top_veto = max(veto_boxes, key=lambda v: float(v.get("score", 0.0)))
+    if cur_primary is not None:
+        log.warning(
+            f"[SAFETY VETO:ACTIVE] Aborting lock (scene-wide) — "
+            f"{top_veto.get('class', 'VETO')} ({float(top_veto.get('score', 0.0)):.2f})"
+        )
+        state.clear_primary_target()
+        kf.reset()
+        state.command_bus.request_trigger(0)
+        return True, top_veto
+    return False, top_veto
 
 
 def _hud_encoder_worker(cfg: BombardeerConfig, state: SystemState, hud_queue: queue.Queue):
@@ -742,41 +762,8 @@ class VisionRuntime:
                         if abs(best_ts - eff_capture_mono) <= 0.08:
                             audit_frame = best_frm
 
-                    # Project current locked target into eff_capture_mono pixel space (both extrapolated and stationary)
-                    ref_xy = None
-                    last_xy = None
-                    active_box_at_batch = None
-                    assoc_gate_px = float(ctrl.confirmation_max_jump_px)
-
-                    if cur_primary is not None:
-                        prim_rng = cur_primary.get("range_m", last_valid_range_m)
-                        pred_cap = kf.predict_state(eff_capture_mono)
-                        if pred_cap is not None:
-                            ref_xy = project_world_to_image_px(
-                                pred_cap[0], pred_cap[1], pan_batch, tilt_batch, prim_rng, cam, optics
-                            )
-                            active_box_at_batch = _reconstruct_box_at_center(
-                                ref_xy[0], ref_xy[1], cur_primary["box"], cur_primary["center"]
-                            )
-                        else:
-                            ref_xy = cur_primary["center"]
-                            active_box_at_batch = cur_primary["box"]
-
-                        last_state = kf.get_last_state()
-                        if last_state is not None:
-                            last_xy = project_world_to_image_px(
-                                last_state[0], last_state[1], pan_batch, tilt_batch, prim_rng, cam, optics
-                            )
-                            dt_gap = max(0.0, eff_capture_mono - last_state[2])
-                            kin_optics_b, _, _, _ = state.site_calibration.get_ground_plane_params(optics, pan_batch)
-                            kin_gap = compute_target_kinematics(prim_rng, kin_optics_b)
-                            kin_gate_px = ((kin_gap.max_v_pan_mrad_s * dt_gap) + kin_gap.max_step_margin_pan_mrad) / max(0.5, optics.mrad_per_pixel)
-                            assoc_gate_px = max(float(ctrl.confirmation_max_jump_px), min(280.0, kin_gate_px))
-
-                    best_cand = _select_target_candidate(
-                        detections, cur_primary, (ref_xy, last_xy), assoc_gate_px
-                    )
-
+                    # Evaluate calibration ownership & scene-wide safety veto BEFORE candidate projection
+                    suppress_tracking = False
                     if active_detector.name == "WILDLIFE":
                         veto_boxes = debug_info.get("veto_boxes", [])
                         rejected = debug_info.get("rejected_animals", [])
@@ -784,37 +771,56 @@ class VisionRuntime:
                             state.site_calibration.ingest_walk_test_detections(
                                 veto_boxes, tilt_batch, eff_capture_mono, state=state
                             )
-                            best_cand = None
-                            tentative_target = None
-                            tentative_streak = 0
+                            suppress_tracking = True
                         elif state.site_calibration.is_motion_owned():
-                            best_cand = None
-                            tentative_target = None
-                            tentative_streak = 0
-                        if cur_primary is not None and veto_boxes:
-                            hit, veto_obj = MDV6Decoder1280.check_veto_overlap(
-                                active_box_at_batch, veto_boxes, pad=cfg.wildlife.veto_padding_px
-                            )
-                            if (not hit) and best_cand is not None:
-                                hit, veto_obj = MDV6Decoder1280.check_veto_overlap(
-                                    best_cand["box"], veto_boxes, pad=cfg.wildlife.veto_padding_px
-                                )
-                            if hit:
-                                log.warning(f"[SAFETY VETO:ACTIVE] Aborting lock — {veto_obj['class']} ({veto_obj['score']:.2f})")
-                                state.clear_primary_target()
-                                kf.reset()
+                            suppress_tracking = True
+                        elif veto_boxes:
+                            aborted, _ = _apply_scene_wide_veto(state, kf, cur_primary, veto_boxes)
+                            if aborted:
                                 cur_primary = None
-                                tentative_target = None
-                                tentative_streak = 0
-                                best_cand = None
-                                state.command_bus.request_trigger(0)
                                 if mono_now - last_veto_audit_mono >= st.audit_veto_cooldown_sec:
                                     last_veto_audit_mono = mono_now
                                     save_audit_snapshot(audit_frame, "VETO_ACTIVE", [], debug_info, cfg.debug_snapshot_dir, st.max_debug_snapshots)
+                            suppress_tracking = True
 
                         if rejected and (mono_now - last_veto_audit_mono >= st.audit_veto_cooldown_sec):
                             last_veto_audit_mono = mono_now
                             save_audit_snapshot(audit_frame, "VETO", detections, debug_info, cfg.debug_snapshot_dir, st.max_debug_snapshots)
+
+                    best_cand = None
+                    if suppress_tracking:
+                        tentative_target = None
+                        tentative_streak = 0
+                    elif detections:
+                        # Project current locked target into eff_capture_mono pixel space (both extrapolated and stationary)
+                        ref_xy = None
+                        last_xy = None
+                        assoc_gate_px = float(ctrl.confirmation_max_jump_px)
+
+                        if cur_primary is not None:
+                            prim_rng = cur_primary.get("range_m", last_valid_range_m)
+                            pred_cap = kf.predict_state(eff_capture_mono)
+                            if pred_cap is not None:
+                                ref_xy = project_world_to_image_px(
+                                    pred_cap[0], pred_cap[1], pan_batch, tilt_batch, prim_rng, cam, optics
+                                )
+                            else:
+                                ref_xy = cur_primary["center"]
+
+                            last_state = kf.get_last_state()
+                            if last_state is not None:
+                                last_xy = project_world_to_image_px(
+                                    last_state[0], last_state[1], pan_batch, tilt_batch, prim_rng, cam, optics
+                                )
+                                dt_gap = max(0.0, eff_capture_mono - last_state[2])
+                                kin_optics_b, _, _, _ = state.site_calibration.get_ground_plane_params(optics, pan_batch)
+                                kin_gap = compute_target_kinematics(prim_rng, kin_optics_b)
+                                kin_gate_px = ((kin_gap.max_v_pan_mrad_s * dt_gap) + kin_gap.max_step_margin_pan_mrad) / max(0.5, optics.mrad_per_pixel)
+                                assoc_gate_px = max(float(ctrl.confirmation_max_jump_px), min(280.0, kin_gate_px))
+
+                        best_cand = _select_target_candidate(
+                            detections, cur_primary, (ref_xy, last_xy), assoc_gate_px
+                        )
 
                     if best_cand is not None:
                         if cur_primary is not None:

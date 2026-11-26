@@ -25,11 +25,13 @@ bombardeer/
 │   ├── android-chrome-512x512.png        # 512x512 PWA splash icon
 │   └── site.webmanifest                  # Web app manifest JSON
 ├── tests/                                # Offline & on-device pytest regression suite
+│   ├── conftest.py                       # Stubs Pi-only libcamera/picamera2 on Windows/dev hosts
 │   ├── test_config.py
 │   ├── test_command_bus_and_web.py
 │   ├── test_kalman_ballistics.py
 │   ├── test_tiling_and_decoder.py
 │   ├── test_latency_and_tracking_regressions.py
+│   ├── test_scene_veto.py
 │   └── test_site_calibration.py
 └── bombardeer_pkg/
     ├── config.py                         # Typed YAML + environment loader
@@ -259,7 +261,7 @@ Click **`Verify Grid`** (in the Site Calibration bar or fullscreen overlay) and 
   * **Mount Height & Ground Slope:** Confirm height matches your physical camera lens height (within ~0.1–0.2 m) and slope sign (`+` downhill, `-` uphill).
   * **Mount Roll:** Spirit-level bubble stays green/centered (`< 2.5°`).
   * **Fit & Sweep:** Walk-Test `RMS` residual should typically be `< 10–15 mrad` with `7 treeline stops (DONE)`.
-  * **Pan Treeline Profile:** Plots `yard_top_mrad` across `Left (-750)` to `Right (+750)` with a live green cursor tracking current pan—the blue curve should vary smoothly without sharp single-stop spikes.
+  * **Pan Treeline Profile:** Plots `yard_top_mrad` across `Left (+750)` to `Right (-750)` (matching the right-handed camera view) with a live green cursor tracking current pan—the blue curve should vary smoothly without sharp single-stop spikes.
 
 ### 6.4 Hands-Off Fallback (Skipping the Walk-Test)
 If you set the turret down in a new spot and do **not** run a Walk-Test:
@@ -381,7 +383,7 @@ journalctl -u bombardeer -f
 * **False Positives vs. Missed Detections:**
   * Static tree-trunk or background false locks: adjust `wildlife.conf_thresh` (default `0.65`) or `control.confirmation_frames` in `config.yaml`.
   * Tall bucks or slight slope variance rejected by `REJ:HEIGHT`: run **`Walk Cal (5'9")`** to lock exact site height/slope, and verify `wildlife.max_animal_height_m` (e.g., `2.0 m`) in `config.yaml`.
-  * Flickering red `VETO:PERSON` boxes on high-contrast NoIR tree trunks or the upper-right barrel tip: adjust `wildlife.person_veto_thresh` (default `0.48`) conservatively; horizontal barrel-tip boxes are already ignored by Walk Calibration.
+  * **Scene-Wide Safety Veto & Fixed Barrel Mask:** Any non-barrel `PERSON` (`>= 0.48`) or `VEHICLE` (`>= 0.35`) anywhere in the frame rejects all animal detections in that sweep (`SCENE_VETO`) and aborts active locks (`TRIGGER 0`). False detections on the rigidly mounted upper-right barrel and receiver shroud are suppressed pre-NMS by `MDV6Decoder1280`'s `1280×720` barrel exclusion mask (`>= 55%` overlap), while real people walking beneath the barrel still veto immediately. If flickering `VETO:PERSON` boxes ever appear on distant tree trunks, adjust `wildlife.person_veto_thresh` conservatively.
 
 ### 8.4 `bombardeer_pkg/control/` (`ballistics.py`, `kalman.py`, `site_calibration.py`, `motion_servo.py`)
 * **Horizon & Far-Edge Alignment:** On the live OpenCV HUD, the teal dashed line shows the metric ground-plane horizon and the gold dashed line shows the perspective-computed `6'0"` far-edge deer head line (both roll-compensated). Enable **`Verify Grid`** in the Web UI to inspect all three lines (`FAR DEER HEAD 6'0"`, `METRIC HORIZON`, `FAR GROUND EDGE`) plus projected `5m–40m` range lines and height brackets. If misaligned after relocating, click **`Reset`** or **`Boot Sweep`** + **`Walk Cal (5'9")`**.

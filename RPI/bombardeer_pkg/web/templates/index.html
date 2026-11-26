@@ -637,10 +637,11 @@ function renderTreelineChart(d) {
     const pts = d.yard_top_profile || [];
     const curPan = (d.turret && d.turret.pan_mrad) || 0;
     const W = 600, H = 92;
-    const panMin = -800, panMax = 800;
+    const panLeft = 800, panRight = -800;
     const yMinMrad = -180, yMaxMrad = 180;
 
-    const mapX = p => Math.max(18, Math.min(W - 18, ((p - panMin) / (panMax - panMin)) * (W - 36) + 18));
+    // Positive pan_mrad = Left (CCW), Negative pan_mrad = Right (CW) — matches camera view
+    const mapX = p => Math.max(18, Math.min(W - 18, ((panLeft - p) / (panLeft - panRight)) * (W - 36) + 18));
     // More negative mrad = higher in image (top of chart); more positive = lower in image (bottom of chart)
     const mapY = m => Math.max(18, Math.min(H - 18, ((m - yMinMrad) / (yMaxMrad - yMinMrad)) * (H - 36) + 18));
 
@@ -649,15 +650,15 @@ function renderTreelineChart(d) {
     out += `<line x1="14" y1="${y0.toFixed(1)}" x2="${W - 14}" y2="${y0.toFixed(1)}" stroke="#30363d" stroke-dasharray="5 4" stroke-width="1"/>`;
     out += `<text x="16" y="12" fill="#8b949e" font-size="10">↑ Higher in view (-mrad)</text>`;
     out += `<text x="${W - 16}" y="12" text-anchor="end" fill="#6e7681" font-size="10">dashed = 0 mrad (level)</text>`;
-    out += `<text x="16" y="${H - 4}" fill="#8b949e" font-size="10">Left (-750)</text>`;
+    out += `<text x="16" y="${H - 4}" fill="#8b949e" font-size="10">Left (+750)</text>`;
     out += `<text x="${W / 2}" y="${H - 4}" text-anchor="middle" fill="#8b949e" font-size="10">Center (0)</text>`;
-    out += `<text x="${W - 16}" y="${H - 4}" text-anchor="end" fill="#8b949e" font-size="10">Right (+750)</text>`;
+    out += `<text x="${W - 16}" y="${H - 4}" text-anchor="end" fill="#8b949e" font-size="10">Right (-750)</text>`;
 
     const cx = mapX(curPan);
     out += `<line x1="${cx.toFixed(1)}" y1="14" x2="${cx.toFixed(1)}" y2="${H - 15}" stroke="#3fb950" stroke-width="1.5" stroke-dasharray="3 2"/>`;
 
     if (pts.length > 0) {
-        const coords = pts.map(([p, v]) => [mapX(p), mapY(v), v]);
+        const coords = pts.map(([p, v]) => [mapX(p), mapY(v), v]).sort((a, b) => a[0] - b[0]);
         const polyPts = coords.map(c => `${c[0].toFixed(1)},${c[1].toFixed(1)}`).join(" ");
         const areaPts = `${coords[0][0].toFixed(1)},${H - 15} ${polyPts} ${coords[coords.length - 1][0].toFixed(1)},${H - 15}`;
         out += `<polygon points="${areaPts}" fill="#38bdf822"/>`;

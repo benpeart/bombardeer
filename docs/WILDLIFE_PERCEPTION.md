@@ -78,12 +78,20 @@ MegaDetector v6 outputs three classes: **`0: animal`**, **`1: person`**, and **`
 ```text
 Raw MDv6 Boxes (Canonical 1280x720, tagged with eff_capture_mono)
         │
+        ├──► Fixed Upper-Right Barrel Exclusion Mask (MDV6Decoder1280, pre-NMS)
+        │         └──► Any candidate box with >= 55% of its area inside the rigidly mounted
+        │              canonical 1280x720 barrel/shroud polygon is suppressed before NMS so
+        │              tilting down never causes the barrel to trigger false scene-wide vetoes
+        │              (real people walking in the yard below the barrel remain well under 55%
+        │              overlap and still veto immediately).
+        │
         ├──► Class 1 (Person >= 0.48) or Class 2 (Vehicle >= 0.35)
-        │         └──► Added to veto_boxes[] (expanded by veto_padding_px = 24 px)
+        │         └──► Added to veto_boxes[] (scene-wide safety veto — no overlap required)
         │              • During active Walk-Test: pre-filtered standing PERSON boxes (bh/bw >= 1.30,
-        │                unclipped, ignoring horizontal barrel artifacts) feed SiteCalibrationManager
-        │              • During tracking: checks overlap against BOTH the active target box projected
-        │                into eff_capture_mono pose AND best_cand["box"]; aborts lock + commands T 0
+        │                unclipped) feed SiteCalibrationManager
+        │              • During scanning/tracking: ANY non-barrel person or vehicle anywhere in the
+        │                frame rejects all animal detections in that sweep (SCENE_VETO), clears
+        │                tentative confirmation, and immediately aborts any active lock + commands T 0
         │
         └──► Class 0 (Animal)
                   │
@@ -105,8 +113,9 @@ Raw MDv6 Boxes (Canonical 1280x720, tagged with eff_capture_mono)
                   │     • When uncalibrated on a new site (use_ground_range = False):
                   │         - Uses stadia_range_m directly & feeds passive ground-plane convergence
                   │
-                  ├─ 4. Zero-Overlap Safety Veto Gate
-                  │     • Rejected if box overlaps any padded person/vehicle veto box
+                  ├─ 4. Scene-Wide Safety Veto Gate
+                  │     • Rejected immediately (SCENE_VETO) if ANY person or vehicle is detected
+                  │       anywhere in the frame (also aborts active locks & passive calibration)
                   │
                   └─ 5. World-Space Confirmation & Nearest-Neighbor Lock (VisionMain)
                         • Confirmation streak gates in world mrad scaled by dt & calibrated TargetKinematics

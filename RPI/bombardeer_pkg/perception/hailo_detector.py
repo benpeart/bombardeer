@@ -328,7 +328,22 @@ class HailoWildlifeDetector(BaseTargetDetector):
             if (not self._active) or (eff_mono < self._min_valid_capture_mono):
                 continue
 
-            if dets:
+            veto_boxes = debug_info.get("veto_boxes", [])
+            if veto_boxes:
+                if dets:
+                    top_veto = max(veto_boxes, key=lambda v: float(v.get("score", 0.0)))
+                    veto_cls = top_veto.get("class", "VETO")
+                    veto_score = float(top_veto.get("score", 0.0))
+                    rejected = debug_info.setdefault("rejected_animals", [])
+                    for d in dets:
+                        pa, pp, pv = d.get("probs", (d["score"], 0.0, 0.0))
+                        rejected.append({
+                            "reason": f"SCENE_VETO:{veto_cls}({veto_score:.2f})",
+                            "box": d["box"],
+                            "probs": (pa, pp, pv),
+                        })
+                    dets = []
+            elif dets:
                 pan_at_cap, tilt_at_cap = self.state.get_turret_pos_at_time(eff_mono)
                 metric_optics, yard_top_mrad, roll_mrad, use_ground_range = (
                     self.state.site_calibration.get_ground_plane_params(self.cfg.optics, pan_at_cap)

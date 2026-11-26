@@ -31,7 +31,7 @@ bombardeer/
     │   ├── base.py                    # BaseTargetDetector abstract base class
     │   ├── aruco.py                   # 1280x720 ArUco calibration detector (CPU)
     │   ├── tiling.py                  # Horizon-anchored multi-tile & TRK-1:1 crop planner
-    │   ├── mdv6_decoder.py            # Vectorized YOLOv9 decoder & safety veto filter
+    │   ├── mdv6_decoder.py            # Vectorized YOLOv9 decoder, pre-NMS barrel mask & scene-wide veto
     │   ├── hailo_worker.py            # Spawned HailoNPUProcess worker loop
     │   └── hailo_detector.py          # HailoWildlifeDetector IPC, single-in-flight gating & supervisor
     └── web/
@@ -59,7 +59,7 @@ Inside that worker process, `VisionRuntime.start()` spawns the `HailoNPUProcess`
 |              • Daylight boot sweep & 5'9" walk-test orchestration                 |
 |              • 1 Hz fenced ISP Day/Dusk & HDR/Monochrome hysteresis evaluator     |
 |              • World-space tentative confirmation, nearest-neighbor locking,      |
-|                projected VETO_ACTIVE safety check & calibrated Kalman updates     |
+|                scene-wide VETO_ACTIVE safety abort & calibrated Kalman updates     |
 |              • Pre-roll ring buffer & systemd WATCHDOG=1 heartbeat (every 2.0 s)  |
 |                                                                                   |
 |  [Core 1]    HudEncoder Thread (up to 15 Hz, active only when web clients open)   |
@@ -124,7 +124,7 @@ All detections map into canonical `1280×720` coordinates ($c_x = 640$, $c_y = 3
 
 $$\Delta\theta_{\text{pan,parallax}} = \frac{-\text{OffsetX}}{D} \times 1000 \quad [\text{mrad}], \qquad \Delta\theta_{\text{tilt,parallax}} = \frac{\text{OffsetY}}{D} \times 1000 \quad [\text{mrad}]$$
 
-* `project_world_to_image_px()` provides the exact inverse projection—used to center `TRK-1:1` crops, align `VETO_ACTIVE` overlap boxes at `eff_capture_mono`, project `tentative_target` across `350 ms` scans, and keep the live HUD target box locked on the deer during turret slews.
+* `project_world_to_image_px()` provides the exact inverse projection—used to center `TRK-1:1` crops, project `tentative_target` across `350 ms` scans, and keep the live HUD target box locked on the deer during turret slews.
 * `compute_deer_head_ceiling_mrad()` computes the perspective-accurate elevation of a `6'0"` (`1.8288 m`) standing deer's head across both near (`min_valid_range_m`) and far (`far_ground_mrad`, fallback `max_engage_range_m`) yard edges via $\theta_{\text{head}}(Z) = s + \arctan((H_{\text{cam}} - H_{\text{deer}}) / Z)$, returning `(ceiling_mrad, far_head_mrad, near_head_mrad)`.
 
 ### 5.2 Deer-Kinematics Bounds (`TargetKinematics`)
@@ -159,7 +159,7 @@ $$\theta_{\text{lead,pan}} = v_{\text{pan}} \cdot \text{ToF}, \qquad \theta_{\te
 `SiteCalibrationManager` eliminates per-location edits to `config.yaml` using camera-only software calibration persisted in `site_calibration.json`:
 
 1. **Daylight Boot Sweep & Relocation Detection:** Compares a `16×9` normalized luma fingerprint of the home view on first daylight (`corr >= 0.65` skips sweep). On a new site, runs a 7-stop pan sweep (`-750` to `+750 mrad` at `tilt = 0`) using Lab color/luma ground-appearance segmentation combined with sky/texture cues to lock onto the pan-indexed far ground edge (`yard_top_profile`) and estimates camera roll (`roll_mrad`) from smooth vertical edges. If triggered in the dark, defers cleanly to `PENDING_DAYLIGHT` without holding motion ownership.
-2. **Exact Projective `5'9"` (`1.7526 m`) Walk-Test Fit:** Disarms the turret (`OFF`, `request_trigger(0)`, `clear_motion()`, `request_setpoint(cur_pan, 0)` so `_halt_pending` never drops the tilt-leveling command), pre-filters `veto_boxes` to standing `PERSON` detections (`bh/bw >= 1.30`, unclipped, `bh >= 30`) so horizontal barrel-tip artifacts are ignored, and solves `(camera_mount_height_m, ground_slope_mrad)` via 8-iteration Huber IRLS with zero small-angle approximation:
+2. **Exact Projective `5'9"` (`1.7526 m`) Walk-Test Fit:** Disarms the turret (`OFF`, `request_trigger(0)`, `clear_motion()`, `request_setpoint(cur_pan, 0)` so `_halt_pending` never drops the tilt-leveling command), consumes barrel-masked `veto_boxes` from `MDV6Decoder1280` (with an extra standing-person aspect filter `bh/bw >= 1.30`, unclipped, `bh >= 30`), and solves `(camera_mount_height_m, ground_slope_mrad)` via 8-iteration Huber IRLS with zero small-angle approximation:
    $$\frac{1}{Z_i} = \frac{\tan(\theta_{\text{feet}, i}) - \tan(\theta_{\text{head}, i})}{H_{\text{op}}}, \qquad \tan(\theta_{\text{feet}, i}) = \tan(s) + H_{\text{cam}} \cdot \frac{1}{Z_i}$$
 3. **Passive Stadia-to-Ground Convergence:** On an uncalibrated new site where no Walk-Test was run, `get_ground_plane_params()` returns `use_ground_range = False` (stadia-only ranging with far-ground-edge `ABOVE_HORIZON` active) while `observe_passive_wildlife()` accumulates wildlife `(1 / stadia_range_m, tan(dep_feet))` observations and promotes to `"PASSIVE_STADIA"` once `>= 15` points span `>= 5.0 m` (`rms <= 35 mrad`).
 4. **Web Console API & Visual Verification (`web/app.py`, `templates/index.html`):**
