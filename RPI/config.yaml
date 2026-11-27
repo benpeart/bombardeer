@@ -41,6 +41,7 @@ control:
   ballistic_acquire_mrad: 120.0
   ballistic_abort_mrad: 260.0
   velocity_deadband_mrad: 4.0
+  tilt_velocity_deadband_mrad: 10.0
   fire_deadband_mrad: 40.0
   calibrate_deadband_mrad: 15.0
   max_fire_slew_speed_mrad_s: 180.0
@@ -68,13 +69,12 @@ wildlife:
   iou_thresh: 0.45
   person_veto_thresh: 0.48
   vehicle_veto_thresh: 0.35
-  veto_padding_px: 24
   class_margin: 0.25
   max_animal_width_frac: 0.55
   max_animal_area_frac: 0.40
   max_animal_aspect_ratio: 1.65
   max_non_animal_prob: 0.02
-  max_animal_height_m: 1.50
+  max_animal_height_m: 1.85  # Western VA white-tailed buck head-up + antlers (~6'0" + margin)
   assumed_target_height_mm: 950.0
   max_npu_restarts: 5
 

@@ -108,7 +108,7 @@ Raw MDv6 Boxes (Canonical 1280x720, tagged with eff_capture_mono)
                   ├─ 3. Roll-Compensated Far Ground Edge & Ground-Plane Physical Gate
                   │     • Feet (y2) must not sit > horizon_feet_margin_720 above scanned far ground edge
                   │     • When metric height/slope calibrated (WALK_TEST or PASSIVE_STADIA):
-                  │         - If net depression >= 25 mrad: height must be <= max_animal_height_m
+                  │         - If net depression >= 25 mrad: height must be <= max_animal_height_m (default 1.85 m, Western VA whitetail buck)
                   │         - Fused range = 70% ground-plane + 30% stadia (clamped 3.0–75.0 m)
                   │     • When uncalibrated on a new site (use_ground_range = False):
                   │         - Uses stadia_range_m directly & feeds passive ground-plane convergence
@@ -117,8 +117,10 @@ Raw MDv6 Boxes (Canonical 1280x720, tagged with eff_capture_mono)
                   │     • Rejected immediately (SCENE_VETO) if ANY person or vehicle is detected
                   │       anywhere in the frame (also aborts active locks & passive calibration)
                   │
-                  └─ 5. World-Space Confirmation & Nearest-Neighbor Lock (VisionMain)
+                  └─ 5. World-Space Confirmation & Anisotropic Range-Gated Lock (VisionMain)
                         • Confirmation streak gates in world mrad scaled by dt & calibrated TargetKinematics
-                        • Locked tracking picks nearest candidate to (predicted, stationary) projections
+                        • Locked tracking picks nearest candidate inside an elliptical (dx/gx, dy/gy) gate
+                          (gx <= 220 px, gy in [45, 110] px, dt capped at 0.65 s) + radial range consistency
+                          (|ΔR| <= 6.0 * dt_eff + max(1.6, 0.15 * R)) to block multi-deer herd swaps
                         • Saves timestamp-matched ACQUIRE/VETO audit JPEG from npu_lores_history
 ```

@@ -8,10 +8,13 @@ import numpy as np
 
 from bombardeer_pkg.config import BallisticsConfig, CameraConfig, OpticsConfig
 
+# Western Virginia mature white-tailed buck head-up + antlers (~6'0" = 1.8288 m)
+DEFAULT_MAX_DEER_HEIGHT_M = 6.0 * 12.0 * 0.0254
+
 
 @dataclass(frozen=True)
 class TargetKinematics:
-    """Range- and optics-derived angular kinematic bounds for a live deer."""
+    """Range- and optics-derived angular kinematic bounds for a live white-tailed deer."""
 
     max_v_pan_mrad_s: float
     max_v_tilt_mrad_s: float
@@ -21,23 +24,32 @@ class TargetKinematics:
     meas_var_tilt: float
     max_step_margin_pan_mrad: float
     max_step_margin_tilt_mrad: float
+    max_radial_speed_m_s: float = 6.0
 
 
 def compute_target_kinematics(
     range_m: float,
     optics: OpticsConfig,
-    max_deer_speed_m_s: float = 10.0,
-    max_deer_accel_m_s2: float = 3.0,
-    max_vertical_speed_m_s: float = 1.0,
-    max_vertical_accel_m_s2: float = 0.6,
+    max_deer_speed_m_s: float = 12.0,
+    max_deer_accel_m_s2: float = 3.5,
+    max_radial_speed_m_s: float = 6.0,
+    max_vertical_speed_m_s: float = 0.6,
+    max_vertical_accel_m_s2: float = 0.5,
     bbox_jitter_pan_px: float = 3.0,
-    bbox_jitter_tilt_px: float = 4.0,
+    bbox_jitter_tilt_px: float = 4.5,
     hw_max_v_pan_mrad_s: float = 850.0,
-    hw_max_v_tilt_mrad_s: float = 450.0,
+    hw_max_v_tilt_mrad_s: float = 180.0,
 ) -> TargetKinematics:
     """
     Derives world-space angular velocity/acceleration limits and measurement
-    variances from live deer speeds, target range, and camera optics.
+    variances from live white-tailed deer speeds, target range, and camera optics.
+
+    Physical basis (Western Virginia white-tailed deer):
+      - Lateral sprint up to ~12 m/s (~27 mph) projected at range r (capped at HW 850 mrad/s).
+      - Radial charge/retreat up to ~6 m/s gives ground-plane tilt rate
+        omega_tilt = 1000 * H * v_r / (r^2 + H^2), plus modest vertical bounding.
+      - Sustained tilt velocity is capped at 180 mrad/s so vertical box jitter or
+        transient leaps can never inject runaway upward/downward coasting.
     """
     r = float(np.clip(range_m, max(1.0, optics.min_valid_range_m), optics.max_valid_range_m))
     h = max(0.5, float(optics.camera_mount_height_m))
@@ -47,18 +59,19 @@ def compute_target_kinematics(
     max_v_pan = min(hw_max_v_pan_mrad_s, (1000.0 * max_deer_speed_m_s) / r)
     accel_pan = float(np.clip((1000.0 * max_deer_accel_m_s2) / r, 25.0, 400.0))
 
-    # Tilt: ground-plane radial motion (H*v/r^2) + modest vertical bounding (vz/r)
-    ground_v_tilt = (1000.0 * h * max_deer_speed_m_s) / (r * r)
+    # Tilt: exact ground-plane radial motion H*v_r/(r^2 + H^2) + modest vertical bounding
+    r2_h2 = (r * r) + (h * h)
+    ground_v_tilt = (1000.0 * h * max_radial_speed_m_s) / r2_h2
     bound_v_tilt = (1000.0 * max_vertical_speed_m_s) / r
     max_v_tilt = min(hw_max_v_tilt_mrad_s, ground_v_tilt + bound_v_tilt)
 
-    ground_a_tilt = (1000.0 * h * max_deer_accel_m_s2) / (r * r)
+    ground_a_tilt = (1000.0 * h * min(max_deer_accel_m_s2, 2.5)) / r2_h2
     bound_a_tilt = (1000.0 * max_vertical_accel_m_s2) / r
-    accel_tilt = float(np.clip(ground_a_tilt + bound_a_tilt, 15.0, 120.0))
+    accel_tilt = float(np.clip(ground_a_tilt + bound_a_tilt, 12.0, 80.0))
 
     # Measurement variance from pixel box-center uncertainty and lens mrad/px
     sigma_pan = max(1.5, bbox_jitter_pan_px * mrad_per_px)
-    sigma_tilt = max(2.0, bbox_jitter_tilt_px * mrad_per_px)
+    sigma_tilt = max(2.5, bbox_jitter_tilt_px * mrad_per_px)
 
     return TargetKinematics(
         max_v_pan_mrad_s=max_v_pan,
@@ -69,6 +82,7 @@ def compute_target_kinematics(
         meas_var_tilt=sigma_tilt * sigma_tilt,
         max_step_margin_pan_mrad=3.0 * sigma_pan,
         max_step_margin_tilt_mrad=3.0 * sigma_tilt,
+        max_radial_speed_m_s=float(max_radial_speed_m_s),
     )
 
 
@@ -143,7 +157,6 @@ def compute_drag_ballistics(
     tgt_v_pan: float,
     tgt_v_tilt: float,
     bal: BallisticsConfig,
-    optics: OpticsConfig,
 ) -> Tuple[float, float, float, float]:
     """
     Computes (tof_sec, drop_mrad, lead_pan_mrad, lead_tilt_mrad) under exponential drag.
@@ -222,9 +235,6 @@ def evaluate_ground_plane(
     return True, None, stadia_range_m
 
 
-DEFAULT_MAX_DEER_HEIGHT_M = 6.0 * 12.0 * 0.0254  # 6'0" (1.8288 m): tall buck head-up + antlers
-
-
 def compute_deer_head_ceiling_mrad(
     optics: OpticsConfig,
     max_deer_height_m: float = DEFAULT_MAX_DEER_HEIGHT_M,
@@ -232,19 +242,15 @@ def compute_deer_head_ceiling_mrad(
     terrain_margin_mrad: float = 14.0,
 ) -> Tuple[float, float, float]:
     """
-    Computes the highest elevation angle (in mrad, lower/more-negative = higher in image)
-    that a standing deer of physical height max_deer_height_m can reach anywhere between
-    optics.min_valid_range_m (closest) and the far yard edge.
+    Computes the highest elevation angle (in depression-positive mrad; lower / more
+    negative = higher in image) that a standing deer of physical height
+    max_deer_height_m can reach anywhere between optics.min_valid_range_m and the
+    far yard edge.
 
     Pinhole perspective law on a ground plane with slope s and camera height H_cam:
       dep_head(Z) = s + atan((H_cam - H_deer) / Z)
 
-    - If H_cam < H_deer (camera lower than deer's head), a NEAR deer rises highest above
-      the metric horizon (at Z = min_valid_range_m), while a FAR deer barely clears it.
-    - If H_cam >= H_deer (elevated mount higher than a deer's head), a deer's head
-      stays BELOW the metric horizon at ALL ranges — closest at the far edge Z_far.
-
-    Returns (ceiling_mrad, far_head_mrad, near_head_mrad).
+    Returns (ceiling_mrad, far_head_mrad, near_head_mrad) in depression-positive mrad.
     """
     h_cam = max(0.35, float(optics.camera_mount_height_m))
     h_deer = max(0.50, float(max_deer_height_m))
@@ -252,7 +258,6 @@ def compute_deer_head_ceiling_mrad(
     r_min = max(2.0, float(optics.min_valid_range_m))
     r_max = max(r_min + 1.0, float(optics.max_valid_range_m))
 
-    # Estimate far ground-edge range from far_ground_mrad (fallback: max_engage_range_m)
     r_far = float(np.clip(optics.max_engage_range_m, r_min, r_max))
     if far_ground_mrad is not None:
         net_far_dep_mrad = float(far_ground_mrad) - s_mrad
@@ -264,10 +269,45 @@ def compute_deer_head_ceiling_mrad(
     near_head_mrad = s_mrad + math.atan2(dh, r_min) * 1000.0
     far_head_mrad = s_mrad + math.atan2(dh, r_far) * 1000.0
     if far_ground_mrad is not None:
-        # Also ensure uphill far ground edges place the deer's head above the ground edge
         far_head_from_edge = float(far_ground_mrad) - (math.atan2(h_deer, r_far) * 1000.0)
         far_head_mrad = min(far_head_mrad, far_head_from_edge)
 
-    # Most-negative (highest in image) across [r_min, r_far], plus small terrain/bounding margin
     ceiling_mrad = min(near_head_mrad, far_head_mrad) - float(terrain_margin_mrad)
     return float(ceiling_mrad), float(far_head_mrad), float(near_head_mrad)
+
+
+def compute_target_elevation_ceiling_mrad(
+    range_m: float,
+    optics: OpticsConfig,
+    max_deer_height_m: float = DEFAULT_MAX_DEER_HEIGHT_M,
+    far_ground_mrad: Optional[float] = None,
+    margin_mrad: float = 25.0,
+) -> float:
+    """
+    Computes the maximum physically valid target elevation angle in turret
+    world_tilt coordinates (+mrad = UP, -mrad = DOWN) for a deer at range_m.
+
+    Negates depression-positive ground-plane geometry so motion_servo.py can
+    clamp target base_tilt directly (before adding ballistic drop + trim),
+    preventing upward slews into overhanging eaves or sky on both elevated
+    (~2.3 m) and sawhorse (~1.0 m) mounts.
+    """
+    r_min = max(2.0, float(optics.min_valid_range_m))
+    r_max = max(r_min + 1.0, float(optics.max_valid_range_m))
+    r = float(np.clip(range_m, r_min, r_max))
+    h_cam = max(0.35, float(optics.camera_mount_height_m))
+    h_deer = max(0.50, float(max_deer_height_m))
+    s_mrad = float(optics.ground_slope_mrad)
+
+    dep_head_mrad = s_mrad + math.atan2(h_cam - h_deer, r) * 1000.0
+    if far_ground_mrad is not None:
+        r_far = float(np.clip(optics.max_engage_range_m, r_min, r_max))
+        net_far_dep_mrad = float(far_ground_mrad) - s_mrad
+        if net_far_dep_mrad >= 15.0:
+            r_est = h_cam / math.sin(min(1.2, net_far_dep_mrad / 1000.0))
+            r_far = float(np.clip(r_est, r_min, r_max))
+        dep_from_edge = float(far_ground_mrad) - (math.atan2(h_deer, r_far) * 1000.0)
+        dep_head_mrad = min(dep_head_mrad, dep_from_edge)
+
+    # Convert depression-positive angle to elevation-positive turret tilt + margin
+    return float(-dep_head_mrad + float(margin_mrad))

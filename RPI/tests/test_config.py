@@ -14,6 +14,9 @@ def test_load_default_config_disables_armed(tmp_path):
     assert cfg.control.coast_decay_onset_sec == 0.650
     assert cfg.control.coast_max_horizon_sec == 1.800
     assert cfg.optics.max_engage_range_m == 40.0
+    assert cfg.control.tilt_velocity_deadband_mrad == 10.0
+    assert cfg.wildlife.max_animal_height_m == 1.85
+    assert not hasattr(cfg.wildlife, "veto_padding_px")
     assert cfg.web.auth_pass == cfg.web.default_pass
     assert cfg.web.armed_allowed is False
 

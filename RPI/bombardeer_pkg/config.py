@@ -88,6 +88,7 @@ class ControlConfig:
     ballistic_acquire_mrad: float = 120.0
     ballistic_abort_mrad: float = 260.0
     velocity_deadband_mrad: float = 4.0
+    tilt_velocity_deadband_mrad: float = 10.0
     fire_deadband_mrad: float = 40.0
     calibrate_deadband_mrad: float = 15.0
     max_fire_slew_speed_mrad_s: float = 180.0
@@ -121,13 +122,12 @@ class WildlifeConfig:
     iou_thresh: float = 0.45
     person_veto_thresh: float = 0.20
     vehicle_veto_thresh: float = 0.20
-    veto_padding_px: int = 24
     class_margin: float = 0.25
     max_animal_width_frac: float = 0.55
     max_animal_area_frac: float = 0.40
     max_animal_aspect_ratio: float = 1.65
     max_non_animal_prob: float = 0.02
-    max_animal_height_m: float = 1.50
+    max_animal_height_m: float = 1.85
     assumed_target_height_mm: float = 950.0
     seam_clip_margin_px: float = 6.0
     max_npu_restarts: int = 5

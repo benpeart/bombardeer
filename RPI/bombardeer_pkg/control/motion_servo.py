@@ -5,7 +5,10 @@ import math
 import time
 
 from bombardeer_pkg.config import BombardeerConfig
-from bombardeer_pkg.control.ballistics import compute_drag_ballistics
+from bombardeer_pkg.control.ballistics import (
+    compute_drag_ballistics,
+    compute_target_elevation_ceiling_mrad,
+)
 from bombardeer_pkg.state import SystemState
 from bombardeer_pkg.utils import set_os_thread_name
 
@@ -40,6 +43,7 @@ def motion_servoing_worker(cfg: BombardeerConfig, state: SystemState):
     last_setpoint_mono = 0.0
     last_debug_log_mono = 0.0
     is_actively_tracking_velocity = False
+    tilt_axis_moving = False
     last_v_pan = 0
     last_v_tilt = 0
     last_sent_p_pan = 99999
@@ -70,6 +74,7 @@ def motion_servoing_worker(cfg: BombardeerConfig, state: SystemState):
             if is_actively_tracking_velocity:
                 bus.request_velocity(0, 0)
                 is_actively_tracking_velocity = False
+            tilt_axis_moving = False
             last_v_pan = 0
             last_v_tilt = 0
             last_fire_gate_ok_mono = -1e9
@@ -85,6 +90,7 @@ def motion_servoing_worker(cfg: BombardeerConfig, state: SystemState):
             if last_mode_seen != "OFF":
                 bus.request_halt()
                 is_actively_tracking_velocity = False
+                tilt_axis_moving = False
                 last_v_pan = 0
                 last_v_tilt = 0
                 last_sent_p_pan = 99999
@@ -106,10 +112,12 @@ def motion_servoing_worker(cfg: BombardeerConfig, state: SystemState):
         last_mode_seen = mode
 
         if serial_ok:
+            policy = state.get_tracking_policy(mode)
             npu_lat_sec = state.get_npu_latency_sec()
             lat_allowance_sec = max(0.160, npu_lat_sec + 0.080)
             effective_coast_horizon = max(ctrl.coast_max_horizon_sec, npu_lat_sec + 1.0)
             effective_decay_onset = max(ctrl.coast_decay_onset_sec, npu_lat_sec + 0.25)
+            pan_coast_hold = policy.pan_coast_hold_sec
 
             target_active = False
             capture_age = 1e9
@@ -124,25 +132,51 @@ def motion_servoing_worker(cfg: BombardeerConfig, state: SystemState):
                 last_target_mono = now
                 is_homing = False
 
-                predicted_state = kf.predict_state(now)
+                predicted_state = kf.predict_state(now, pan_hold_sec=pan_coast_hold)
                 if predicted_state is not None:
                     base_pan, base_tilt, tgt_v_pan, tgt_v_tilt = predicted_state
                     current_range_m = target_data.get("range_m", optics.default_fallback_range_m)
 
                     tof_sec, drop_mrad, lead_pan_mrad, lead_tilt_mrad = compute_drag_ballistics(
-                        current_range_m, current_tilt, tgt_v_pan, tgt_v_tilt, bal, optics
+                        current_range_m, current_tilt, tgt_v_pan, tgt_v_tilt, bal
                     )
 
+                    # Policy-driven physical target elevation ceiling
+                    aim_base_tilt = base_tilt + lead_tilt_mrad
+                    ceil_clamped = False
+                    if policy.enforce_elevation_ceiling:
+                        metric_optics, yard_top_mrad, _, use_ground_range = (
+                            state.site_calibration.get_ground_plane_params(optics, base_pan)
+                        )
+                        if use_ground_range or yard_top_mrad is not None:
+                            max_target_tilt = compute_target_elevation_ceiling_mrad(
+                                current_range_m,
+                                metric_optics,
+                                max_deer_height_m=policy.max_target_height_m,
+                                far_ground_mrad=yard_top_mrad,
+                            )
+                            if aim_base_tilt > max_target_tilt:
+                                aim_base_tilt = max_target_tilt
+                                ceil_clamped = True
+
                     world_pan = int(round(base_pan + lead_pan_mrad))
-                    world_tilt = int(round(base_tilt + lead_tilt_mrad + drop_mrad + optics.tilt_calibration_trim_mrad))
+                    world_tilt = int(round(aim_base_tilt + drop_mrad + optics.tilt_calibration_trim_mrad))
 
                     pan_clamped = (world_pan < ctrl.pan_min_mrad or world_pan > ctrl.pan_max_mrad)
-                    tilt_clamped = (world_tilt < ctrl.tilt_min_mrad or world_tilt > ctrl.tilt_max_mrad)
+                    hw_tilt_clamped = (world_tilt < ctrl.tilt_min_mrad or world_tilt > ctrl.tilt_max_mrad)
                     world_pan = max(ctrl.pan_min_mrad, min(ctrl.pan_max_mrad, world_pan))
                     world_tilt = max(ctrl.tilt_min_mrad, min(ctrl.tilt_max_mrad, world_tilt))
 
-                    if pan_clamped or tilt_clamped:
-                        kf.clamp_position(pan_clamped, world_pan, tilt_clamped, world_tilt)
+                    if pan_clamped or hw_tilt_clamped or ceil_clamped:
+                        clamp_tilt_state = aim_base_tilt if ceil_clamped else (
+                            world_tilt - drop_mrad - optics.tilt_calibration_trim_mrad
+                        )
+                        kf.clamp_position(
+                            pan_clamped,
+                            world_pan,
+                            hw_tilt_clamped or ceil_clamped,
+                            clamp_tilt_state,
+                        )
 
                     realtime_err_pan = world_pan - current_pan
                     realtime_err_tilt = world_tilt - current_tilt
@@ -198,14 +232,19 @@ def motion_servoing_worker(cfg: BombardeerConfig, state: SystemState):
                         if radial_error_mrad > ctrl.ballistic_abort_mrad:
                             use_ballistic = True
                             is_actively_tracking_velocity = False
+                            tilt_axis_moving = False
                         else:
                             use_ballistic = False
 
                     time_since_tx = now - last_setpoint_mono
 
                     if use_ballistic:
+                        # Hold converged ballistic wait position during extended coasting instead of re-slewing blindly
+                        coasting_hold = (capture_age > (effective_decay_onset + 0.35)) and (last_sent_p_pan != 99999)
                         goal_delta = math.hypot(world_pan - last_sent_p_pan, world_tilt - last_sent_p_tilt)
-                        if (time_since_tx >= 0.400 and goal_delta > 60.0) or last_v_pan != 0 or last_v_tilt != 0:
+                        if (not coasting_hold) and (
+                            (time_since_tx >= 0.400 and goal_delta > 60.0) or last_v_pan != 0 or last_v_tilt != 0
+                        ):
                             last_setpoint_mono = now
                             last_sent_p_pan = world_pan
                             last_sent_p_tilt = world_tilt
@@ -230,16 +269,25 @@ def motion_servoing_worker(cfg: BombardeerConfig, state: SystemState):
                                 kv_large=0.85,
                                 latency_scale=latency_scale,
                             )
+
+                            # Policy-driven tilt deadband hysteresis (eliminates grazing head-bob chatter)
+                            active_tilt_db = (
+                                policy.tilt_exit_deadband_mrad
+                                if tilt_axis_moving
+                                else policy.tilt_enter_deadband_mrad
+                            )
+
                             raw_v_tilt = _compute_axis_velocity(
                                 realtime_err_tilt,
                                 tgt_v_tilt,
-                                ctrl.velocity_deadband_mrad,
+                                active_tilt_db,
                                 kp_small=1.05,
                                 kp_large=1.45,
                                 kv_small=0.40,
                                 kv_large=0.55,
                                 latency_scale=latency_scale,
                             )
+                            tilt_axis_moving = (raw_v_tilt != 0)
 
                             if capture_age > effective_decay_onset:
                                 decay_factor = math.exp(
@@ -279,6 +327,7 @@ def motion_servoing_worker(cfg: BombardeerConfig, state: SystemState):
                     if is_actively_tracking_velocity:
                         bus.request_velocity(0, 0)
                         is_actively_tracking_velocity = False
+                    tilt_axis_moving = False
                     last_v_pan = 0
                     last_v_tilt = 0
                     last_sent_p_pan = 99999

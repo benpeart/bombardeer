@@ -127,22 +127,23 @@ $$\Delta\theta_{\text{pan,parallax}} = \frac{-\text{OffsetX}}{D} \times 1000 \qu
 * `project_world_to_image_px()` provides the exact inverse projection—used to center `TRK-1:1` crops, project `tentative_target` across `350 ms` scans, and keep the live HUD target box locked on the deer during turret slews.
 * `compute_deer_head_ceiling_mrad()` computes the perspective-accurate elevation of a `6'0"` (`1.8288 m`) standing deer's head across both near (`min_valid_range_m`) and far (`far_ground_mrad`, fallback `max_engage_range_m`) yard edges via $\theta_{\text{head}}(Z) = s + \arctan((H_{\text{cam}} - H_{\text{deer}}) / Z)$, returning `(ceiling_mrad, far_head_mrad, near_head_mrad)`.
 
-### 5.2 Deer-Kinematics Bounds (`TargetKinematics`)
-`compute_target_kinematics(range_m, optics)` (called with site-calibrated `metric_optics` from `SiteCalibrationManager`) derives physically grounded angular bounds from whitetail deer speeds ($v_{\max} = 10\text{ m/s}$, $a_{\max} = 3.0\text{ m/s}^2$, vertical bounding allowance $v_z = 1.0\text{ m/s}$, $a_z = 0.6\text{ m/s}^2$), calibrated mount height $H$, range $R$, and lens `mrad_per_pixel`:
+### 5.2 Western Virginia White-Tailed Deer Kinematics (`TargetKinematics`)
+`compute_target_kinematics(range_m, optics)` (called with site-calibrated `metric_optics` from `SiteCalibrationManager`) derives physically grounded angular bounds from real white-tailed deer gaits (lateral sprint $v_{\max} = 12\text{ m/s}$ / `~27 mph`, radial charge/retreat $v_r = 6.0\text{ m/s}$, lateral acceleration $a_{\max} = 3.5\text{ m/s}^2$, vertical bounding allowance $v_z = 0.6\text{ m/s}$, $a_z = 0.5\text{ m/s}^2$, mature buck head-up height `1.85 m`), calibrated mount height $H$, range $R$, and lens `mrad_per_pixel`:
 
-$$\omega_{\text{pan,max}}(R) = \min\!\left(850,\ \frac{1000 \cdot v_{\max}}{R}\right), \qquad \omega_{\text{tilt,max}}(R) = \min\!\left(450,\ \frac{1000 \cdot H \cdot v_{\max}}{R^2} + \frac{1000 \cdot v_z}{R}\right)$$
+$$\omega_{\text{pan,max}}(R) = \min\!\left(850,\ \frac{1000 \cdot v_{\max}}{R}\right), \qquad \omega_{\text{tilt,max}}(R) = \min\!\left(180,\ \frac{1000 \cdot H \cdot v_r}{R^2 + H^2} + \frac{1000 \cdot v_z}{R}\right)$$
 
-Measurement variances reflect real night-IR bounding-box jitter ($\sigma_{\text{pan}} = 3.0\text{ px} \cdot \text{mrad/px}$, $\sigma_{\text{tilt}} = 4.0\text{ px} \cdot \text{mrad/px}$, $R_{\text{meas}} = \sigma^2$), cutting vertical velocity gain `K_vel` by 4×–9× on close-range stationary deer compared to an isotropic `R = 10` filter.
+Measurement variances reflect real night-IR and grazing bounding-box jitter ($\sigma_{\text{pan}} = 3.0\text{ px} \cdot \text{mrad/px}$, $\sigma_{\text{tilt}} = 4.5\text{ px} \cdot \text{mrad/px}$, $R_{\text{meas}} = \sigma^2$), preventing grazing head-bobbing (`±8–11 mrad`) from exciting spurious tilt velocity.
 
-### 5.3 Encapsulated 4-State Kalman Filter (`kalman.py`)
+### 5.3 Encapsulated 4-State Kalman Filter with Damped Coasting (`kalman.py`)
 `TargetKalmanFilter` tracks `[pan_mrad, tilt_mrad, v_pan_mrad_s, v_tilt_mrad_s]` in world coordinates with all state access and clamping atomic under `self._lock`:
-* **Anisotropic `Q(dt)` & `R`:** `update_measurement(..., kinematics=kin)` applies separate pan/tilt acceleration process noise and measurement variances strictly using `capture_mono` (`dt` clamped to `[0.001, 1.8] s`, ignoring out-of-order frames).
-* **Physical-Step Innovation Gate:** Measurement jumps exceeding $\omega_{\max}(R)\cdot dt + 3\sigma_\theta$ are clamped before `kf.correct()`, rejecting non-physical box glitches.
-* **Atomic Velocity & Position Clamping:** `statePost[2, 0]` and `statePost[3, 0]` are clamped to `±max_v_pan` and `±max_v_tilt` inside `update_measurement()`, while `clamp_position()` zeroes boundary velocity when software travel limits are hit.
-* **Non-Mutating Read-Only Queries:** `predict_state(query_mono)` extrapolates up to `2.5 s` without mutating `statePost` or `errorCovPost`, and `get_last_state()` returns the un-extrapolated position and capture timestamp for dual-reference target association.
+* **Consistent Hold-Then-Decay Velocity Transition:** Both `update_measurement()` and `predict_state()` use the exact analytical hold-then-exponential-decay model ($v(t) = v_0$ for $\Delta t \le t_{\text{hold}}$, then $v(t) = v_0 e^{-\lambda (\Delta t - t_{\text{hold}})}$ and $\Delta x = v_0 (t_{\text{hold}} + (1 - e^{-\lambda u}) / \lambda)$). Pan holds through normal NPU latency (`pan_hold_sec = max(0.35, npu_lat + 0.08)`, $\lambda_{\text{pan}} = 3.5\text{ s}^{-1}$) while tilt decays rapidly (`0.12 s` hold, $\lambda_{\text{tilt}} = 6.5\text{ s}^{-1}$)—so dropouts smoothly decelerate to a bounded wait position instead of linearly coasting into mechanical limits or slingshotting on re-acquisition.
+* **Anisotropic Damped `Q(dt)` & `R`:** `update_measurement(..., kinematics=kin)` applies separate pan/tilt acceleration process noise and measurement variances strictly using `capture_mono` (`dt` clamped to `[0.001, 1.8] s`, ignoring out-of-order frames), scaling `Q`'s velocity cross-covariance by the exponential velocity decay factor so post-dropout re-acquisitions update position without injecting a spurious velocity slingshot.
+* **Capped-`dt` Physical-Step Innovation Gate:** Measurement jumps exceeding $\omega_{\max}(R)\cdot \min(dt, 0.65\text{ s}) + 3\sigma_\theta$ are clamped before `kf.correct()` and dampen post-update velocity (`0.25×` pan, `0` tilt), rejecting cross-yard deer swaps and outlier spikes.
+* **Atomic Velocity & Position Clamping:** `statePost[2, 0]` and `statePost[3, 0]` are clamped to `±max_v_pan` and `±max_v_tilt` (`<= 180 mrad/s`) inside `update_measurement()`, while `clamp_position()` zeroes boundary velocity when software travel or elevation-ceiling limits are hit.
+* **Non-Mutating Read-Only Queries:** `predict_state(query_mono, pan_hold_sec=...)` returns `(pan, tilt, decayed_v_pan, decayed_v_tilt)` up to `2.5 s` without mutating `statePost` or `errorCovPost`, and `get_last_state()` returns the un-extrapolated position and capture timestamp for dual-reference target association.
 
-### 5.4 Nearest-Neighbor Target Locking & World-Space Confirmation
-* **Locked Target Association:** Inside `if is_new_batch:`, `VisionMain` projects both the extrapolated Kalman state (`ref_xy`) and the un-extrapolated last position (`last_xy`) into `eff_capture_mono` pixel space and picks the closest detection within a kinematic pixel gate (`min(280 px, kin_gate_px)`). This prevents target bouncing between multiple deer while still re-acquiring a deer that stops suddenly after a `350–700 ms` scan gap.
+### 5.4 Anisotropic & Range-Consistent Target Locking (`vision_pipeline.py`)
+* **Locked Target Association:** Inside `if is_new_batch:`, `VisionMain` evaluates calibration ownership and scene-wide safety vetoes first, then projects both the damped Kalman prediction (`ref_xy`) and the un-extrapolated last position (`last_xy`) into `eff_capture_mono` pixel space. In `WILDLIFE` mode, `_select_target_candidate()` enforces an anisotropic elliptical pixel gate (`gx <= 220 px`, tighter vertical `gy` in `[45, 110] px` using `dt_eff = min(dt_gap, 0.65 s)`) plus a radial range-consistency gate (`|ΔR| <= 6.0 * dt_eff + max(1.6, 0.15 * R)`), preventing multi-deer herd swaps across different ranges while still following radial charges and sudden stops. `ARUCO` mode retains symmetric circular gating.
 * **World-Space Confirmation:** `tentative_target` stores world `(world_pan, world_tilt)` and `capture_mono` so confirmation streaks are unaffected by homing or panning slews across a `350 ms` scan gap.
 
 ### 5.5 Aerodynamic Drag Ballistics
@@ -177,15 +178,16 @@ Every `20 ms` (`motion_loop_interval_sec = 0.020`), `motion_servoing_worker()` e
    * `npu_lat_sec = state.get_npu_latency_sec()`.
    * `effective_decay_onset = max(coast_decay_onset_sec, npu_lat_sec + 0.25)` and `effective_coast_horizon = max(coast_max_horizon_sec, npu_lat_sec + 1.0)`.
    * Beyond `effective_decay_onset`, commanded velocities decay exponentially ($e^{-\lambda \cdot (\text{capture\_age} - t_{\text{onset}})}$); beyond `effective_coast_horizon`, the primary target clears and the Kalman filter resets.
-3. **Dual-Mode Hysteresis (`P` vs. `V`) & Asymmetric Latency-Scaled Gains:**
-   * **Mode 1 — Ballistic Setpoint (`P <pan> <tilt>`):** Engages when radial error exceeds `ballistic_acquire_mrad` (`120 mrad`), or aborts continuous pursuit if error exceeds `ballistic_abort_mrad` (`260 mrad`).
-   * **Mode 2 — Continuous Velocity Pursuit (`V <pan_s> <tilt_s>`):** Throttled to `<= 25 Hz` (`setpoint_min_interval_sec = 0.040`) with `latency_scale = max(0.65, min(1.0, 1.0 - 1.5 * max(0.0, npu_lat_sec - 0.160)))` to preserve phase margin during `350 ms` `SCAN-12MP` cycles:
-     * **Pan:** `kp = 1.30` (`<= 25 mrad`) / `2.00` (`> 25 mrad`), `kv = 0.65` / `0.85`, clamped to **`±850 mrad/s`**.
-     * **Tilt:** `kp = 1.05` (`<= 25 mrad`) / `1.45` (`> 25 mrad`), `kv = 0.40` / `0.55`, clamped to **`±300 mrad/s`**.
-4. **Latency-Aware Slew-Gated Firing Interlock (`T 1`):** Trigger engagement requires **all** of:
+3. **Range-Specific Site-Calibrated Elevation Ceiling (`WILDLIFE` Only):** Before adding ballistic drop and trim, `motion_servo.py` clamps target `base_tilt + lead_tilt` against `compute_target_elevation_ceiling_mrad(current_range_m, metric_optics, max_deer_height_m=cfg.wildlife.max_animal_height_m, far_ground_mrad=yard_top_mrad)` (elevation-positive turret coordinates) and zeroes upward Kalman velocity via `kf.clamp_position()` if clamped—preventing upward slews into eaves or sky on both elevated (`~2.3 m`) and sawhorse (`~1.0 m`) mounts while leaving `ARUCO` unconstrained.
+4. **Dual-Mode Hysteresis (`P` vs. `V`), Ballistic Coast Guard & Tilt Deadband Hysteresis:**
+   * **Mode 1 — Ballistic Setpoint (`P <pan> <tilt>`):** Engages when radial error exceeds `ballistic_acquire_mrad` (`120 mrad`), or aborts continuous pursuit if error exceeds `ballistic_abort_mrad` (`260 mrad`). During extended dropouts (`capture_age > effective_decay_onset + 0.35`), holds the converged wait setpoint instead of issuing repeated blind slews.
+   * **Mode 2 — Continuous Velocity Pursuit (`V <pan_s> <tilt_s>`):** Throttled to `<= 25 Hz` (`setpoint_min_interval_sec = 0.040`) with `latency_scale = max(0.65, min(1.0, 1.0 - 1.5 * max(0.0, npu_lat_sec - 0.160)))`:
+     * **Pan (`4.0 mrad` deadband):** `kp = 1.30` (`<= 25 mrad`) / `2.00` (`> 25 mrad`), `kv = 0.65` / `0.85`, clamped to **`±850 mrad/s`**.
+     * **Tilt (`10.0 mrad` enter / `4.0 mrad` exit hysteresis in `WILDLIFE` `ON`/`ARMED`; `4.0 mrad` in `ARUCO`/`CALIBRATE`):** `kp = 1.05` (`<= 25 mrad`) / `1.45` (`> 25 mrad`), `kv = 0.40` / `0.55`, clamped to **`±300 mrad/s`**, eliminating vertical chatter during stationary grazing.
+5. **Latency-Aware Slew-Gated Firing Interlock (`T 1`):** Trigger engagement requires **all** of:
    * Mode is `ARMED` (`cfg.web.armed_allowed == True`) or `CALIBRATE` (`primed == True`).
    * Serial link connected and target range within `[min_valid_range_m, max_engage_range_m]`.
    * `capture_age <= fire_data_freshness_sec + max(0.160, npu_lat_sec + 0.080)` **and** arrival gap `time_since_seen <= max(fire_data_freshness_sec, npu_lat_sec + 0.120)`.
    * Radial aim error `<= fire_deadband_mrad` (or `calibrate_deadband_mrad` in `CALIBRATE`).
    * Total barrel slew speed `< max_fire_slew_speed_mrad_s`.
-5. **Idle Auto-Home:** After `home_timeout_sec` with no active target, commands `P 0 0` (re-issuing every `2.0 s` if stopped off-home).
+6. **Idle Auto-Home:** After `home_timeout_sec` with no active target, commands `P 0 0` (re-issuing every `2.0 s` if stopped off-home).

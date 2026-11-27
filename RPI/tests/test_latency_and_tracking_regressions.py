@@ -249,7 +249,7 @@ def test_motion_servo_fire_gate_supports_350ms_scan_and_blocks_stale():
     """
     cfg = load_config(env={})
     cfg.control.motion_loop_interval_sec = 0.005
-    _, drop_mrad, _, _ = compute_drag_ballistics(15.0, -50.0, 0.0, 0.0, cfg.ballistics, cfg.optics)
+    _, drop_mrad, _, _ = compute_drag_ballistics(15.0, -50.0, 0.0, 0.0, cfg.ballistics)
 
     # --- Case 1: Fresh 345ms SCAN-12MP detection (capture_age = 0.45s, arrival age = 0.10s) ---
     state = SystemState(cfg)
@@ -447,3 +447,174 @@ def test_reconstruct_box_at_center_preserves_size_and_vertical_aim_offset():
     assert shifted == [260.0, 364.0, 340.0, 424.0]
     assert (shifted[2] - shifted[0]) == 80.0
     assert (shifted[3] - shifted[1]) == 60.0
+
+
+def test_motion_servo_grazing_head_bob_eliminates_tilt_chatter():
+    """
+    Reproduces 06:43:06-11: stationary grazing deer at 14.2m with +-7-9 mrad vertical
+    error oscillations. In WILDLIFE ON mode, tilt hysteresis deadband (10 mrad) must
+    keep tilt velocity command at 0 (no -92 <-> -99 bounce).
+    """
+    cfg = load_config(env={})
+    cfg.control.motion_loop_interval_sec = 0.005
+    cfg.control.setpoint_min_interval_sec = 0.005
+    _, drop_mrad, _, _ = compute_drag_ballistics(14.2, -95.0, 0.0, 0.0, cfg.ballistics)
+    base_tilt_target = -95.0 - drop_mrad - cfg.optics.tilt_calibration_trim_mrad
+
+    state = SystemState(cfg)
+    vel_events = []
+    orig_req_vel = state.command_bus.request_velocity
+
+    def _spy_vel(pan_s, tilt_s):
+        vel_events.append((pan_s, tilt_s))
+        orig_req_vel(pan_s, tilt_s)
+
+    state.command_bus.request_velocity = _spy_vel
+
+    now = time.monotonic()
+    state.update_health(serial_connected=True, npu_latency_ms=110.0)
+    state.update_turret_telemetry(-195, -95, False, now)
+    state.set_turret_mode("ON")
+    state.target_filter.update_measurement(-195.0, base_tilt_target + 7.0, now - 0.05)
+    state.set_primary_target({
+        "center": (640, 410),
+        "box": [610, 385, 670, 435],
+        "score": 0.85,
+        "area": 3000,
+        "range_m": 14.2,
+        "capture_mono": now - 0.05,
+        "last_seen_mono": now - 0.01,
+    })
+
+    t = threading.Thread(target=motion_servoing_worker, args=(cfg, state), daemon=True)
+    t.start()
+    time.sleep(0.05)
+    # Swing tilt error to -8 mrad (other side of deadband)
+    now2 = time.monotonic()
+    state.target_filter.update_measurement(-195.0, base_tilt_target - 8.0, now2 - 0.02)
+    time.sleep(0.05)
+    state.shutdown_event.set()
+    t.join(timeout=1.0)
+
+    assert vel_events
+    assert all(vt == 0 for _, vt in vel_events)
+
+
+def test_motion_servo_enforces_elevation_ceiling_in_wildlife_but_not_aruco(tmp_path):
+    """
+    Site-calibrated deer elevation ceiling prevents WILDLIFE mode from slewing up
+    into porch eaves/sky (+398 mrad), while leaving ARUCO mode unconstrained.
+    """
+    cfg = load_config(env={})
+    cfg.base_dir = str(tmp_path)
+    cfg.control.motion_loop_interval_sec = 0.005
+    cfg.control.ballistic_acquire_mrad = 100.0
+
+    # --- Case 1: WILDLIFE with calibrated 2.29m mount -> clamps +350 mrad target well below porch roof ---
+    state = SystemState(cfg)
+    state.site_calibration.data.metric_source = "WALK_TEST"
+    state.site_calibration.data.camera_mount_height_m = 2.29
+    state.site_calibration.data.ground_slope_mrad = -42.8
+    state.site_calibration.data.yard_top_profile = {"0": 46.0}
+
+    setpoints = []
+    orig_sp = state.command_bus.request_setpoint
+
+    def _spy_sp(p, t_val):
+        setpoints.append((p, t_val))
+        orig_sp(p, t_val)
+
+    state.command_bus.request_setpoint = _spy_sp
+
+    now = time.monotonic()
+    state.update_health(serial_connected=True, npu_latency_ms=110.0)
+    state.update_turret_telemetry(0, -100, False, now)
+    state.set_turret_mode("ON")
+    state.target_filter.update_measurement(0.0, 350.0, now - 0.05)
+    state.set_primary_target({
+        "center": (640, 100),
+        "box": [610, 80, 670, 120],
+        "score": 0.90,
+        "area": 2400,
+        "range_m": 9.0,
+        "capture_mono": now - 0.05,
+        "last_seen_mono": now - 0.01,
+    })
+
+    t = threading.Thread(target=motion_servoing_worker, args=(cfg, state), daemon=True)
+    t.start()
+    time.sleep(0.05)
+    state.shutdown_event.set()
+    t.join(timeout=1.0)
+
+    assert setpoints
+    assert all(sp_t < 60 for _, sp_t in setpoints)
+
+    # --- Case 2: ARUCO mode -> same +300 mrad target is NOT clipped by yard deer ceiling ---
+    state_a = SystemState(cfg)
+    state_a.set_active_detector_type("ARUCO")
+    state_a.site_calibration.data.metric_source = "WALK_TEST"
+    state_a.site_calibration.data.camera_mount_height_m = 2.29
+    state_a.site_calibration.data.ground_slope_mrad = -42.8
+
+    sp_aruco = []
+    orig_sp_a = state_a.command_bus.request_setpoint
+    state_a.command_bus.request_setpoint = lambda p, t_val: (sp_aruco.append((p, t_val)), orig_sp_a(p, t_val))
+
+    now_a = time.monotonic()
+    state_a.update_health(serial_connected=True)
+    state_a.update_turret_telemetry(0, -100, False, now_a)
+    state_a.set_turret_mode("ON")
+    state_a.target_filter.update_measurement(0.0, 300.0, now_a - 0.05)
+    state_a.set_primary_target({
+        "center": (640, 120),
+        "box": [610, 100, 670, 140],
+        "score": 1.0,
+        "area": 2400,
+        "range_m": 9.0,
+        "capture_mono": now_a - 0.05,
+        "last_seen_mono": now_a - 0.01,
+    })
+
+    ta = threading.Thread(target=motion_servoing_worker, args=(cfg, state_a), daemon=True)
+    ta.start()
+    time.sleep(0.05)
+    state_a.shutdown_event.set()
+    ta.join(timeout=1.0)
+
+    assert sp_aruco
+    assert any(sp_t > 250 for _, sp_t in sp_aruco)
+
+
+def test_anisotropic_and_range_association_blocks_multi_deer_swap_and_allows_radial_charge():
+    """
+    15.3m background deer lock must reject an 8.9m foreground deer (6.4m range jump &
+    large vertical offset) while still tracking a real deer charging radially at 6 m/s.
+    """
+    locked = {"center": (600.0, 380.0), "box": [570, 360, 630, 400], "range_m": 15.3}
+
+    # Foreground deer at 8.9m with higher confidence & big vertical drop
+    foreground_deer = {"center": (640.0, 495.0), "box": [600, 460, 680, 530], "score": 0.94, "range_m": 8.9}
+    # Same deer after a 0.25s radial charge (6 m/s -> 1.5m closer = 13.8m, small downward shift)
+    charging_deer = {"center": (608.0, 396.0), "box": [576, 374, 640, 418], "score": 0.84, "range_m": 13.8}
+
+    # Gate parameters for dt_eff=0.25s at 15.3m: gx=160, gy=55, max_range_delta=3.8m
+    chosen_swap = vp._select_target_candidate(
+        [foreground_deer],
+        locked,
+        ref_points=((605.0, 385.0), (600.0, 380.0)),
+        max_jump_px=160.0,
+        max_jump_y_px=55.0,
+        max_range_delta_m=3.8,
+    )
+    assert chosen_swap is None
+
+    chosen_charge = vp._select_target_candidate(
+        [foreground_deer, charging_deer],
+        locked,
+        ref_points=((605.0, 385.0), (600.0, 380.0)),
+        max_jump_px=160.0,
+        max_jump_y_px=55.0,
+        max_range_delta_m=3.8,
+    )
+    assert chosen_charge is charging_deer

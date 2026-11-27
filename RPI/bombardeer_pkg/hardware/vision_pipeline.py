@@ -29,7 +29,6 @@ from bombardeer_pkg.control.ballistics import (
     compute_drag_ballistics,
     compute_deer_head_ceiling_mrad,
     compute_horizon_y_720,
-    compute_target_kinematics,
     image_px_to_world_mrad,
     project_world_to_image_px,
 )
@@ -121,10 +120,18 @@ def _reconstruct_box_at_center(px: float, py: float, ref_box, ref_center=None):
     return [px - 0.5 * bw, py - dy_top, px + 0.5 * bw, py + dy_bot]
 
 
-def _select_target_candidate(detections, cur_primary, ref_points, max_jump_px: float):
+def _select_target_candidate(
+    detections,
+    cur_primary,
+    ref_points,
+    max_jump_px: float,
+    max_jump_y_px: float = None,
+    max_range_delta_m: float = None,
+):
     """
     Pick the nearest detection to the locked target's projected image position(s)
-    to prevent jumping between multiple deer while tolerating sudden stops after
+    using an optional anisotropic elliptical (dx/gx, dy/gy) gate and range-consistency
+    check to prevent multi-deer herd swaps while tolerating sudden stops after
     350-700 ms scan gaps.
     """
     if not detections:
@@ -136,14 +143,26 @@ def _select_target_candidate(detections, cur_primary, ref_points, max_jump_px: f
     if not pts:
         pts = [cur_primary["center"]]
 
+    gx = max(1.0, float(max_jump_px))
+    gy = max(1.0, float(max_jump_y_px)) if max_jump_y_px is not None else gx
+    prim_rng = cur_primary.get("range_m")
+
     best = None
-    best_dist = float("inf")
+    best_score = float("inf")
     for cand in detections:
         cx, cy = cand["center"]
-        dist = min(math.hypot(cx - rx, cy - ry) for rx, ry in pts)
-        if dist <= max_jump_px and dist < best_dist:
-            best_dist = dist
-            best = cand
+        dr = 0.0
+        if max_range_delta_m is not None and prim_rng is not None and cand.get("range_m") is not None:
+            dr = abs(float(cand["range_m"]) - float(prim_rng))
+            if dr > max_range_delta_m:
+                continue
+
+        norm_xy = min(math.hypot((cx - rx) / gx, (cy - ry) / gy) for rx, ry in pts)
+        if norm_xy <= 1.0:
+            score = math.hypot(norm_xy, dr / max(1.0, float(max_range_delta_m))) if max_range_delta_m else norm_xy
+            if score < best_score:
+                best_score = score
+                best = cand
     return best
 
 
@@ -188,7 +207,7 @@ def _hud_encoder_worker(cfg: BombardeerConfig, state: SystemState, hud_queue: qu
             local_target,
             sensor_fps,
             sensor_mode,
-            det_name,
+            det_tel,
             mono_now,
         ) = pkt
         annotated = cv2.resize(frame_lores, (cam.display_width, cam.display_height), interpolation=cv2.INTER_LINEAR)
@@ -214,7 +233,7 @@ def _hud_encoder_worker(cfg: BombardeerConfig, state: SystemState, hud_queue: qu
 
         cv2.drawMarker(annotated, (oc_x, oc_y), (0, 255, 255), cv2.MARKER_CROSS, 16, 1)
 
-        _, drop_mrad, _, _ = compute_drag_ballistics(rng_m, t_mrad, 0.0, 0.0, bal, optics)
+        _, drop_mrad, _, _ = compute_drag_ballistics(rng_m, t_mrad, 0.0, 0.0, bal)
         total_tilt_adj = drop_mrad + optics.tilt_calibration_trim_mrad
         conv_x = cam.optical_center[0] + int((-optics.camera_offset_x_mm / (rng_m * 1000.0)) * optics.focal_length_px)
         conv_y = cam.optical_center[1] + int(
@@ -264,7 +283,7 @@ def _hud_encoder_worker(cfg: BombardeerConfig, state: SystemState, hud_queue: qu
             # Project locked target into live turret pose so the HUD box stays aligned during slews
             disp_box = local_target["box"]
             disp_center = local_target["center"]
-            pred_hud = state.target_filter.predict_state(mono_now)
+            pred_hud = state.target_filter.predict_state(mono_now, pan_hold_sec=max(state.target_filter.DEFAULT_PAN_COAST_HOLD_SEC, npu_lat_sec + 0.08))
             if pred_hud is not None:
                 hx, hy = project_world_to_image_px(
                     pred_hud[0], pred_hud[1], p_mrad, t_mrad, rng_m, cam, optics
@@ -308,12 +327,6 @@ def _hud_encoder_worker(cfg: BombardeerConfig, state: SystemState, hud_queue: qu
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 1, cv2.LINE_AA)
 
         ser_ok = health["serial_connected"]
-        cam_tag = "12MP" if sensor_mode == "DAY_12MP" else "3MP"
-        det_tel = (
-            f"{cam_tag} {health['npu_scan_mode']}:{health['npu_fps']:.1f}Hz({health['npu_latency_ms']:.0f}ms)"
-            if det_name == "WILDLIFE"
-            else f"{cam_tag} DET:ARUCO"
-        )
         status = f"FPS:{sensor_fps:.1f} | {det_tel} | P:{p_mrad} T:{t_mrad} | {'SER:OK' if ser_ok else 'SER:DISC'}"
         st_font = cv2.FONT_HERSHEY_SIMPLEX
         st_scale = 0.56
@@ -379,7 +392,10 @@ class VisionRuntime:
         # Spawn HailoNPUProc BEFORE starting any threads (eliminates multithreaded IPC hazards)
         self.wildlife_detector = HailoWildlifeDetector(self.cfg, self.state)
         self.state.wildlife_detector = self.wildlife_detector
-        self.wildlife_detector.set_active(self.state.get_active_detector_type() == "WILDLIFE")
+        self.state.register_detector(self.wildlife_detector)
+        self.wildlife_detector.set_active(
+            self.state.get_active_detector_type() == self.wildlife_detector.name
+        )
 
         self._threads = [
             threading.Thread(target=turret_serial_worker, args=(self.cfg, self.state), daemon=True, name="SerialWorker"),
@@ -406,10 +422,12 @@ class VisionRuntime:
         rate_log = RateLimitedLogger(interval_sec=5.0)
 
         set_os_thread_name("VisionMain", cpu_cores=[0, 1, 2])
-        detectors = {
-            "ARUCO": ArucoTargetDetector(cfg),
-            "WILDLIFE": self.wildlife_detector,
-        }
+        aruco_detector = ArucoTargetDetector(cfg)
+        state.register_detector(aruco_detector)
+        detectors = {aruco_detector.name: aruco_detector}
+        if self.wildlife_detector is not None:
+            detectors[self.wildlife_detector.name] = self.wildlife_detector
+        fallback_detector = aruco_detector
 
         sensor_mode = "DUSK_3MP"
         is_monochrome = False
@@ -471,7 +489,7 @@ class VisionRuntime:
         try:
             while not state.shutdown_event.is_set():
                 req_det = state.get_active_detector_type()
-                active_detector = detectors.get(req_det, detectors["ARUCO"])
+                active_detector = detectors.get(req_det, fallback_detector)
                 sensor_size = cam.sensor_day_size if sensor_mode == "DAY_12MP" else cam.sensor_dusk_size
                 plan_bundle = None
                 frame_roi = None
@@ -494,8 +512,8 @@ class VisionRuntime:
                     pan_cap, tilt_cap = state.get_turret_pos_at_time(capture_mono)
 
                     need_native = (
-                        active_detector.name == "WILDLIFE"
-                        and self.wildlife_detector.is_ready_for_frame()
+                        active_detector.uses_native_roi
+                        and active_detector.is_ready_for_frame()
                     )
                     if need_native:
                         npu_lat_sec = state.get_npu_latency_sec()
@@ -504,7 +522,7 @@ class VisionRuntime:
                         if cur_primary is not None:
                             prim_age = max(0.0, capture_mono - cur_primary.get("capture_mono", cur_primary["last_seen_mono"]))
                             if prim_age <= track_hold:
-                                pred = kf.predict_state(capture_mono)
+                                pred = kf.predict_state(capture_mono, pan_hold_sec=max(kf.DEFAULT_PAN_COAST_HOLD_SEC, npu_lat_sec + 0.08))
                                 if pred is not None:
                                     px, py = project_world_to_image_px(
                                         pred[0], pred[1], pan_cap, tilt_cap,
@@ -529,7 +547,7 @@ class VisionRuntime:
                                 tx, ty, tentative_target["box"], tentative_target["center"]
                             )
 
-                        plan_bundle = self.wildlife_detector.prepare_plan(
+                        plan_bundle = active_detector.prepare_plan(
                             sensor_size[0], sensor_size[1], tilt_cap, active_track_box, pan_mrad=pan_cap
                         )
                         rx0, ry0, rw, rh = plan_bundle[2]
@@ -603,7 +621,7 @@ class VisionRuntime:
                     gain = float(metadata.get("AnalogueGain", 1.0))
                     exp_us = float(metadata.get("ExposureTime", 33333))
                     has_tgt = state.get_primary_target() is not None
-                    npu_idle = (active_detector.name != "WILDLIFE") or self.wildlife_detector.is_idle()
+                    npu_idle = active_detector.is_idle()
                     safe_to_switch = (
                         (not has_tgt)
                         and (tentative_streak == 0)
@@ -636,7 +654,7 @@ class VisionRuntime:
                             rate_log.warning("isp_hdr", f"[ISP] Daylight update warning: {exc}")
 
                     desired_mode = sensor_mode
-                    if active_detector.name != "WILDLIFE":
+                    if not active_detector.prefers_high_res_day_sensor:
                         desired_mode = "DUSK_3MP"
                     elif sensor_mode == "DUSK_3MP":
                         if (not is_monochrome) and (lux >= cam.day_12mp_enter_lux) and (gain <= cam.day_12mp_enter_max_gain):
@@ -650,7 +668,7 @@ class VisionRuntime:
                             sensor_switch_candidate = desired_mode
                             sensor_switch_since_mono = mono_now
                         req_dwell = (
-                            2.0 if active_detector.name != "WILDLIFE"
+                            2.0 if not active_detector.prefers_high_res_day_sensor
                             else (cam.sensor_boot_eval_sec if mono_now <= fast_eval_until_mono else cam.sensor_switch_dwell_sec)
                         )
                         if safe_to_switch and ((mono_now - sensor_switch_since_mono) >= req_dwell):
@@ -661,7 +679,7 @@ class VisionRuntime:
                                 roi_scratch = None
                                 npu_lores_history.clear()
                                 min_valid_capture_mono = time.monotonic()
-                                self.wildlife_detector.discard_older_than(min_valid_capture_mono)
+                                active_detector.discard_older_than(min_valid_capture_mono)
                                 picam2.stop()
                                 gc.collect()
                                 picam2.configure(_build_camera_config(picam2, cfg, desired_mode, is_monochrome, last_ev))
@@ -693,7 +711,7 @@ class VisionRuntime:
                     tentative_target = None
                     tentative_streak = 0
                     min_valid_capture_mono = mono_now
-                    self.wildlife_detector.discard_older_than(min_valid_capture_mono)
+                    active_detector.discard_older_than(min_valid_capture_mono)
                     if not serial_ok:
                         state.clear_primary_target()
 
@@ -701,8 +719,9 @@ class VisionRuntime:
                 if active_detector.name != last_detector_type:
                     log.info(f"[PERCEPTION] Switching detector: {last_detector_type} -> {active_detector.name}")
                     min_valid_capture_mono = mono_now
-                    self.wildlife_detector.discard_older_than(min_valid_capture_mono)
-                    self.wildlife_detector.set_active(active_detector.name == "WILDLIFE")
+                    for det_obj in detectors.values():
+                        det_obj.discard_older_than(min_valid_capture_mono)
+                        det_obj.set_active(det_obj is active_detector)
                     last_detector_type = active_detector.name
                     tentative_target = None
                     tentative_streak = 0
@@ -712,21 +731,17 @@ class VisionRuntime:
                     sensor_switch_candidate = None
                     fast_eval_until_mono = mono_now + cam.sensor_boot_eval_sec + 3.0
 
-                if active_detector.name == "WILDLIFE":
-                    detections, eff_capture_mono = self.wildlife_detector.detect(
-                        frame_roi,
-                        capture_mono,
-                        is_monochrome=is_monochrome,
-                        tilt_mrad=tilt_cap,
-                        track_box=active_track_box,
-                        sensor_size=sensor_size,
-                        plan_bundle=plan_bundle,
-                    )
-                    frame_roi = None
-                else:
-                    detections, eff_capture_mono = active_detector.detect(
-                        frame_lores, capture_mono, is_monochrome=is_monochrome
-                    )
+                input_frame = frame_roi if active_detector.uses_native_roi else frame_lores
+                detections, eff_capture_mono = active_detector.detect(
+                    input_frame,
+                    capture_mono,
+                    is_monochrome=is_monochrome,
+                    tilt_mrad=tilt_cap,
+                    track_box=active_track_box,
+                    sensor_size=sensor_size,
+                    plan_bundle=plan_bundle,
+                )
+                frame_roi = None
 
                 debug_info = active_detector.get_last_debug_info()
                 npu_lat_sec = state.get_npu_latency_sec()
@@ -754,7 +769,7 @@ class VisionRuntime:
 
                     # Resolve the exact lores frame matching eff_capture_mono for audit snapshots
                     audit_frame = frame_lores
-                    if active_detector.name == "WILDLIFE" and npu_lores_history:
+                    if active_detector.uses_native_roi and npu_lores_history:
                         best_ts, best_frm = min(
                             npu_lores_history,
                             key=lambda item: abs(item[0] - eff_capture_mono),
@@ -764,28 +779,27 @@ class VisionRuntime:
 
                     # Evaluate calibration ownership & scene-wide safety veto BEFORE candidate projection
                     suppress_tracking = False
-                    if active_detector.name == "WILDLIFE":
-                        veto_boxes = debug_info.get("veto_boxes", [])
-                        rejected = debug_info.get("rejected_animals", [])
-                        if state.site_calibration.is_walk_test_active():
-                            state.site_calibration.ingest_walk_test_detections(
-                                veto_boxes, tilt_batch, eff_capture_mono, state=state
-                            )
-                            suppress_tracking = True
-                        elif state.site_calibration.is_motion_owned():
-                            suppress_tracking = True
-                        elif veto_boxes:
-                            aborted, _ = _apply_scene_wide_veto(state, kf, cur_primary, veto_boxes)
-                            if aborted:
-                                cur_primary = None
-                                if mono_now - last_veto_audit_mono >= st.audit_veto_cooldown_sec:
-                                    last_veto_audit_mono = mono_now
-                                    save_audit_snapshot(audit_frame, "VETO_ACTIVE", [], debug_info, cfg.debug_snapshot_dir, st.max_debug_snapshots)
-                            suppress_tracking = True
+                    veto_boxes = debug_info.get("veto_boxes", [])
+                    rejected = debug_info.get("rejected_animals", [])
+                    if state.site_calibration.is_walk_test_active():
+                        state.site_calibration.ingest_walk_test_detections(
+                            veto_boxes, tilt_batch, eff_capture_mono, state=state
+                        )
+                        suppress_tracking = True
+                    elif state.site_calibration.is_motion_owned():
+                        suppress_tracking = True
+                    elif veto_boxes:
+                        aborted, _ = _apply_scene_wide_veto(state, kf, cur_primary, veto_boxes)
+                        if aborted:
+                            cur_primary = None
+                            if mono_now - last_veto_audit_mono >= st.audit_veto_cooldown_sec:
+                                last_veto_audit_mono = mono_now
+                                save_audit_snapshot(audit_frame, "VETO_ACTIVE", [], debug_info, cfg.debug_snapshot_dir, st.max_debug_snapshots)
+                        suppress_tracking = True
 
-                        if rejected and (mono_now - last_veto_audit_mono >= st.audit_veto_cooldown_sec):
-                            last_veto_audit_mono = mono_now
-                            save_audit_snapshot(audit_frame, "VETO", detections, debug_info, cfg.debug_snapshot_dir, st.max_debug_snapshots)
+                    if rejected and (mono_now - last_veto_audit_mono >= st.audit_veto_cooldown_sec):
+                        last_veto_audit_mono = mono_now
+                        save_audit_snapshot(audit_frame, "VETO", detections, debug_info, cfg.debug_snapshot_dir, st.max_debug_snapshots)
 
                     best_cand = None
                     if suppress_tracking:
@@ -795,11 +809,14 @@ class VisionRuntime:
                         # Project current locked target into eff_capture_mono pixel space (both extrapolated and stationary)
                         ref_xy = None
                         last_xy = None
-                        assoc_gate_px = float(ctrl.confirmation_max_jump_px)
+                        assoc_gate_x_px = float(ctrl.confirmation_max_jump_px)
+                        assoc_gate_y_px = None
+                        max_range_delta_m = None
+                        pan_hold = max(kf.DEFAULT_PAN_COAST_HOLD_SEC, npu_lat_sec + 0.08)
 
                         if cur_primary is not None:
                             prim_rng = cur_primary.get("range_m", last_valid_range_m)
-                            pred_cap = kf.predict_state(eff_capture_mono)
+                            pred_cap = kf.predict_state(eff_capture_mono, pan_hold_sec=pan_hold)
                             if pred_cap is not None:
                                 ref_xy = project_world_to_image_px(
                                     pred_cap[0], pred_cap[1], pan_batch, tilt_batch, prim_rng, cam, optics
@@ -813,13 +830,19 @@ class VisionRuntime:
                                     last_state[0], last_state[1], pan_batch, tilt_batch, prim_rng, cam, optics
                                 )
                                 dt_gap = max(0.0, eff_capture_mono - last_state[2])
+                                dt_eff = min(dt_gap, kf.MAX_INNOVATION_GATE_DT_SEC)
                                 kin_optics_b, _, _, _ = state.site_calibration.get_ground_plane_params(optics, pan_batch)
-                                kin_gap = compute_target_kinematics(prim_rng, kin_optics_b)
-                                kin_gate_px = ((kin_gap.max_v_pan_mrad_s * dt_gap) + kin_gap.max_step_margin_pan_mrad) / max(0.5, optics.mrad_per_pixel)
-                                assoc_gate_px = max(float(ctrl.confirmation_max_jump_px), min(280.0, kin_gate_px))
+                                assoc_gate_x_px, assoc_gate_y_px, max_range_delta_m = (
+                                    active_detector.get_association_gate(prim_rng, dt_eff, kin_optics_b, ctrl)
+                                )
 
                         best_cand = _select_target_candidate(
-                            detections, cur_primary, (ref_xy, last_xy), assoc_gate_px
+                            detections,
+                            cur_primary,
+                            (ref_xy, last_xy),
+                            assoc_gate_x_px,
+                            max_jump_y_px=assoc_gate_y_px,
+                            max_range_delta_m=max_range_delta_m,
                         )
 
                     if best_cand is not None:
@@ -834,15 +857,20 @@ class VisionRuntime:
                             if tentative_target is not None:
                                 dt_tent = max(0.05, eff_capture_mono - tentative_target["capture_mono"])
                                 kin_optics_t, _, _, _ = state.site_calibration.get_ground_plane_params(optics, pan_batch)
-                                kin_tent = compute_target_kinematics(cand_rng, kin_optics_t)
-                                max_pan_jump = max(
-                                    ctrl.confirmation_max_jump_px * optics.mrad_per_pixel,
-                                    (kin_tent.max_v_pan_mrad_s * dt_tent) + kin_tent.max_step_margin_pan_mrad,
-                                )
-                                max_tilt_jump = max(
-                                    ctrl.confirmation_max_jump_px * optics.mrad_per_pixel,
-                                    (kin_tent.max_v_tilt_mrad_s * dt_tent) + kin_tent.max_step_margin_tilt_mrad,
-                                )
+                                kin_tent = active_detector.get_kinematics(cand_rng, kin_optics_t)
+                                base_jump_mrad = ctrl.confirmation_max_jump_px * optics.mrad_per_pixel
+                                if kin_tent is not None:
+                                    max_pan_jump = max(
+                                        base_jump_mrad,
+                                        (kin_tent.max_v_pan_mrad_s * dt_tent) + kin_tent.max_step_margin_pan_mrad,
+                                    )
+                                    max_tilt_jump = max(
+                                        base_jump_mrad,
+                                        (kin_tent.max_v_tilt_mrad_s * dt_tent) + kin_tent.max_step_margin_tilt_mrad,
+                                    )
+                                else:
+                                    max_pan_jump = base_jump_mrad
+                                    max_tilt_jump = base_jump_mrad
                                 within_world_gate = (
                                     abs(cand_w_pan - tentative_target["world_pan"]) <= max_pan_jump
                                     and abs(cand_w_tilt - tentative_target["world_tilt"]) <= max_tilt_jump
@@ -863,9 +891,9 @@ class VisionRuntime:
                                 verified = best_cand
                                 tentative_target = None
                                 tentative_streak = 0
-                                if active_detector.name == "WILDLIFE":
+                                if active_detector.saves_acquire_audit_snapshot:
                                     log.warning(
-                                        f"[ACQUIRE:WILDLIFE] Locked ({sensor_mode}) | Box:{best_cand['box']} "
+                                        f"[ACQUIRE:{active_detector.name}] Locked ({sensor_mode}) | Box:{best_cand['box']} "
                                         f"| Range:{best_cand['range_m']:.1f}m"
                                     )
                                     save_audit_snapshot(audit_frame, "ACQUIRE", detections, debug_info, cfg.debug_snapshot_dir, st.max_debug_snapshots)
@@ -881,12 +909,12 @@ class VisionRuntime:
                         verified["center"][0], verified["center"][1],
                         pan_v, tilt_v, last_valid_range_m, cam, optics
                     )
-                    if active_detector.name == "WILDLIFE":
-                        kin_optics_v, _, _, _ = state.site_calibration.get_ground_plane_params(optics, pan_v)
-                        kin = compute_target_kinematics(last_valid_range_m, kin_optics_v)
-                    else:
-                        kin = None
-                    kf.update_measurement(raw_w_pan, raw_w_tilt, eff_capture_mono, kinematics=kin)
+                    kin_optics_v, _, _, _ = state.site_calibration.get_ground_plane_params(optics, pan_v)
+                    kin = active_detector.get_kinematics(last_valid_range_m, kin_optics_v)
+                    kf.update_measurement(
+                        raw_w_pan, raw_w_tilt, eff_capture_mono, kinematics=kin,
+                        pan_hold_sec=max(kf.DEFAULT_PAN_COAST_HOLD_SEC, npu_lat_sec + 0.08),
+                    )
                     state.set_primary_target({
                         "center": verified["center"],
                         "box": verified["box"],
@@ -901,12 +929,7 @@ class VisionRuntime:
                 elif state.get_primary_target() is None and (mono_now - last_standby_log_mono >= 2.0):
                     last_standby_log_mono = mono_now
                     isp_tag = "BW" if is_monochrome else "HDR"
-                    tel = self.wildlife_detector.get_telemetry() if active_detector.name == "WILDLIFE" else {}
-                    npu_str = (
-                        f" | NPU:{tel.get('npu_fps', 0.0):4.1f}Hz({tel.get('npu_latency_ms', 0.0):3.0f}ms {tel.get('scan_mode', 'IDLE')})"
-                        if active_detector.name == "WILDLIFE"
-                        else ""
-                    )
+                    npu_str = active_detector.format_standby_telemetry()
                     log.info(
                         f"[STANDBY:{active_detector.name}] Cam:{sensor_fps:4.1f}FPS({sensor_mode}/{isp_tag}) | "
                         f"Lux:{metadata.get('Lux', 0.0):5.1f} Gain:{metadata.get('AnalogueGain', 1.0):4.1f}x"
@@ -974,7 +997,10 @@ class VisionRuntime:
                             local_target,
                             sensor_fps,
                             sensor_mode,
-                            active_detector.name,
+                            active_detector.format_hud_telemetry(
+                                "12MP" if sensor_mode == "DAY_12MP" else "3MP",
+                                state.get_health_snapshot(),
+                            ),
                             mono_now,
                         ))
                     except queue.Full:

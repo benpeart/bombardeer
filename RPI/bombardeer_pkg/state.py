@@ -5,11 +5,12 @@ import logging
 import math
 import threading
 import time
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from bombardeer_pkg.config import BombardeerConfig
 from bombardeer_pkg.control.kalman import TargetKalmanFilter
 from bombardeer_pkg.control.site_calibration import SiteCalibrationManager
+from bombardeer_pkg.perception.base import TrackingPolicy, get_default_tracking_policy
 
 log = logging.getLogger("Bombardeer")
 
@@ -94,6 +95,7 @@ class SystemState:
         self.command_bus = TurretCommandBus()
         self.target_filter = TargetKalmanFilter(accel_noise_mrad_s2=150.0, measurement_noise=35.0)
         self.wildlife_detector = None
+        self._detectors: Dict[str, object] = {}
         self.site_calibration = SiteCalibrationManager(cfg)
 
         # Lock 0: Engagement mode & active detector
@@ -168,6 +170,23 @@ class SystemState:
     def set_active_detector_type(self, det_type: str):
         with self._mode_lock:
             self._active_detector_type = det_type
+
+    def register_detector(self, detector):
+        if detector is None:
+            return
+        with self._mode_lock:
+            self._detectors[detector.name] = detector
+
+    def get_active_detector(self):
+        with self._mode_lock:
+            return self._detectors.get(self._active_detector_type)
+
+    def get_tracking_policy(self, mode: str) -> TrackingPolicy:
+        npu_lat_sec = self.get_npu_latency_sec()
+        det = self.get_active_detector()
+        if det is not None:
+            return det.get_tracking_policy(self.cfg, mode, npu_lat_sec)
+        return get_default_tracking_policy(self.get_active_detector_type(), self.cfg, mode, npu_lat_sec)
 
     # --- Web Frame Plane ---
 

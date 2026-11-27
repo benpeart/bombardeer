@@ -53,6 +53,8 @@ class ArucoTargetDetector(BaseTargetDetector):
         is_monochrome: bool = False,
         tilt_mrad: float = 0.0,
         track_box=None,
+        sensor_size=None,
+        plan_bundle=None,
     ):
         if frame_bgr is None:
             return [], capture_mono_time

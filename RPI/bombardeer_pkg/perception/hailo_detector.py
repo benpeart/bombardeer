@@ -17,8 +17,8 @@ from multiprocessing import shared_memory
 import numpy as np
 
 from bombardeer_pkg.config import BombardeerConfig
-from bombardeer_pkg.control.ballistics import evaluate_ground_plane
-from bombardeer_pkg.perception.base import BaseTargetDetector
+from bombardeer_pkg.control.ballistics import compute_target_kinematics, evaluate_ground_plane
+from bombardeer_pkg.perception.base import BaseTargetDetector, TrackingPolicy, wildlife_tracking_policy
 from bombardeer_pkg.perception.hailo_worker import hailo_worker_main
 from bombardeer_pkg.perception.tiling import build_pass_plan, compute_plan_roi_bounds
 from bombardeer_pkg.state import SystemState
@@ -190,6 +190,41 @@ class HailoWildlifeDetector(BaseTargetDetector):
     @property
     def name(self) -> str:
         return "WILDLIFE"
+
+    @property
+    def uses_native_roi(self) -> bool:
+        return True
+
+    @property
+    def prefers_high_res_day_sensor(self) -> bool:
+        return True
+
+    @property
+    def saves_acquire_audit_snapshot(self) -> bool:
+        return True
+
+    def get_tracking_policy(self, cfg, mode: str, npu_lat_sec: float = 0.0) -> TrackingPolicy:
+        return wildlife_tracking_policy(cfg, mode, npu_lat_sec)
+
+    def get_kinematics(self, range_m: float, optics):
+        return compute_target_kinematics(range_m, optics)
+
+    def get_association_gate(self, prim_rng: float, dt_eff: float, optics, ctrl):
+        kin = compute_target_kinematics(prim_rng, optics)
+        mpp = max(0.5, float(optics.mrad_per_pixel))
+        kin_gate_x = ((kin.max_v_pan_mrad_s * dt_eff) + kin.max_step_margin_pan_mrad) / mpp
+        kin_gate_y = ((kin.max_v_tilt_mrad_s * dt_eff) + kin.max_step_margin_tilt_mrad) / mpp
+        gx = max(float(ctrl.confirmation_max_jump_px), min(220.0, kin_gate_x))
+        gy = max(45.0, min(110.0, kin_gate_y))
+        max_range_delta_m = (kin.max_radial_speed_m_s * dt_eff) + max(1.6, 0.15 * float(prim_rng))
+        return gx, gy, max_range_delta_m
+
+    def format_hud_telemetry(self, cam_tag: str, health: dict) -> str:
+        return f"{cam_tag} {health['npu_scan_mode']}:{health['npu_fps']:.1f}Hz({health['npu_latency_ms']:.0f}ms)"
+
+    def format_standby_telemetry(self) -> str:
+        tel = self.get_telemetry()
+        return f" | NPU:{tel.get('npu_fps', 0.0):4.1f}Hz({tel.get('npu_latency_ms', 0.0):3.0f}ms {tel.get('scan_mode', 'IDLE')})"
 
     @property
     def is_available(self) -> bool:
